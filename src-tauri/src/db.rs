@@ -260,6 +260,15 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // Task schema migrations
+    let _ = conn.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE tasks ADD COLUMN result TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE tasks ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE tasks ADD COLUMN triggered_by TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE tasks ADD COLUMN chain_next TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE tasks ADD COLUMN conditions TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE tasks ADD COLUMN condition_status TEXT NOT NULL DEFAULT ''", []);
+
     let default_tools = [
         (
             "run_command",

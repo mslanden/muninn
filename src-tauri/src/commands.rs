@@ -267,7 +267,10 @@ pub fn get_tasks(state: State<AppState>) -> Result<Vec<TaskRecord>, String> {
         let mut stmt = db
             .prepare(
                 r#"
-                SELECT id, name, description, schedule, next_run, status, created_at, updated_at
+                SELECT id, name, description, schedule, next_run, status,
+                       completed_at, result, run_count, triggered_by,
+                       chain_next, conditions, condition_status,
+                       created_at, updated_at
                 FROM tasks
                 ORDER BY id DESC
                 "#,
@@ -282,8 +285,15 @@ pub fn get_tasks(state: State<AppState>) -> Result<Vec<TaskRecord>, String> {
                     schedule: row.get(3)?,
                     next_run: row.get(4)?,
                     status: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
+                    completed_at: row.get(6)?,
+                    result: row.get(7)?,
+                    run_count: row.get(8)?,
+                    triggered_by: row.get(9)?,
+                    chain_next: row.get(10)?,
+                    conditions: row.get(11)?,
+                    condition_status: row.get(12)?,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                 })
             })
             .map_err(|e| e.to_string())?;

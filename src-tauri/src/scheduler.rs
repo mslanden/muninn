@@ -279,10 +279,16 @@ pub async fn run_scheduler(app: AppHandle) {
                 status
             };
 
+            let completed_at = if final_status == "completed" {
+                chrono::Local::now().naive_local().format("%Y-%m-%dT%H:%M:%S").to_string()
+            } else {
+                String::new()
+            };
             let _ = with_db(&state, |db| {
                 db.execute(
-                    "UPDATE tasks SET status = ?2, next_run = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                    params![task_id, final_status, new_next_run],
+                    "UPDATE tasks SET status = ?2, next_run = ?3, run_count = run_count + 1, \
+                     result = ?4, completed_at = ?5, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    params![task_id, final_status, new_next_run, reply_preview, completed_at],
                 )
                 .map_err(|e| e.to_string())
             });

@@ -517,6 +517,7 @@ body::before {
 }
 
 .composer-box {
+  position: relative;
   border: 1px solid var(--border);
   border-radius: 2px;
   background: var(--card);
@@ -571,6 +572,34 @@ body::before {
 }
 
 .hint-chip:hover { color: var(--muted); }
+
+/* Slash command picker */
+.slash-picker {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  max-height: 200px;
+  overflow-y: auto;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  margin-bottom: 4px;
+  z-index: 100;
+}
+.slash-picker.hidden { display: none; }
+.slash-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.slash-picker-item:hover, .slash-picker-item.active { background: var(--overlay-medium); }
+.slash-picker-cmd { color: var(--accent); font-weight: 600; font-size: 12px; min-width: 60px; }
+.slash-picker-name { color: var(--text); font-size: 11px; }
+.slash-picker-desc { color: var(--dim); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .send-btn {
   font-family: 'JetBrains Mono', monospace;
@@ -637,7 +666,7 @@ body::before {
 
 .feed-item {
   display: grid;
-  grid-template-columns: 6px 1fr;
+  grid-template-columns: 6px 1fr auto;
   gap: 10px;
   align-items: start;
   padding: 10px 8px;
@@ -647,6 +676,17 @@ body::before {
 }
 
 .feed-item:hover { background: var(--overlay-light); }
+
+.feed-item-delete {
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+  opacity: 0;
+  transition: opacity 200ms ease, color 200ms ease;
+}
+.feed-item:hover .feed-item-delete { opacity: 1; }
+.feed-item-delete:hover { color: var(--red); }
 
 .feed-dot {
   width: 6px;
@@ -814,6 +854,19 @@ body::before {
   display: flex;
   gap: 6px;
   margin-top: 10px;
+  align-items: center;
+}
+
+.task-status-select {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 1px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
 }
 
 .task-action-btn {

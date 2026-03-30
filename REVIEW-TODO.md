@@ -14,20 +14,19 @@
 - [x] /stop command to cancel in-flight chat generation
 - [x] Progress reminders every 5 tool-call rounds
 
-## Medium Priority
-- [ ] Mutex panics in `audio.rs` - `.unwrap()` on mutex locks should use `if let Ok()`
-- [ ] No WAL mode for SQLite - add `PRAGMA journal_mode = WAL`
-- [ ] Redundant field access `main.js:894` - `feed.id ?? feed.id` is a no-op
-- [ ] `cachedContentFiles` set but never read (`main.js:1920`)
-- [ ] `threadOptions` declared but never used (`main.js:41`)
-- [ ] Missing error handling on ~15 frontend `invoke()` calls
-- [ ] CSP disabled in `tauri.conf.json` (`"csp": null`)
-- [ ] Stale context bar after thread switch - `contextTokens` never reset
-- [ ] Orphaned CSS: `.layout-bar`, `.layout-pill`, `.layout-divider`, `.layout-add`
+## Medium Priority (all done)
+- [x] Mutex panics in `audio.rs`
+- [x] WAL mode for SQLite
+- [x] Redundant field access `feed.id ?? feed.id`
+- [x] Dead code: `cachedContentFiles`, `threadOptions`
+- [x] Error handling on frontend `invoke()` calls
+- [x] CSP in `tauri.conf.json`
+- [x] Stale context bar after thread switch
+- [x] Orphaned CSS removed
 
-## ROADMAP Gaps
-- [ ] Slash command picker UI (autocomplete dropdown)
-- [ ] Feed: per-item remove button
-- [ ] Tasks: `chain_next`, `conditions`, `run_count`, `triggered_by` schema + logic
-- [ ] Tasks: manual status change UI
-- [ ] Session delete button in history UI
+## ROADMAP Gaps (all done)
+- [x] Slash command picker UI (autocomplete dropdown)
+- [x] Feed: per-item remove button
+- [x] Tasks: schema columns (`completed_at`, `result`, `run_count`, `triggered_by`, `chain_next`, `conditions`, `condition_status`)
+- [x] Tasks: manual status change UI
+- [x] Session delete button in history UI

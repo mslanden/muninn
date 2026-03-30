@@ -109,6 +109,13 @@ pub struct TaskRecord {
     pub schedule: String,
     pub next_run: String,
     pub status: String,
+    pub completed_at: String,
+    pub result: String,
+    pub run_count: i64,
+    pub triggered_by: String,
+    pub chain_next: String,
+    pub conditions: String,
+    pub condition_status: String,
     pub created_at: String,
     pub updated_at: String,
 }

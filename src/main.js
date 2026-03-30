@@ -699,13 +699,76 @@ function renderChatTile(tileObj, body) {
   };
 
   sendBtn.addEventListener("click", doSend);
+
+  // Slash command picker
+  const slashPicker = document.createElement("div");
+  slashPicker.className = "slash-picker hidden";
+  composer.querySelector(".composer-box").appendChild(slashPicker);
+  let slashPickerIdx = -1;
+
+  function updateSlashPicker() {
+    const text = input.value;
+    const match = text.match(/^\/(\S*)$/);
+    if (!match) { slashPicker.classList.add("hidden"); slashPickerIdx = -1; return; }
+    const partial = match[1].toLowerCase();
+    const builtins = [
+      { slash: "stop", name: "Stop", desc: "Cancel in-flight generation" },
+      { slash: "init", name: "Init Project", desc: "Explore and index current project" }
+    ];
+    const agentItems = cachedAgents
+      .filter(a => field(a, "enabled") !== false && field(a, "slashCommand", "slash_command"))
+      .map(a => ({ slash: field(a, "slashCommand", "slash_command"), name: field(a, "name"), desc: field(a, "description") || "" }));
+    const all = [...builtins, ...agentItems].filter(c => c.slash.toLowerCase().startsWith(partial));
+    if (!all.length) { slashPicker.classList.add("hidden"); slashPickerIdx = -1; return; }
+    slashPickerIdx = Math.max(0, Math.min(slashPickerIdx, all.length - 1));
+    slashPicker.innerHTML = all.map((c, i) =>
+      `<div class="slash-picker-item${i === slashPickerIdx ? " active" : ""}" data-idx="${i}">
+        <span class="slash-picker-cmd">/${escapeHtml(c.slash)}</span>
+        <span class="slash-picker-name">${escapeHtml(c.name)}</span>
+        <span class="slash-picker-desc">${escapeHtml(c.desc).substring(0, 60)}</span>
+      </div>`
+    ).join("");
+    slashPicker.classList.remove("hidden");
+    slashPicker.querySelectorAll(".slash-picker-item").forEach(el => {
+      el.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        input.value = `/${all[parseInt(el.dataset.idx)].slash} `;
+        slashPicker.classList.add("hidden");
+        input.focus();
+      });
+    });
+  }
+
+  // Also wire up the hint chip to insert /
+  const hintChip = composer.querySelector('[data-hint="slash"]');
+  if (hintChip) {
+    hintChip.addEventListener("click", () => {
+      input.value = "/";
+      input.focus();
+      updateSlashPicker();
+    });
+  }
+
   input.addEventListener("keydown", (e) => {
+    if (!slashPicker.classList.contains("hidden")) {
+      const items = slashPicker.querySelectorAll(".slash-picker-item");
+      if (e.key === "ArrowDown") { e.preventDefault(); slashPickerIdx = Math.min(slashPickerIdx + 1, items.length - 1); updateSlashPicker(); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); slashPickerIdx = Math.max(slashPickerIdx - 1, 0); updateSlashPicker(); return; }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        if (slashPickerIdx >= 0 && items[slashPickerIdx]) {
+          e.preventDefault();
+          items[slashPickerIdx].dispatchEvent(new Event("mousedown"));
+          return;
+        }
+      }
+      if (e.key === "Escape") { e.preventDefault(); slashPicker.classList.add("hidden"); return; }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void doSend();
     }
   });
-  input.addEventListener("input", () => autoResize(input));
+  input.addEventListener("input", () => { autoResize(input); updateSlashPicker(); });
 }
 
 function autoResize(textarea) {
@@ -1139,14 +1202,22 @@ async function refreshFeedTile(tileId) {
         <span>${escapeHtml(message)}</span>
         <span class="feed-time">${feedTimeAgo(createdAt)}</span>
       </div>
+      <span class="feed-item-delete" title="Remove">&times;</span>
     `;
 
     if (!isRead) {
-      el.addEventListener("click", async () => {
+      el.addEventListener("click", async (e) => {
+        if (e.target.classList.contains("feed-item-delete")) return;
         await invoke("mark_feed_item_read", { req: { id } });
         await refreshFeedTile(tileId);
       });
     }
+
+    el.querySelector(".feed-item-delete").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try { await invoke("remove_feed_item", { req: { id } }); } catch {}
+      await refreshFeedTile(tileId);
+    });
 
     list.appendChild(el);
   }
@@ -1286,6 +1357,11 @@ function renderTasksTile(tileObj, body) {
           ${nextRun ? `<span>Next: ${formatNextRun(nextRun)}</span>` : ""}
         </div>
         <div class="task-actions">
+          <select class="task-status-select" data-action="status">
+            <option value="scheduled" ${status === "scheduled" ? "selected" : ""}>scheduled</option>
+            <option value="running" ${status === "running" ? "selected" : ""}>running</option>
+            <option value="completed" ${status === "completed" ? "selected" : ""}>completed</option>
+          </select>
           <button class="task-action-btn" data-action="edit">Edit</button>
           <button class="task-action-btn danger" data-action="delete">Delete</button>
         </div>
@@ -1299,6 +1375,11 @@ function renderTasksTile(tileObj, body) {
         nextInput.value = nextRun || "";
         saveBtn.textContent = "Update Task";
         form.classList.add("visible");
+      });
+
+      card.querySelector('[data-action="status"]').addEventListener("change", async (e) => {
+        try { await invoke("set_task_status", { req: { id, status: e.target.value } }); } catch {}
+        doRefresh();
       });
 
       card.querySelector('[data-action="delete"]').addEventListener("click", async () => {
@@ -1889,12 +1970,19 @@ function renderMemoryTile(tileObj, body) {
       row.innerHTML = `
         <div class="entity-top">
           <span class="entity-name">${escapeHtml(preview.substring(0, 80)) || "Empty session"}</span>
-          <span class="entity-summary" style="margin:0;white-space:nowrap;">${msgCount} msgs</span>
+          <span class="entity-delete" title="Delete session">&times;</span>
         </div>
-        <div class="entity-summary">${lastAt}</div>
+        <div class="entity-summary">${lastAt} &middot; ${msgCount} msgs</div>
       `;
 
-      row.addEventListener("click", async () => {
+      row.querySelector(".entity-delete").addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try { await invoke("delete_session", { sessionId: sid }); } catch {}
+        refreshHistory();
+      });
+
+      row.addEventListener("click", async (e) => {
+        if (e.target.classList.contains("entity-delete")) return;
         const messages = await invoke("get_messages", { sessionId: sid });
         histDetail.classList.remove("hidden");
         histDetail.innerHTML = "";
