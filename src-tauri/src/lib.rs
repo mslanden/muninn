@@ -80,13 +80,8 @@ pub fn run() {
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
-            let tray_builder = TrayIconBuilder::new();
-            let tray_builder = if let Some(icon) = app.default_window_icon() {
-                tray_builder.icon(icon.clone())
-            } else {
-                tray_builder
-            };
-            tray_builder
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().expect("app icon missing — check bundle.icon in tauri.conf.json").clone())
                 .tooltip("Spino")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
