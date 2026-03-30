@@ -1,13 +1,18 @@
 # Review TODO (remaining items)
 
-## High Priority
-- [ ] Missing CSS variables (`--gold`, `--fg`) - causes invisible context bar fill and content preview issues
-- [ ] Potential panic at startup - `unwrap()` on `app.default_window_icon()` in `lib.rs:83`
-- [ ] Memory leaks from event-driven re-renders - `memory-updated`, `tasks-changed`, `content-changed` events accumulate duplicate listeners
-- [ ] Leaflet maps never `.remove()`d when tiles close
-- [ ] Content preview escape key handler leaks when closed by clicking
-- [ ] Markdown rendering: `<br>` tags inserted inside `<pre><code>` blocks
-- [ ] Markdown rendering: greedy list regex merges separate lists
+## High Priority (all done)
+- [x] Missing CSS variables (`--gold`, `--fg`)
+- [x] Potential panic at startup - `unwrap()` on `app.default_window_icon()`
+- [x] Memory leaks from event-driven re-renders (verified safe - innerHTML wipes old listeners)
+- [x] Leaflet maps never `.remove()`d when tiles close
+- [x] Content preview escape key handler leaks when closed by clicking
+- [x] Markdown rendering: `<br>` tags inserted inside `<pre><code>` blocks
+- [x] Markdown rendering: greedy list regex merges separate lists
+
+## Previously Fixed
+- [x] XSS vulnerabilities - escapeHtml applied across 25+ innerHTML locations
+- [x] /stop command to cancel in-flight chat generation
+- [x] Progress reminders every 5 tool-call rounds
 
 ## Medium Priority
 - [ ] Mutex panics in `audio.rs` - `.unwrap()` on mutex locks should use `if let Ok()`

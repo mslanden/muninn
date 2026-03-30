@@ -42,7 +42,7 @@ impl AudioRecorder {
         let audio_level = self.audio_level.clone();
 
         // Clear previous samples
-        samples.lock().unwrap().clear();
+        if let Ok(mut s) = samples.lock() { s.clear(); }
         is_recording.store(true, Ordering::SeqCst);
 
         std::thread::spawn(move || {
@@ -66,7 +66,7 @@ impl AudioRecorder {
             };
 
             let sr = config.sample_rate();
-            *sample_rate_store.lock().unwrap() = sr;
+            if let Ok(mut store) = sample_rate_store.lock() { *store = sr; }
             let channels = config.channels() as usize;
 
             let samples_write = samples.clone();
@@ -109,10 +109,10 @@ impl AudioRecorder {
                     };
 
                     smoothed_rms = smoothed_rms * 0.85 + rms * 0.15;
-                    *level.lock().unwrap() = smoothed_rms.min(1.0);
+                    if let Ok(mut l) = level.lock() { *l = smoothed_rms.min(1.0); }
 
                     // Store samples
-                    samples_write.lock().unwrap().extend_from_slice(&mono_samples);
+                    if let Ok(mut sw) = samples_write.lock() { sw.extend_from_slice(&mono_samples); }
 
                     // VAD logic (check roughly every 100ms)
                     callback_count += 1;
@@ -134,7 +134,7 @@ impl AudioRecorder {
                         let _ = app_for_level.emit("voice-level", smoothed_rms);
 
                         // Adaptive silence timeout based on recording length
-                        let total_samples = samples_write.lock().unwrap().len();
+                        let total_samples = samples_write.lock().map(|s| s.len()).unwrap_or(0);
                         let duration_s = total_samples as f32 / sr as f32;
                         let silence_timeout_ticks = if duration_s < 3.0 {
                             20 // 2.0s
@@ -177,7 +177,13 @@ impl AudioRecorder {
             drop(stream);
 
             // Convert samples to 16kHz 16-bit mono WAV
-            let raw = samples.lock().unwrap();
+            let raw = match samples.lock() {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = app_handle.emit("voice-error", "Failed to read audio samples");
+                    return;
+                }
+            };
             if raw.is_empty() {
                 let _ = app_handle.emit("voice-error", "No audio captured");
                 return;
@@ -195,7 +201,7 @@ impl AudioRecorder {
     }
 
     pub fn audio_level(&self) -> f32 {
-        *self.audio_level.lock().unwrap()
+        self.audio_level.lock().map(|l| *l).unwrap_or(0.0)
     }
 }
 

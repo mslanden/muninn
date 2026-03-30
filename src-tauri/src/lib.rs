@@ -40,6 +40,7 @@ pub fn run() {
             let db_path = data_dir.join("spinosaur.db");
             let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
             conn.execute("PRAGMA foreign_keys = ON;", []).map_err(|e| e.to_string())?;
+            conn.execute("PRAGMA journal_mode = WAL;", []).map_err(|e| e.to_string())?;
             db::init_db(&conn)?;
 
             let (workspace_root, workspace_root_canon) = tools::default_workspace_root()?;

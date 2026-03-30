@@ -37,8 +37,6 @@ let focusedTileId = null;
 
 let loadedSettings = {};
 let cachedAgents = [];
-let cachedContentFiles = [];
-let threadOptions = [];
 
 // Per-chat streaming state keyed by tile id
 const chatStreams = {};
@@ -537,6 +535,7 @@ function renderChatTile(tileObj, body) {
       sel.addEventListener("change", async () => {
         const stream = chatStreams[tileObj.id];
         if (!stream) return;
+        stream.contextTokens = null;
         if (sel.value === "__new__") {
           const pp = tileObj.projectPath || "";
           const session = await invoke("create_session", { req: { projectPath: pp } });
@@ -547,6 +546,7 @@ function renderChatTile(tileObj, body) {
           if (chatLog) chatLog.innerHTML = "";
           stream.bubble = null;
           stream.text = "";
+          updateContextBar(tileObj.id, 0);
           await refreshThreadSelect(tileObj);
         } else {
           stream.sessionId = sel.value;
@@ -928,14 +928,15 @@ function renderMyFeedTile(tileObj, body) {
   });
 
   async function loadFeedList() {
-    const feeds = await invoke("get_ai_feeds");
+    let feeds;
+    try { feeds = await invoke("get_ai_feeds"); } catch { feeds = []; }
     feedList.innerHTML = "";
     if (!feeds.length) {
       feedList.innerHTML = `<div class="myfeed-no-feeds">No feeds yet</div>`;
       return;
     }
     for (const feed of feeds) {
-      const id = feed.id ?? feed.id;
+      const id = feed.id;
       const name = feed.name;
       const topics = (feed.topics || []).join(", ");
       const el = document.createElement("div");
@@ -1105,7 +1106,8 @@ async function refreshFeedTile(tileId) {
   const badge = document.querySelector(`[data-feed-badge="${tileId}"]`);
   if (!list) return;
 
-  const items = await invoke("get_feed_items", { req: { limit: 200, unreadOnly: false } });
+  let items;
+  try { items = await invoke("get_feed_items", { req: { limit: 200, unreadOnly: false } }); } catch { items = []; }
   const unread = items.filter(item => !field(item, "isRead", "is_read")).length;
 
   if (badge) {
@@ -1250,7 +1252,8 @@ function renderTasksTile(tileObj, body) {
 
   async function doRefresh() {
     const list = body.querySelector(`[data-tasks-list="${tileObj.id}"]`);
-    const items = await invoke("get_tasks");
+    let items;
+    try { items = await invoke("get_tasks"); } catch { items = []; }
     const filtered = currentFilter === "all" ? items : items.filter(i => field(i, "status", "status") === currentFilter);
 
     list.innerHTML = "";
@@ -1324,7 +1327,8 @@ function renderToolsTile(tileObj, body) {
 
   async function doRefresh(query = "") {
     const list = body.querySelector(`[data-tools-list="${tileObj.id}"]`);
-    const items = await invoke("get_tools");
+    let items;
+    try { items = await invoke("get_tools"); } catch { items = []; }
     const filtered = query ? items.filter(i => (field(i, "name", "name") || "").toLowerCase().includes(query)) : items;
 
     list.innerHTML = "";
@@ -1447,7 +1451,8 @@ function renderAgentsTile(tileObj, body) {
   async function doRefresh() {
     const list = body.querySelector(`[data-agents-list="${tileObj.id}"]`);
     const countEl = body.querySelector(`[data-agents-count="${tileObj.id}"]`);
-    const items = await invoke("get_agents");
+    let items;
+    try { items = await invoke("get_agents"); } catch { items = []; }
     cachedAgents = items;
 
     countEl.textContent = `${items.length} agent${items.length !== 1 ? "s" : ""}`;
@@ -1664,7 +1669,8 @@ function renderMemoryTile(tileObj, body) {
   });
 
   async function refreshProfile() {
-    const profile = await invoke("get_memory_profile");
+    let profile;
+    try { profile = await invoke("get_memory_profile"); } catch { return; }
     memName.value = field(profile, "userName", "user_name") || "";
     memAbout.value = field(profile, "userAbout", "user_about") || "";
     memProfile.value = field(profile, "profileText", "profile_text") || "";
@@ -1707,7 +1713,8 @@ function renderMemoryTile(tileObj, body) {
 
   async function refreshEntities() {
     const list = body.querySelector(`[data-entities-list="${tileObj.id}"]`);
-    const items = await invoke("get_entities");
+    let items;
+    try { items = await invoke("get_entities"); } catch { items = []; }
     list.innerHTML = "";
 
     if (!items.length) {
@@ -1760,7 +1767,8 @@ function renderMemoryTile(tileObj, body) {
   // Relationships
   async function refreshRelationships() {
     const list = body.querySelector(`[data-relationships-list="${tileObj.id}"]`);
-    const items = await invoke("get_relationships");
+    let items;
+    try { items = await invoke("get_relationships"); } catch { items = []; }
     list.innerHTML = "";
 
     if (!items.length) {
@@ -1807,7 +1815,8 @@ function renderMemoryTile(tileObj, body) {
 
   async function refreshEpisodes() {
     const list = body.querySelector(`[data-episodes-list="${tileObj.id}"]`);
-    const items = await invoke("get_episodes");
+    let items;
+    try { items = await invoke("get_episodes"); } catch { items = []; }
     list.innerHTML = "";
 
     if (!items.length) {
@@ -1855,11 +1864,13 @@ function renderMemoryTile(tileObj, body) {
     histDetail.innerHTML = "";
 
     let sessions;
-    if (query) {
-      sessions = await invoke("search_messages", { req: { query, limit: 30 } });
-    } else {
-      sessions = await invoke("get_sessions", { req: { limit: 30 } });
-    }
+    try {
+      if (query) {
+        sessions = await invoke("search_messages", { req: { query, limit: 30 } });
+      } else {
+        sessions = await invoke("get_sessions", { req: { limit: 30 } });
+      }
+    } catch { sessions = []; }
 
     histList.innerHTML = "";
     if (!sessions.length) {
@@ -1954,8 +1965,8 @@ function renderContentTile(tileObj, body) {
       pathLabel.textContent = dir;
     } catch {}
 
-    const items = await invoke("get_content_files");
-    cachedContentFiles = items;
+    let items;
+    try { items = await invoke("get_content_files"); } catch { items = []; }
 
     const filter = filterSelect.value;
     const filtered = filter === "all" ? items : items.filter(i => field(i, "kind", "kind") === filter);
@@ -2771,7 +2782,7 @@ async function bootPopout() {
   if (shell) shell.style.gridTemplateColumns = "1fr";
 
   await setupEventListeners();
-  loadedSettings = await invoke("get_app_settings");
+  try { loadedSettings = await invoke("get_app_settings"); } catch { loadedSettings = {}; }
 
   try { cachedAgents = await invoke("get_agents"); } catch {}
 
@@ -2803,12 +2814,14 @@ async function bootPopout() {
 async function bootMain() {
   await setupEventListeners();
 
-  loadedSettings = await invoke("get_app_settings");
+  try { loadedSettings = await invoke("get_app_settings"); } catch { loadedSettings = {}; }
   sidebarModel.textContent = loadedSettings["llm/model"] || "MiniMax-M2.7";
 
-  const pathInfo = await invoke("get_workspace_root");
-  const workspaceRoot = field(pathInfo, "workspaceRoot", "workspace_root");
-  sidebarWorkspace.textContent = projectLabel(workspaceRoot);
+  try {
+    const pathInfo = await invoke("get_workspace_root");
+    const workspaceRoot = field(pathInfo, "workspaceRoot", "workspace_root");
+    sidebarWorkspace.textContent = projectLabel(workspaceRoot);
+  } catch { sidebarWorkspace.textContent = "~/"; }
 
 
   try { cachedAgents = await invoke("get_agents"); } catch {}
