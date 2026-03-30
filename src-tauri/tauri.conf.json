@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Spino",
+  "version": "0.1.0",
+  "identifier": "com.marcelinolanden.spinosaur",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Spino",
+        "width": 980,
+        "height": 680,
+        "resizable": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": ["$APPDATA/**", "$HOME/Library/Application Support/**", "/tmp/**"],
+          "deny": []
+        }
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "app",
+    "icon": ["icons/icon.icns", "icons/icon.png"]
+  }
+}

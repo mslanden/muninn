@@ -1,0 +1,22 @@
+{
+  "name": "spinosaur",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "tauri": "tauri",
+    "sign-dev": "/usr/libexec/PlistBuddy -c 'Delete :NSMicrophoneUsageDescription' src-tauri/target/debug/bundle/macos/Spino.app/Contents/Info.plist 2>/dev/null; /usr/libexec/PlistBuddy -c 'Add :NSMicrophoneUsageDescription string \"Spino needs microphone access for voice input.\"' src-tauri/target/debug/bundle/macos/Spino.app/Contents/Info.plist && /usr/libexec/PlistBuddy -c 'Delete :NSSpeechRecognitionUsageDescription' src-tauri/target/debug/bundle/macos/Spino.app/Contents/Info.plist 2>/dev/null; /usr/libexec/PlistBuddy -c 'Add :NSSpeechRecognitionUsageDescription string \"Spino uses speech recognition for voice commands.\"' src-tauri/target/debug/bundle/macos/Spino.app/Contents/Info.plist && codesign --force --sign - --entitlements src-tauri/Entitlements.plist src-tauri/target/debug/bundle/macos/Spino.app",
+    "start": "npm run dev & sleep 2 && open src-tauri/target/debug/bundle/macos/Spino.app"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-autostart": "^2.5.1",
+    "@tauri-apps/plugin-dialog": "^2.6.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "vite": "^5.4.0"
+  }
+}

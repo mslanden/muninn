@@ -1,0 +1,37 @@
+[package]
+name = "spinosaur"
+version = "0.1.0"
+description = "A macOS-first Tauri + Rust app"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "spinosaur_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+portable-pty = "0.9"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+urlencoding = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png", "devtools"] }
+tauri-plugin-autostart = "2"
+notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
+tokio = { version = "1", features = ["time", "sync"] }
+uuid = { version = "1", features = ["v4"] }
+which = "6"
+cpal = "0.17.3"
+tauri-plugin-dialog = "2.6.0"
+futures = "0.3.32"
+dirs = "6.0.0"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
