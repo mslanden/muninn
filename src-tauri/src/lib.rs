@@ -2,29 +2,41 @@ mod audio;
 mod commands;
 mod db;
 mod feeds;
+mod interactive;
 mod llm;
+mod mail;
 mod models;
 mod scheduler;
+mod search;
+mod todos;
 mod tools;
 
 use models::RunningProcess;
+use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::Client;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::Emitter;
 
+pub type DbPool = r2d2::Pool<SqliteConnectionManager>;
+
 pub struct AppState {
     pub workspace_root: Mutex<PathBuf>,
     pub workspace_root_canon: Mutex<PathBuf>,
-    pub db: Mutex<Connection>,
+    pub db: DbPool,
     pub processes: Mutex<HashMap<String, RunningProcess>>,
     pub http: Client,
     pub audio: audio::AudioRecorder,
     /// Session IDs that have been requested to stop generation
     pub stop_requests: Mutex<HashSet<String>>,
+    /// Agent-owned to-do lists, keyed by session_id. Ephemeral — not persisted.
+    pub todos: Mutex<HashMap<String, Vec<models::TodoItem>>>,
+    /// Outstanding `ask_user` questions, keyed by session_id. Sender fires when
+    /// the user answers; drop the sender to cancel.
+    pub pending_questions: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -37,10 +49,20 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-            let db_path = data_dir.join("spinosaur.db");
-            let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
-            conn.execute("PRAGMA foreign_keys = ON;", []).map_err(|e| e.to_string())?;
-            conn.execute_batch("PRAGMA journal_mode = WAL;").map_err(|e| e.to_string())?;
+            let db_path = data_dir.join("muninn.db");
+            // Pooled connections: WAL allows concurrent readers, so chat turns, the
+            // scheduler, and UI queries no longer serialize on one connection. Pragmas
+            // run on every new connection (execute_batch, not execute — see 09fc056).
+            let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
+                c.execute_batch(
+                    "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;",
+                )
+            });
+            let pool = r2d2::Pool::builder()
+                .max_size(8)
+                .build(manager)
+                .map_err(|e| e.to_string())?;
+            let conn = pool.get().map_err(|e| e.to_string())?;
             db::init_db(&conn)?;
 
             let (workspace_root, workspace_root_canon) = tools::default_workspace_root()?;
@@ -53,6 +75,7 @@ pub fn run() {
                 params![workspace_root.display().to_string()],
             )
             .map_err(|e| e.to_string())?;
+            drop(conn);
             let http = Client::builder()
                 .timeout(std::time::Duration::from_secs(90))
                 .build()
@@ -61,11 +84,13 @@ pub fn run() {
             app.manage(AppState {
                 workspace_root: Mutex::new(workspace_root),
                 workspace_root_canon: Mutex::new(workspace_root_canon),
-                db: Mutex::new(conn),
+                db: pool,
                 processes: Mutex::new(HashMap::new()),
                 http,
                 audio: audio::AudioRecorder::new(),
                 stop_requests: Mutex::new(HashSet::new()),
+                todos: Mutex::new(HashMap::new()),
+                pending_questions: Mutex::new(HashMap::new()),
             });
 
             // Plugins
@@ -76,13 +101,13 @@ pub fn run() {
             app.handle().plugin(tauri_plugin_dialog::init())?;
 
             // System tray
-            let show_item = MenuItem::with_id(app, "show", "Show Spino", true, None::<&str>)?;
+            let show_item = MenuItem::with_id(app, "show", "Show Muninn", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().expect("app icon missing — check bundle.icon in tauri.conf.json").clone())
-                .tooltip("Spino")
+                .tooltip("Muninn")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -237,9 +262,18 @@ pub fn run() {
             commands::get_ai_feeds,
             commands::create_ai_feed,
             commands::delete_ai_feed,
+            commands::update_ai_feed,
             commands::get_ai_feed_items,
             commands::mark_ai_feed_item_read,
-            commands::refresh_ai_feed
+            commands::generate_feed_item_image,
+            commands::generate_feed_article,
+            commands::refresh_ai_feed,
+            commands::ai_web_search,
+            commands::geocode_user_location,
+            commands::get_session_todos,
+            commands::answer_user_question,
+            commands::cancel_user_question,
+            commands::has_pending_question
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

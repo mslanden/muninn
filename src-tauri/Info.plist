@@ -3,8 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Spino needs microphone access for voice input and speech-to-text.</string>
+    <string>Muninn needs microphone access for voice input and speech-to-text.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>Spino uses speech recognition for voice commands.</string>
+    <string>Muninn uses speech recognition for voice commands.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Muninn uses Automation to read your Apple Mail inbox when you ask it about your email.</string>
 </dict>
 </plist>

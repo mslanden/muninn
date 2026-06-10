@@ -1,8 +1,82 @@
 use portable_pty;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+
+/// A single turn in a replayable chat history. `blocks` is an Anthropic-style content array —
+/// each block is `{type:"text"|"tool_use"|"tool_result", ...}`. This is the canonical in-memory
+/// form; provider adapters convert it to OpenAI's tool_calls shape when needed.
+#[derive(Clone, Debug)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub blocks: Vec<Value>,
+}
+
+impl HistoryMessage {
+    pub fn text(role: &str, text: &str) -> Self {
+        Self {
+            role: role.to_string(),
+            blocks: vec![json!({"type": "text", "text": text})],
+        }
+    }
+
+    /// Concatenate all text blocks for display / approximate sizing.
+    pub fn plain_text(&self) -> String {
+        let mut out = String::new();
+        for block in &self.blocks {
+            if block.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(t);
+                }
+            }
+        }
+        out
+    }
+
+    /// Approximate character count, used for history trimming.
+    pub fn char_len(&self) -> usize {
+        serde_json::to_string(&self.blocks)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+}
+
+/// A single entry in an agent's ephemeral to-do list. Written by the agent via the
+/// `write_todos` tool; stored in-memory per session (not persisted across app restart).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoItem {
+    /// Short imperative phrase, e.g. "Read src/main.rs".
+    pub content: String,
+    /// One of: "pending" | "in_progress" | "completed".
+    pub status: String,
+    /// Present-participle form shown while the item is the active one
+    /// (e.g. "Reading src/main.rs"). Optional — falls back to `content`.
+    #[serde(default)]
+    pub active_form: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleConfig {
+    pub version: u32,
+    pub start_date: String,
+    pub end_date: Option<String>,
+    pub days: HashMap<String, Option<DayConfig>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DayConfig {
+    pub mode: String,
+    pub times: Option<Vec<String>>,
+    pub interval_mins: Option<u32>,
+}
 
 #[derive(Serialize)]
 pub struct SessionRecord {
@@ -69,7 +143,7 @@ pub struct PathResult {
 pub struct ProjectRecord {
     pub path: String,
     pub name: String,
-    pub spino_md: String,
+    pub agents_md: String,
     pub created_at: String,
     pub last_opened_at: String,
 }
@@ -107,6 +181,7 @@ pub struct TaskRecord {
     pub name: String,
     pub description: String,
     pub schedule: String,
+    pub schedule_config: String,
     pub next_run: String,
     pub status: String,
     pub completed_at: String,
@@ -306,6 +381,7 @@ pub struct TaskCreateRequest {
     pub name: String,
     pub description: Option<String>,
     pub schedule: Option<String>,
+    pub schedule_config: Option<String>,
     pub next_run: Option<String>,
 }
 
@@ -316,6 +392,7 @@ pub struct TaskUpdateRequest {
     pub name: String,
     pub description: Option<String>,
     pub schedule: Option<String>,
+    pub schedule_config: Option<String>,
     pub next_run: Option<String>,
 }
 
@@ -584,6 +661,7 @@ pub struct AiFeedRecord {
     pub name: String,
     pub topics: Vec<String>,
     pub refresh_interval_mins: i64,
+    pub schedule_config: String,
     pub last_refreshed_at: String,
     pub created_at: String,
 }
@@ -597,8 +675,31 @@ pub struct AiFeedItemRecord {
     pub summary: String,
     pub url: String,
     pub source_name: String,
+    pub image_url: String,
     pub is_read: bool,
     pub created_at: String,
+    pub article: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiWebSearchRequest {
+    pub query: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiWebSource {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiWebSearchResult {
+    pub answer: String,
+    pub sources: Vec<AiWebSource>,
 }
 
 #[derive(Serialize)]
@@ -613,6 +714,17 @@ pub struct AiFeedCreateRequest {
     pub name: String,
     pub topics: Vec<String>,
     pub refresh_interval_mins: Option<i64>,
+    pub schedule_config: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiFeedUpdateRequest {
+    pub id: i64,
+    pub name: String,
+    pub topics: Vec<String>,
+    pub refresh_interval_mins: Option<i64>,
+    pub schedule_config: Option<String>,
 }
 
 #[derive(Deserialize)]

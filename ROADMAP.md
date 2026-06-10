@@ -1,4 +1,4 @@
-# Spinosaur V1 Roadmap
+# Muninn V1 Roadmap
 
 ## Goal
 Recreate core Verus app workflows in Tauri + Rust with **no daemon**.
@@ -137,4 +137,4 @@ Add command groups:
 - Test pass (`npm run build`, `cargo check`)
 
 ## Immediate Next Build Step
-- Implement nav rail + section panel scaffold in `spinosaur` frontend, then ship Vertical Slice A (Chat + session history) on top of that shell.
+- Implement nav rail + section panel scaffold in `muninn` frontend, then ship Vertical Slice A (Chat + session history) on top of that shell.

@@ -1,0 +1,76 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+- **Run the desktop app (dev):** `npm run tauri dev` — launches Vite on port 1420 (strict) and the Tauri Rust host. `beforeDevCommand` in `src-tauri/tauri.conf.json` starts `npm run dev` automatically.
+- **Frontend only:** `npm run dev` (Vite, no Rust host — useful for pure UI work but invoke/`@tauri-apps/*` calls will error).
+- **Production build:** `npm run build` then `npm run tauri build` (macOS `.app` bundle).
+- **Rust type-check without a full build:** `cargo check --manifest-path src-tauri/Cargo.toml`.
+- **Sign a locally-built debug bundle** (adds mic + speech recognition entitlements so voice features work): `npm run sign-dev`. Use after `npm run tauri build --debug`.
+- **Launch signed debug bundle:** `npm run start`.
+- **Run Rust unit tests:** `cargo test --manifest-path src-tauri/Cargo.toml --lib` (covers workspace path scoping, dangerous-command detection, `sanitize_tool_pairs`, schema migrations, schedule parsing). CI (`.github/workflows/ci.yml`) runs `cargo check`, `cargo test`, and `npm run build` on push/PR. There is no frontend test suite and no linter configured.
+
+## Required env vars / provider config
+
+- `OPENAI_API_KEY` — for OpenAI provider (or save in Settings UI under `llm/openai_api_key`).
+- `MINIMAX_API_KEY` (or `ANTHROPIC_API_KEY`) — for the "MiniMax (Anthropic Compatible)" provider. Optional `MINIMAX_ANTHROPIC_BASE_URL` (default `https://api.minimax.io/anthropic`).
+- Settings stored in the DB's `app_config` table take precedence over env vars (see `first_non_empty_setting` in [src-tauri/src/db.rs](src-tauri/src/db.rs)).
+
+## Architecture
+
+Muninn is a **single-process Tauri 2 app**: there is no daemon, no sidecar, and no separate backend service. The Rust process owns all state and exposes it to the webview via `#[tauri::command]` handlers registered in [src-tauri/src/lib.rs](src-tauri/src/lib.rs) `invoke_handler!`. The frontend is vanilla JS + Vite (no framework) that calls `invoke(...)` from `@tauri-apps/api/core` and listens to events via `listen(...)`.
+
+### Rust module map (`src-tauri/src/`)
+
+- [lib.rs](src-tauri/src/lib.rs) — `AppState`, app setup, system tray, window event hooks, scheduler + embedding-backfill + content-watcher spawn, full command registration list.
+- [commands/](src-tauri/src/commands/) — every `#[tauri::command]`, split into feature submodules (`chat`, `sessions`, `feed`, `ai_feeds`, `tasks`, `agents`, `memory`, `settings`, `gallery`, `workspace`, `terminal`, `projects`, `voice`, `toolconfig`). All commands are re-exported flat from `commands/mod.rs`, so `lib.rs` registration stays `commands::foo`. This is the only module that should be referenced from JS.
+- [db.rs](src-tauri/src/db.rs) — SQLite schema (`init_db` + versioned `run_migrations`), `with_db` accessor, `insert_message`, `add_feed_item`, settings accessors. **DB access goes through an r2d2 connection pool** (8 conns, WAL allows concurrent readers; writers rely on a 5s `busy_timeout`); pragmas run per-connection via the pool's `with_init` (use `execute_batch`, not `execute` — see commit `09fc056`). DB lives at `app_data_dir()/muninn.db` (macOS: `~/Library/Application Support/com.marcelinolanden.muninn/`).
+- [llm.rs](src-tauri/src/llm.rs) — the `Provider` enum (OpenAI chat/completions vs Anthropic messages wire formats: auth, request body, SSE parsing, tool-round message shapes) and the single shared `run_tool_loop` used by `chat_with_openai`, `chat_with_minimax_anthropic`, and `run_agent`. Also `history_to_openai` / `history_to_anthropic` converters, tool-schema JSON (`tool_defs` is the single source for both providers), memory retrieval + embedding backfill. The canonical in-memory history shape is **Anthropic-style content blocks** (`{type:"text"|"tool_use"|"tool_result"}`); OpenAI's `tool_calls` shape is derived on the fly.
+- [tools.rs](src-tauri/src/tools.rs) — workspace-scoped filesystem/search/shell + web-search/fetch + image-gen + Mapbox directions/places. `WorkspaceScope` is the boundary: every fs tool goes through `resolve_within_workspace` and every shell command through `is_dangerous_command`.
+- [scheduler.rs](src-tauri/src/scheduler.rs) — `next_run_from_schedule` parses strings like `"every 30s"`, `"daily at 09:00"`, `"every monday at 10:00"`; `run_scheduler` ticks tasks and AI feeds.
+- [feeds.rs](src-tauri/src/feeds.rs) — AI feed generation (scheduled LLM jobs that produce feed items with optional images).
+- [audio.rs](src-tauri/src/audio.rs) — `cpal`-based recorder; wired to whisper transcription commands.
+- [models.rs](src-tauri/src/models.rs) — shared serde structs + `HistoryMessage` type.
+
+### Chat turn loop (important)
+
+`commands::chat` → loads structured history from SQLite → trims to ~80k-token budget by char count on the JSON (not plain text) → calls `sanitize_tool_pairs` so no orphan `tool_use`/`tool_result` survives trimming (providers reject this with a 400) → builds a `Provider` and enters `run_tool_loop` in `llm.rs` → tool rounds run in-Rust via handlers in `tools.rs`, each logged to `tool_logs` and the feed → final assistant message + any hidden intermediate rows persisted. Custom agents (`run_agent`) go through the same `run_tool_loop` (with the agent's system prompt/tool allowlist and the agent-iteration event).
+
+Stop generation: the frontend calls `stop_chat` which inserts the session id into `AppState.stop_requests`; `run_tool_loop` checks this between rounds (for both chat and agent runs).
+
+### Safety boundaries (do not weaken)
+
+- **Workspace scoping:** all file tools take a canonicalized `root_canon` and must reject paths that escape it. See `resolve_within_workspace` in [tools.rs](src-tauri/src/tools.rs:117).
+- **Dangerous command check:** shell tools run through `is_dangerous_command`. Agent-invoked commands that match are routed through the `ask_user` approval prompt in interactive chat (hard-blocked in scheduled/background runs); only `run_command_scoped_unchecked` skips the check, and it must only be called post-approval. See [tools.rs](src-tauri/src/tools.rs) and `commands::check_command_safety`.
+- **Secret settings:** `get_app_settings` redacts any `app_config` key containing `api_key`/`_token`/`_secret` (except the client-side Mapbox token) to the `__secret_set__` placeholder; `set_app_settings` ignores writes of that placeholder. Never add a code path that returns raw secrets to the webview.
+- **CSP** in [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json) enumerates every allowed `connect-src` origin — adding a new LLM/image/maps provider means editing the CSP.
+- **Capabilities** in [src-tauri/capabilities/default.json](src-tauri/capabilities/default.json) are minimal by design. Add new plugin permissions here, not by broadening existing ones.
+- **XSS:** the frontend builds DOM via `innerHTML` extensively and relies on `escapeHtml` (see [src/utils.js](src/utils.js)). Any new `innerHTML` sink must escape untrusted data.
+
+### System tray / window behavior
+
+The app runs tray-resident: `WindowEvent::CloseRequested` hides the window instead of closing, and `RunEvent::ExitRequested` prevents exit. Quit is only via the tray menu. `TrayIconBuilder` requires an explicit icon (see commit `85c7e73`) — don't remove the `.icon(...)` call.
+
+### Frontend structure
+
+The frontend is split into ES modules under `src/`:
+
+- [main.js](src/main.js) — entry point: side-effect imports of all feature modules (which registers their tile renderers), sidebar button wiring, and the `bootMain`/`bootPopout` flow.
+- [state.js](src/state.js) — shared DOM refs and cross-module mutable state. Reassignable scalars (`loadedSettings`, `mapboxToken`, `cachedAgents`, `focusedTileId`, `nextTileId`) live behind the exported `ui` object because ES module bindings can't be reassigned by importers. `tiles`, `chatStreams`, and `tileMaps` are exported containers (mutated, never reassigned).
+- [registry.js](src/registry.js) — the tile-renderer registry. Dependency-free on purpose: feature modules call `registerTileRenderer(type, fn)` at import time, and `tilesys.js` looks renderers up at render time. Putting this anywhere with imports recreates a circular-init (TDZ) crash at boot.
+- [tilesys.js](src/tilesys.js) — tile add/remove/focus, grid layout, sidebar, pop-out windows, layout persistence.
+- [utils.js](src/utils.js) — pure helpers (`escapeHtml`, `renderMarkdown`, formatters).
+- Feature modules, one per tile type: [chat.js](src/chat.js), [feeds.js](src/feeds.js), [web.js](src/web.js), [logs.js](src/logs.js), [tasks.js](src/tasks.js), [toolspanel.js](src/toolspanel.js), [agents.js](src/agents.js), [memory.js](src/memory.js), [content.js](src/content.js), [workspaces.js](src/workspaces.js), [settings.js](src/settings.js); plus [schedule.js](src/schedule.js) (shared schedule widget), [reader.js](src/reader.js) (article reader windows), [events.js](src/events.js) (all Tauri event listeners), [theme.js](src/theme.js).
+
+Panels are rendered as "tiles" (the `tiles` array in `state.js`) keyed by numeric `id`; `tileMaps` tracks Mapbox instances for cleanup on tile close (tiles can also set a `cleanup()` callback). Theme is handled via `data-theme` on `<html>` and persisted to `localStorage` under `muninn-theme`.
+
+## Conventions / gotchas
+
+- The README still mentions the old `spino` path in one `cd` example — ignore it; the project lives at `Muninn/`.
+- When adding a new `#[tauri::command]`, you must (1) define it in the right `commands/` submodule, (2) register it in the `invoke_handler!` macro in `lib.rs`, and (3) call it from the relevant frontend module. Missing step 2 produces a runtime "command not found" error only.
+- When adding a new tool the LLM can call, add it to `tool_defs` in [llm.rs](src-tauri/src/llm.rs) (both providers derive their schema from it) and add the dispatch arm in [tools.rs](src-tauri/src/tools.rs) `execute_agent_tool`.
+- When adding a new tile type, write `renderXTile(tileObj, body)` in a new module, call `registerTileRenderer("x", renderXTile)` at the bottom, add the side-effect import in `main.js`, and add an entry to `TILE_TYPES` in `tilesys.js` if it should appear in the sidebar.
+- History trimming operates on structured JSON length, not plain text — changes to message shape can silently shift the effective context budget.
+- The `dist/` folder is committed as the Tauri `frontendDist`; a stale `dist` can cause `npm run tauri dev` to serve old UI if Vite isn't running. Prefer `npm run tauri dev` over running the bundled app during iteration.

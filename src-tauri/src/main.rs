@@ -1,3 +1,3 @@
 fn main() {
-    spinosaur_lib::run();
+    muninn_lib::run();
 }

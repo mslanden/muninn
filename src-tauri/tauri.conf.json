@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Spino",
+  "productName": "Muninn",
   "version": "0.1.0",
-  "identifier": "com.marcelinolanden.spinosaur",
+  "identifier": "com.marcelinolanden.muninn",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Spino",
+        "title": "Muninn",
         "width": 980,
         "height": 680,
         "resizable": true,
@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; font-src https://fonts.gstatic.com; img-src 'self' asset: http: https: data: blob:; connect-src 'self' https://api.minimax.io https://api.openai.com https://api.anthropic.com https://*.tile.openstreetmap.org https://nominatim.openstreetmap.org https://router.project-osrm.org https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; media-src 'self' asset: blob:",
+      "csp": "default-src 'self'; script-src 'self' https://unpkg.com https://api.mapbox.com blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com https://api.mapbox.com; font-src https://fonts.gstatic.com; img-src 'self' asset: http: https: data: blob:; connect-src 'self' ipc://localhost https://api.minimax.io https://api.openai.com https://api.anthropic.com https://*.mapbox.com https://events.mapbox.com https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; frame-src 'self' http: https:; child-src 'self' http: https:; worker-src blob:; media-src 'self' asset: blob:",
       "assetProtocol": {
         "enable": true,
         "scope": {

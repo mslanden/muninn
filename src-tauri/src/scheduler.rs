@@ -1,10 +1,11 @@
-use chrono::{Datelike, Local, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Weekday};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Weekday};
 use rusqlite::params;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::AppState;
-use crate::db::{add_feed_item, get_app_setting_value, with_db};
+use crate::db::{add_feed_item, get_app_setting_value, insert_message, with_db};
 use crate::llm::{chat_with_minimax_anthropic, chat_with_openai};
+use crate::models::{DayConfig, HistoryMessage, ScheduleConfig};
 use crate::tools::truncate_chars;
 
 /// Parse a human-friendly schedule string into the next run time from `now`.
@@ -144,6 +145,111 @@ fn compute_next_run(schedule: &str, last_run: NaiveDateTime) -> Option<String> {
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
 }
 
+fn weekday_to_key(wd: Weekday) -> &'static str {
+    match wd {
+        Weekday::Mon => "mon",
+        Weekday::Tue => "tue",
+        Weekday::Wed => "wed",
+        Weekday::Thu => "thu",
+        Weekday::Fri => "fri",
+        Weekday::Sat => "sat",
+        Weekday::Sun => "sun",
+    }
+}
+
+/// Find the next run from a day config on a specific date.
+fn next_run_on_date(date: NaiveDate, cfg: &DayConfig, after: Option<NaiveDateTime>) -> Option<NaiveDateTime> {
+    match cfg.mode.as_str() {
+        "times" => {
+            let times = cfg.times.as_ref()?;
+            let mut parsed: Vec<NaiveTime> = times.iter().filter_map(|t| parse_hhmm(t)).collect();
+            parsed.sort();
+            for t in parsed {
+                let candidate = date.and_time(t);
+                if let Some(ref a) = after {
+                    if candidate <= *a {
+                        continue;
+                    }
+                }
+                return Some(candidate);
+            }
+            None
+        }
+        "continuous" => {
+            let mins = cfg.interval_mins.unwrap_or(60) as i64;
+            if mins <= 0 {
+                return None;
+            }
+            if let Some(ref a) = after {
+                if a.date() == date {
+                    let next = *a + TimeDelta::minutes(mins);
+                    if next.date() == date {
+                        return Some(next);
+                    }
+                    return None;
+                }
+            }
+            // Start of day
+            date.and_hms_opt(0, 0, 0)
+        }
+        _ => None,
+    }
+}
+
+/// Parse a JSON schedule config and compute the next run time from `from`.
+pub fn next_run_from_schedule_config(
+    config_json: &str,
+    from: NaiveDateTime,
+) -> Option<NaiveDateTime> {
+    let config: ScheduleConfig = serde_json::from_str(config_json).ok()?;
+    let start = NaiveDate::parse_from_str(&config.start_date, "%Y-%m-%d").ok()?;
+    let end = config
+        .end_date
+        .as_ref()
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+
+    // Determine the effective start point
+    let effective_from = if from.date() < start {
+        start.and_hms_opt(0, 0, 0)?
+    } else {
+        from
+    };
+
+    // Past end date?
+    if let Some(end_date) = end {
+        if effective_from.date() > end_date {
+            return None;
+        }
+    }
+
+    // Check today first
+    let today_key = weekday_to_key(effective_from.weekday());
+    if let Some(Some(day_cfg)) = config.days.get(today_key) {
+        if let Some(next) = next_run_on_date(effective_from.date(), day_cfg, Some(from)) {
+            if end.map_or(true, |e| next.date() <= e) {
+                return Some(next);
+            }
+        }
+    }
+
+    // Search forward up to 7 days
+    for offset in 1..=7 {
+        let candidate_date = effective_from.date() + TimeDelta::days(offset);
+        if let Some(end_date) = end {
+            if candidate_date > end_date {
+                return None;
+            }
+        }
+        let key = weekday_to_key(candidate_date.weekday());
+        if let Some(Some(day_cfg)) = config.days.get(key) {
+            if let Some(next) = next_run_on_date(candidate_date, day_cfg, None) {
+                return Some(next);
+            }
+        }
+    }
+    None
+}
+
 /// The main scheduler loop. Spawned once at app startup.
 pub async fn run_scheduler(app: AppHandle) {
     loop {
@@ -154,10 +260,10 @@ pub async fn run_scheduler(app: AppHandle) {
         let now_str = now.format("%Y-%m-%dT%H:%M:%S").to_string();
 
         // Find due tasks: status = 'scheduled', next_run is non-empty and <= now
-        let due_tasks: Vec<(i64, String, String, String)> = match with_db(&state, |db| {
+        let due_tasks: Vec<(i64, String, String, String, String)> = match with_db(&state, |db| {
             let mut stmt = db
                 .prepare(
-                    "SELECT id, name, description, schedule FROM tasks \
+                    "SELECT id, name, description, schedule, schedule_config FROM tasks \
                      WHERE status = 'scheduled' AND next_run != '' AND next_run <= ?1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -168,6 +274,7 @@ pub async fn run_scheduler(app: AppHandle) {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })
                 .map_err(|e| e.to_string())?;
@@ -181,7 +288,7 @@ pub async fn run_scheduler(app: AppHandle) {
             Err(_) => continue,
         };
 
-        for (task_id, task_name, description, schedule) in due_tasks {
+        for (task_id, task_name, description, schedule, schedule_config) in due_tasks {
             // Mark as running
             let _ = with_db(&state, |db| {
                 db.execute(
@@ -219,16 +326,11 @@ pub async fn run_scheduler(app: AppHandle) {
                 description.clone()
             };
 
-            // Save user message
-            let _ = with_db(&state, |db| {
-                db.execute(
-                    "INSERT INTO messages (session_id, role, content) VALUES (?1, 'user', ?2)",
-                    params![session_id, prompt],
-                )
-                .map_err(|e| e.to_string())
-            });
+            // Save user message (structured so future replays keep the turn intact).
+            let user_blocks = vec![serde_json::json!({"type": "text", "text": prompt.clone()})];
+            let _ = insert_message(&state, &session_id, "user", &prompt, &user_blocks, false);
 
-            let history = vec![("user".to_string(), prompt.clone())];
+            let history = vec![HistoryMessage::text("user", &prompt)];
 
             // Determine provider/model
             let provider = get_app_setting_value(&state, "llm/provider")
@@ -249,31 +351,32 @@ pub async fn run_scheduler(app: AppHandle) {
 
             // Run LLM
             let result = if provider == "minimax" || model.starts_with("MiniMax-") {
-                chat_with_minimax_anthropic(&app, &state, &session_id, &model, &history, None).await
+                chat_with_minimax_anthropic(&app, &state, &session_id, &model, &history, None, false).await
             } else {
-                chat_with_openai(&app, &state, &session_id, &model, &history, None).await
+                chat_with_openai(&app, &state, &session_id, &model, &history, None, false).await
             };
 
             let (status, reply_preview) = match &result {
-                Ok(reply) => {
-                    let _ = with_db(&state, |db| {
-                        db.execute(
-                            "INSERT INTO messages (session_id, role, content) VALUES (?1, 'assistant', ?2)",
-                            params![session_id, reply],
-                        )
-                        .map_err(|e| e.to_string())
-                    });
+                Ok((reply, blocks)) => {
+                    let _ = insert_message(&state, &session_id, "assistant", reply, blocks, false);
                     ("completed", truncate_chars(reply, 200))
                 }
                 Err(e) => ("scheduled", format!("Error: {}", truncate_chars(e, 180))),
             };
 
-            // Calculate next run
-            let new_next_run = compute_next_run(&schedule, now).unwrap_or_default();
+            // Calculate next run (prefer schedule_config over legacy schedule)
+            let new_next_run = if !schedule_config.trim().is_empty() {
+                next_run_from_schedule_config(&schedule_config, now)
+                    .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+                    .unwrap_or_default()
+            } else {
+                compute_next_run(&schedule, now).unwrap_or_default()
+            };
 
             // If task has a recurring schedule, reset to 'scheduled' with new next_run.
             // If no schedule (one-shot), mark as completed.
-            let final_status = if !schedule.trim().is_empty() && !new_next_run.is_empty() {
+            let has_schedule = (!schedule.trim().is_empty()) || (!schedule_config.trim().is_empty());
+            let final_status = if has_schedule && !new_next_run.is_empty() {
                 "scheduled"
             } else {
                 status
@@ -303,6 +406,71 @@ pub async fn run_scheduler(app: AppHandle) {
                 if result.is_ok() { "checkmark" } else { "error" },
                 &session_id,
             );
+        }
+
+        // ---- Feed auto-refresh ----
+        // Find feeds due for refresh: schedule_config feeds use next_run, legacy feeds use interval math.
+        let due_feeds: Vec<(i64, String, String)> = match with_db(&state, |db| {
+            let mut stmt = db
+                .prepare(
+                    "SELECT id, name, schedule_config FROM ai_feeds \
+                     WHERE (schedule_config != '' AND next_run != '' AND next_run <= ?1) \
+                        OR (schedule_config = '' AND (last_refreshed_at = '' \
+                            OR datetime(last_refreshed_at, '+' || refresh_interval_mins || ' minutes') <= datetime(?1)))",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![now_str], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| e.to_string())?);
+            }
+            Ok(out)
+        }) {
+            Ok(feeds) => feeds,
+            Err(_) => vec![],
+        };
+
+        for (feed_id, feed_name, feed_schedule_config) in due_feeds {
+            match crate::feeds::refresh_feed_impl(state.inner(), feed_id, &app).await {
+                Ok(items_added) => {
+                    add_feed_item(
+                        &state,
+                        "feed",
+                        &format!("Feed refreshed: {} (+{} items)", feed_name, items_added),
+                        "",
+                        "checkmark",
+                        "",
+                    );
+                }
+                Err(e) => {
+                    add_feed_item(
+                        &state,
+                        "feed",
+                        &format!("Feed refresh failed: {}", feed_name),
+                        &truncate_chars(&e, 120),
+                        "error",
+                        "",
+                    );
+                }
+            }
+
+            // Compute and store next_run for schedule_config feeds
+            if !feed_schedule_config.trim().is_empty() {
+                let new_next = next_run_from_schedule_config(&feed_schedule_config, now)
+                    .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+                    .unwrap_or_default();
+                let _ = with_db(&state, |db| {
+                    db.execute(
+                        "UPDATE ai_feeds SET next_run = ?2 WHERE id = ?1",
+                        params![feed_id, new_next],
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
-# Spinosaur
+# Muninn
 
-Spinosaur is a macOS-first Tauri + Rust local coding assistant MVP.
+Muninn is a macOS-first Tauri + Rust local coding assistant MVP.
 
 ## Included MVP features
 
@@ -22,7 +22,7 @@ Spinosaur is a macOS-first Tauri + Rust local coding assistant MVP.
 ## Run
 
 ```bash
-cd /Users/marcelinolanden/Documents/myProjects/Verus/spinosaur
+cd /Users/marcelinolanden/Documents/myProjects/spino
 npm install
 npm run tauri dev
 ```

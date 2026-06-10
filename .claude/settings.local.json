@@ -43,7 +43,32 @@
       "Bash(find /Users/marcelinolanden/Documents/myProjects/spinosaur/src -type f \\\\\\(-name *.ts -o -name *.tsx -o -name *.js -o -name *.jsx \\\\\\))",
       "Bash(git init:*)",
       "Bash(git branch:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(cp -R src-tauri/target/debug/bundle/macos/Spino.app /Applications/Spino.app)",
+      "Bash(open /Applications/Spino.app)",
+      "Bash(log show:*)",
+      "Bash(/Applications/Spino.app/Contents/MacOS/spinosaur)",
+      "WebFetch(domain:keepingitrealpod.com)",
+      "WebFetch(domain:www.natalietaflingerhomes.com)",
+      "WebFetch(domain:natalietaflinger.exprealty.com)",
+      "WebFetch(domain:natalietaflingerrealtor.medium.com)",
+      "Bash(cp:*)",
+      "Bash(cp -R /Users/marcelinolanden/Documents/myProjects/spino/src-tauri/target/release/bundle/macos/Spino.app /Applications/Spino.app)",
+      "Bash($HOME/.cargo/bin/cargo check:*)",
+      "Bash(export PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\")",
+      "Bash(export PATH=\"$HOME/.cargo/bin:$PATH\")",
+      "Bash(export PATH=\"$HOME/.cargo/bin:/usr/local/bin:$PATH\")",
+      "Bash(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' /Applications/Spino.app/Contents/Info.plist)",
+      "Bash(/usr/libexec/PlistBuddy -c 'Print :NSSpeechRecognitionUsageDescription' /Applications/Spino.app/Contents/Info.plist)",
+      "Bash(/usr/libexec/PlistBuddy -c 'Delete :NSMicrophoneUsageDescription' /Users/marcelinolanden/Documents/myProjects/spino/src-tauri/target/release/bundle/macos/Spino.app/Contents/Info.plist)",
+      "Bash(/usr/libexec/PlistBuddy -c 'Add :NSMicrophoneUsageDescription string \"Spino needs microphone access for voice input and speech-to-text.\"' /Users/marcelinolanden/Documents/myProjects/spino/src-tauri/target/release/bundle/macos/Spino.app/Contents/Info.plist)",
+      "Bash(/usr/libexec/PlistBuddy -c 'Delete :NSSpeechRecognitionUsageDescription' /Users/marcelinolanden/Documents/myProjects/spino/src-tauri/target/release/bundle/macos/Spino.app/Contents/Info.plist)",
+      "Bash(/usr/libexec/PlistBuddy -c 'Add :NSSpeechRecognitionUsageDescription string \"Spino uses speech recognition for voice commands.\"' /Users/marcelinolanden/Documents/myProjects/spino/src-tauri/target/release/bundle/macos/Spino.app/Contents/Info.plist)",
+      "Bash(rm -rf /Applications/Muninn.app)",
+      "Bash(cp -R /Users/marcelinolanden/Documents/myProjects/Muninn/src-tauri/target/release/bundle/macos/Muninn.app /Applications/Muninn.app)",
+      "Bash(xattr -dr com.apple.quarantine /Applications/Muninn.app)",
+      "Bash(/usr/libexec/PlistBuddy -c \"Print :NSAppleEventsUsageDescription\" /Applications/Muninn.app/Contents/Info.plist)"
     ]
   }
 }

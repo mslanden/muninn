@@ -4,8 +4,133 @@ use std::collections::{HashMap, HashSet};
 use tauri::{AppHandle, Emitter};
 
 use crate::AppState;
-use crate::db::{first_non_empty_setting, get_app_setting_value, with_db};
+use crate::db::{first_non_empty_setting, get_app_setting_value, insert_message, with_db};
 use crate::models::*;
+
+/// Convert stored structured history into Anthropic-style messages.
+fn history_to_anthropic(history: &[HistoryMessage]) -> Vec<Value> {
+    history
+        .iter()
+        .filter(|h| !h.blocks.is_empty())
+        .map(|h| json!({ "role": h.role, "content": h.blocks }))
+        .collect()
+}
+
+/// Convert stored structured history into OpenAI chat/completions messages. A single
+/// HistoryMessage can expand into multiple OpenAI messages because each tool_result block
+/// becomes its own `role:"tool"` entry.
+fn history_to_openai(history: &[HistoryMessage]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for h in history {
+        match h.role.as_str() {
+            "assistant" => {
+                let mut text_acc = String::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                for b in &h.blocks {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(t) = b.get("text").and_then(Value::as_str) {
+                                text_acc.push_str(t);
+                            }
+                        }
+                        Some("tool_use") => {
+                            let id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                            let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                            let input = b.get("input").cloned().unwrap_or_else(|| json!({}));
+                            let args = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+                            tool_calls.push(json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": args}
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut msg = json!({"role": "assistant"});
+                if !text_acc.is_empty() {
+                    msg["content"] = json!(text_acc);
+                } else {
+                    msg["content"] = Value::Null;
+                }
+                if !tool_calls.is_empty() {
+                    msg["tool_calls"] = json!(tool_calls);
+                }
+                out.push(msg);
+            }
+            "user" => {
+                let mut text_acc = String::new();
+                for b in &h.blocks {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(t) = b.get("text").and_then(Value::as_str) {
+                                if !text_acc.is_empty() {
+                                    text_acc.push('\n');
+                                }
+                                text_acc.push_str(t);
+                            }
+                        }
+                        Some("tool_result") => {
+                            let id = b
+                                .get("tool_use_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let content_str = match b.get("content") {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Array(arr)) => {
+                                    let mut s = String::new();
+                                    for c in arr {
+                                        if let Some(t) = c.get("text").and_then(Value::as_str) {
+                                            s.push_str(t);
+                                        }
+                                    }
+                                    s
+                                }
+                                Some(v) => v.to_string(),
+                                None => String::new(),
+                            };
+                            out.push(json!({
+                                "role": "tool",
+                                "tool_call_id": id,
+                                "content": content_str,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                if !text_acc.is_empty() {
+                    out.push(json!({"role": "user", "content": text_acc}));
+                }
+            }
+            _ => {
+                let text = h.plain_text();
+                if !text.is_empty() {
+                    out.push(json!({"role": h.role, "content": text}));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One-line summary of a user tool_result turn for DB `content` (used only when row happens to
+/// be visible in UI — intermediate rounds are hidden, but we still store a readable fallback).
+fn tool_result_summary(blocks: &[Value]) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for b in blocks {
+        if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+            if let Some(id) = b.get("tool_use_id").and_then(Value::as_str) {
+                names.push(id.to_string());
+            }
+        }
+    }
+    if names.is_empty() {
+        "[tool results]".into()
+    } else {
+        format!("[tool results: {}]", names.join(", "))
+    }
+}
 use crate::tools::{
     enabled_tool_ids, execute_agent_tool, log_tool, parse_tool_code_block,
     truncate_chars, WorkspaceScope,
@@ -278,6 +403,143 @@ pub(crate) async fn compact_entity_summary(
     Some(compacted)
 }
 
+/// One-shot, non-streaming LLM call that expands a short feed summary into a fuller
+/// markdown overview/article. Grounded in `source_text` (the fetched original page) when
+/// available. Returns the article text or an error string.
+pub(crate) async fn generate_feed_article_text(
+    state: &AppState,
+    title: &str,
+    summary: &str,
+    url: &str,
+    source_name: &str,
+    source_text: &str,
+) -> Result<String, String> {
+    let provider = get_app_setting_value(state, "llm/provider")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "minimax".to_string());
+
+    let model = get_app_setting_value(state, "llm/model")
+        .ok()
+        .flatten()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| {
+            if provider == "minimax" { "MiniMax-M2.7".to_string() } else { "gpt-4.1-mini".to_string() }
+        });
+
+    let is_anthropic = provider == "minimax" || provider == "anthropic" || model.starts_with("MiniMax-");
+
+    let (api_key, endpoint) = if is_anthropic {
+        let key = first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])
+            .ok()
+            .flatten()
+            .or_else(|| std::env::var("MINIMAX_API_KEY").ok())
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+            .ok_or_else(|| "No API key configured".to_string())?;
+        let base = std::env::var("MINIMAX_ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
+        let ep = if base.ends_with("/v1/messages") { base } else { format!("{}/v1/messages", base.trim_end_matches('/')) };
+        (key, ep)
+    } else {
+        let key = first_non_empty_setting(state, &["llm/openai_api_key"])
+            .ok()
+            .flatten()
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+            .ok_or_else(|| "No API key configured".to_string())?;
+        (key, "https://api.openai.com/v1/chat/completions".to_string())
+    };
+
+    // Cap fetched source so we stay within a sane token budget.
+    let source_excerpt: String = source_text.chars().take(8000).collect();
+    let source_block = if source_excerpt.trim().is_empty() {
+        "(The original page could not be fetched — write from the headline and summary, and clearly avoid inventing specific facts, numbers, or quotes.)".to_string()
+    } else {
+        format!("Original article content (may be truncated):\n{source_excerpt}")
+    };
+
+    let prompt = format!(
+        "Write a clear, well-structured overview article for this news/feed item.\n\n\
+        Headline: {title}\n\
+        Source: {source_name}\n\
+        URL: {url}\n\
+        Existing short summary: {summary}\n\n\
+        {source_block}\n\n\
+        Guidelines:\n\
+        - Write 3-6 short paragraphs (roughly 250-500 words) in plain, engaging prose.\n\
+        - Use Markdown. You may add a couple of `##` subheadings or a short bullet list if it genuinely helps.\n\
+        - Lead with what happened and why it matters, then add context and key details.\n\
+        - Ground everything in the provided content. Do NOT fabricate specifics. If something is unknown, say so or leave it out.\n\
+        - Do not restate the headline as a title, and do not add a 'Source:' footer (the UI shows that separately).\n\
+        Respond with ONLY the article in Markdown."
+    );
+
+    let system = "You are a sharp, concise editorial writer who turns source material into a faithful, readable overview. Never invent facts.";
+
+    let request_body = if is_anthropic {
+        json!({
+            "model": model,
+            "max_tokens": 1600,
+            "stream": false,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    } else {
+        json!({
+            "model": model,
+            "max_tokens": 1600,
+            "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ]
+        })
+    };
+
+    let resp = if is_anthropic {
+        state.http.post(&endpoint)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body)
+            .send().await.map_err(|e| e.to_string())?
+    } else {
+        state.http.post(&endpoint)
+            .bearer_auth(&api_key)
+            .json(&request_body)
+            .send().await.map_err(|e| e.to_string())?
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("LLM request failed ({status}): {body}"));
+    }
+
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = if is_anthropic {
+        body.get("content")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+            .and_then(|b| b.get("text"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+    } else {
+        body.get("choices")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+    }
+    .ok_or_else(|| "LLM returned no article text".to_string())?;
+
+    let article = text.trim().to_string();
+    if article.is_empty() {
+        return Err("LLM returned an empty article".to_string());
+    }
+    Ok(article)
+}
+
 /// Backfill embeddings for entities that don't have one yet.
 /// Called once on startup to handle entities created before embeddings were added.
 pub(crate) async fn backfill_embeddings(state: &AppState) {
@@ -318,11 +580,16 @@ pub(crate) async fn backfill_embeddings(state: &AppState) {
 
 /// Build system prompt. If `relevant_entity_ids` is Some, only include those entities.
 /// If None, falls back to loading all entities (legacy behavior for agents, etc.).
+/// Used by the custom-agent path, which is always user-invoked → interactive = true.
 pub(crate) fn build_system_prompt(state: &AppState) -> String {
-    build_system_prompt_with_context(state, None)
+    build_system_prompt_with_context(state, None, true)
 }
 
-pub(crate) fn build_system_prompt_with_context(state: &AppState, relevant_entity_ids: Option<&[(i64, f32)]>) -> String {
+pub(crate) fn build_system_prompt_with_context(
+    state: &AppState,
+    relevant_entity_ids: Option<&[(i64, f32)]>,
+    interactive: bool,
+) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let home = std::env::var("HOME").unwrap_or_default();
     let workspace = state
@@ -332,7 +599,7 @@ pub(crate) fn build_system_prompt_with_context(state: &AppState, relevant_entity
         .unwrap_or_default();
 
     let mut prompt = format!(
-        "You are Spino, a helpful and intelligent AI assistant running locally on the user's Mac. \
+        "You are Muninn, a helpful and intelligent AI assistant running locally on the user's Mac. \
 Today's date is {today}.\n\n\
 ## Response Style\n\
 Respond naturally and conversationally, like a knowledgeable friend. \
@@ -374,17 +641,136 @@ Proactively use your tools — don't describe what you *could* do, just do it."
         caps.push("Generate images from text descriptions (generate_image) — images display automatically in the chat after generation, do NOT say you can't show images");
     }
     if enabled.contains("search_places") {
-        caps.push("Search for places and businesses — maps display automatically, ALWAYS use the tool for location queries instead of text-only answers (search_places)");
+        caps.push("Show a specific named place on the map (search_places) — Use this to locate and display a KNOWN place by name, like 'Arriba's Mexican Grill' or 'LAX airport'. This is a pin-drop tool, not a discovery tool. For discovering new places use search_nearby, for reviews/recommendations use web_search.");
+        caps.push("Browse nearby places by CATEGORY (search_nearby) — PREFERRED tool for 'find X near me' or 'what restaurants are around here' queries. Use category IDs like 'restaurant', 'mexican_restaurant', 'coffee', 'gas_station', 'grocery', 'pharmacy', 'hotel', 'bar', 'gym', 'parking', 'fast_food', 'pizza'. Always try search_nearby FIRST for general food/service discovery. Falls back to user's saved location automatically. For reviews, ratings, or 'best of' recommendations, combine with web_search for richer results.");
     }
     if enabled.contains("get_directions") {
-        caps.push("Get directions between locations — maps display automatically, ALWAYS use the tool instead of text-only directions (get_directions)");
+        caps.push("Get directions between locations — maps display automatically, ALWAYS use the tool instead of text-only directions. Supports driving, walking, and cycling modes. (get_directions)");
     }
-
+    if enabled.contains("list_inbox") {
+        caps.push("Read the user's Apple Mail inbox (list_inbox) — recent messages, optionally unread-only.");
+    }
+    if enabled.contains("search_mail") {
+        caps.push("Search mail by subject or sender (search_mail) — subject+sender only, not body content.");
+    }
+    if enabled.contains("read_mail") {
+        caps.push("Read the full body of a specific message by Message-ID (read_mail).");
+    }
+    if enabled.contains("write_todos") {
+        caps.push("Maintain a plan / checklist for this turn (write_todos) — rewrite the full list each call.");
+    }
+    if enabled.contains("ask_user") && interactive {
+        caps.push("Ask the user a clarifying question and wait for their answer (ask_user).");
+    }
     if !caps.is_empty() {
         prompt.push_str("\n\nAvailable tools:\n");
         for cap in &caps {
             prompt.push_str(&format!("- {}\n", cap));
         }
+    }
+
+    // Mode-dependent framing. In interactive mode the agent can ask the user
+    // questions; in non-interactive (scheduled) mode it cannot and must make
+    // judgment calls on its own.
+    if !interactive {
+        prompt.push_str(
+            "\n\n## Autonomous mode\n\
+This is a scheduled or background run — there is no user present to answer \
+questions. Make your best decision with the context you already have. If the \
+request is genuinely ambiguous, note the assumption you made in your output \
+rather than stalling.",
+        );
+    }
+
+    // Email tools need a short section too — explain the workflow and the read-only boundary.
+    // Keep in sync with build_project_system_prompt.
+    let any_mail_tool = ["list_inbox", "search_mail", "read_mail"]
+        .iter()
+        .any(|t| enabled.contains(*t));
+    if any_mail_tool {
+        prompt.push_str(
+            "\n\n## Email (Apple Mail)\n\
+You can read the user's email through Apple Mail on this Mac. Access is \
+READ-ONLY — you cannot send, reply, delete, mark read, or modify anything. \
+The tools read Mail's local cache across all configured accounts (iCloud, \
+Gmail, work IMAP, etc.).\n\n\
+Typical flow: use list_inbox for \"what's new\" questions, search_mail when \
+the user names a person or topic, then read_mail on a specific message id \
+to quote or summarize content. The `id` returned by list/search is an \
+opaque handle — treat it as a black box and pass it verbatim to read_mail. \
+Handles are session-local to Mail.app (if Mail restarts, they become stale \
+and you need to re-list to get fresh ones; read_mail returns a clear error \
+when that happens).\n\n\
+Dates are ISO-8601 local time (YYYY-MM-DDTHH:MM:SS). For \"today's mail\" \
+or \"emails from last week\", push the date range into the `since` / `until` \
+parameters rather than listing everything and filtering mentally — Mail \
+handles the filter server-side, which is both faster and lets you see \
+matches further back than the recent-N limit. Use today's date from the \
+system prompt as your anchor. `until` is exclusive, so for \"today only\" \
+set `since` to today and `until` to tomorrow.\n\n\
+search_mail matches Subject + From only, not body. If the user asks \
+something that needs body content (\"what did Bob say about the budget?\"), \
+narrow with search_mail first, then read_mail each candidate.\n\n\
+First use of any mail tool will trigger a one-time macOS permission prompt \
+(\"Muninn wants to control Mail\"). If it fails with an authorization \
+error, tell the user to grant Automation access in System Settings.",
+        );
+    }
+
+    // Tasks need more context than a single bullet — append a dedicated section
+    // whenever any task tool is enabled. Keep this in sync with
+    // build_project_system_prompt.
+    let any_task_tool = ["create_task", "list_tasks", "update_task", "delete_task"]
+        .iter()
+        .any(|t| enabled.contains(*t));
+    if any_task_tool {
+        prompt.push_str(
+            "\n\n## Scheduled automations (tasks)\n\
+Tasks are scheduled LLM runs — when a task fires, the scheduler starts a fresh \
+Muninn session and sends the task's `description` as the user message. You then \
+have your full toolset and act autonomously; no human is in the loop.\n\n\
+Write `description` as a direct instruction to future-you, imperative voice \
+(\"Summarize the top 5 HN posts and save to notes/hn.md\"), not as a memo \
+(\"HN summary\"). Be specific enough that future-you can act without clarification.\n\n\
+Tasks are automations, not to-dos. Don't create one for \"remind me to call mom\" \
+(that's a reminder). Do create one for recurring work the user wants Muninn to \
+handle on its own — daily digests, periodic checks, cron-style jobs. Schedule \
+strings: 'every 30m', 'daily at 09:00', 'every monday at 10:00', 'hourly'; \
+omit schedule for a one-shot delayed run. Call list_tasks before edit/delete \
+to get the id.",
+        );
+    }
+
+    if enabled.contains("write_todos") {
+        prompt.push_str(
+            "\n\n## Planning (write_todos)\n\
+For any user request that will take more than ~3 steps, call `write_todos` \
+BEFORE starting work to lay out the plan. Keep the list short (3–8 items), \
+each item a single concrete action. Rewrite the full list each time — there \
+is no partial-update tool.\n\n\
+Status discipline: exactly one item is `in_progress` at any moment (the one \
+you're actively working on); others are `pending` or `completed`. Update the \
+list after finishing each step so the user can see progress. Don't bother \
+with write_todos for trivial 1–2 step requests — it's noise.",
+        );
+    }
+
+    if enabled.contains("ask_user") && interactive {
+        prompt.push_str(
+            "\n\n## Asking clarifying questions (ask_user)\n\
+Use `ask_user` when you GENUINELY can't proceed without information only the \
+user can give — ambiguous references (\"which Alice?\"), destructive action \
+confirmations (\"delete all three files?\"), or required inputs the tools \
+can't look up.\n\n\
+Do NOT use ask_user to:\n\
+- Ask permission for every small step (just do reasonable things)\n\
+- Get information you could find by calling another tool first (read the \
+file, search mail, run `ls` — then ask only if still ambiguous)\n\
+- Stall on easy judgment calls — pick something and proceed\n\n\
+One question at a time. The call blocks until the user answers, times out \
+after 10 minutes, or is cancelled. If `choices` is supplied, the UI shows \
+buttons; otherwise it's free-text.",
+        );
     }
 
     // User profile context
@@ -521,7 +907,7 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     // Registered projects summaries
     let projects: Vec<(String, String, String)> = with_db(state, |db| {
         let mut stmt = db
-            .prepare("SELECT path, name, spino_md FROM projects ORDER BY last_opened_at DESC LIMIT 20")
+            .prepare("SELECT path, name, agents_md FROM projects ORDER BY last_opened_at DESC LIMIT 20")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
@@ -544,9 +930,9 @@ Proactively use your tools — don't describe what you *could* do, just do it."
 
     if !projects.is_empty() {
         prompt.push_str("\n\n## Registered Projects");
-        for (path, name, spino_md) in &projects {
+        for (path, name, agents_md) in &projects {
             let display_name = if name.is_empty() { path.as_str() } else { name.as_str() };
-            let preview: String = spino_md.lines().take(3).collect::<Vec<_>>().join(" ");
+            let preview: String = agents_md.lines().take(3).collect::<Vec<_>>().join(" ");
             if preview.is_empty() {
                 prompt.push_str(&format!("\n- {} ({})", display_name, path));
             } else {
@@ -558,19 +944,26 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     prompt
 }
 
-pub(crate) fn build_project_system_prompt(state: &AppState, project_path: &str) -> String {
+pub(crate) fn build_project_system_prompt(
+    state: &AppState,
+    project_path: &str,
+    interactive: bool,
+) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    // Read spino.md directly from the workspace directory
-    let spino_md = if !project_path.is_empty() {
-        let spino_path = std::path::Path::new(project_path).join("spino.md");
-        std::fs::read_to_string(&spino_path).unwrap_or_default()
+    // Read AGENTS.md directly from the workspace directory (fall back to legacy spino.md)
+    let agents_md = if !project_path.is_empty() {
+        let agents_path = std::path::Path::new(project_path).join("AGENTS.md");
+        let legacy_path = std::path::Path::new(project_path).join("spino.md");
+        std::fs::read_to_string(&agents_path)
+            .or_else(|_| std::fs::read_to_string(&legacy_path))
+            .unwrap_or_default()
     } else {
         String::new()
     };
 
     let mut prompt = format!(
-        "You are Spino, working within the project at {project_path}. \
+        "You are Muninn, working within the project at {project_path}. \
 Today's date is {today}.\n\n\
 ## Response Style\n\
 Respond naturally and conversationally. \
@@ -590,7 +983,11 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     if enabled.contains("search_files") { caps.push("Search for text in files (search_files)"); }
     if enabled.contains("web_search") { caps.push("Search the web (web_search)"); }
     if enabled.contains("web_fetch") { caps.push("Fetch web page content (web_fetch)"); }
-
+    if enabled.contains("list_inbox") { caps.push("Read the user's Apple Mail inbox (list_inbox)"); }
+    if enabled.contains("search_mail") { caps.push("Search mail by subject or sender (search_mail)"); }
+    if enabled.contains("read_mail") { caps.push("Read a message by Message-ID (read_mail)"); }
+    if enabled.contains("write_todos") { caps.push("Maintain a checklist plan (write_todos)"); }
+    if enabled.contains("ask_user") && interactive { caps.push("Ask the user a clarifying question (ask_user)"); }
     if !caps.is_empty() {
         prompt.push_str("\n\nAvailable tools:\n");
         for cap in &caps {
@@ -598,308 +995,222 @@ Proactively use your tools — don't describe what you *could* do, just do it."
         }
     }
 
-    if !spino_md.is_empty() {
-        prompt.push_str(&format!("\n\n## Project Description (spino.md)\n{}", spino_md));
+    if !interactive {
+        prompt.push_str(
+            "\n\n## Autonomous mode\nScheduled/background run — no user present. \
+Make your best decision with the context you have and note any assumptions \
+in your output.",
+        );
+    }
+
+    // Keep this block in sync with build_system_prompt_with_context.
+    let any_mail_tool = ["list_inbox", "search_mail", "read_mail"]
+        .iter()
+        .any(|t| enabled.contains(*t));
+    if any_mail_tool {
+        prompt.push_str(
+            "\n\n## Email (Apple Mail)\n\
+Read-only access to the user's Apple Mail across all configured accounts. \
+Cannot send, reply, delete, or modify. Workflow: list_inbox for recent mail, \
+search_mail for a person/topic (Subject+From only, not body), read_mail with \
+the opaque handle from list/search. Handles are session-local (Mail restart \
+invalidates them — re-list to refresh). First call may trigger a macOS \
+Automation prompt.",
+        );
+    }
+
+    // Keep this block in sync with build_system_prompt_with_context.
+    let any_task_tool = ["create_task", "list_tasks", "update_task", "delete_task"]
+        .iter()
+        .any(|t| enabled.contains(*t));
+    if any_task_tool {
+        prompt.push_str(
+            "\n\n## Scheduled automations (tasks)\n\
+Tasks are scheduled LLM runs — when a task fires, the scheduler starts a fresh \
+Muninn session and sends the task's `description` as the user message. You then \
+have your full toolset and act autonomously; no human is in the loop.\n\n\
+Write `description` as a direct instruction to future-you, imperative voice \
+(\"Summarize the top 5 HN posts and save to notes/hn.md\"), not as a memo \
+(\"HN summary\"). Be specific enough that future-you can act without clarification.\n\n\
+Tasks are automations, not to-dos. Don't create one for \"remind me to call mom\" \
+(that's a reminder). Do create one for recurring work the user wants Muninn to \
+handle on its own — daily digests, periodic checks, cron-style jobs. Schedule \
+strings: 'every 30m', 'daily at 09:00', 'every monday at 10:00', 'hourly'; \
+omit schedule for a one-shot delayed run. Call list_tasks before edit/delete \
+to get the id.",
+        );
+    }
+
+    if enabled.contains("write_todos") {
+        prompt.push_str(
+            "\n\n## Planning (write_todos)\nFor requests requiring more than ~3 steps, \
+call `write_todos` first to lay out the plan. Rewrite the full list each call \
+(no partial updates). Exactly one item is `in_progress` at a time. Skip this \
+tool for trivial 1–2 step requests.",
+        );
+    }
+
+    if enabled.contains("ask_user") && interactive {
+        prompt.push_str(
+            "\n\n## Asking the user (ask_user)\nUse `ask_user` only when you can't \
+proceed without user-only info: ambiguous references, destructive-action \
+confirmations, required inputs no tool can look up. Don't use it to ask \
+permission for every step or to avoid easy judgment calls. One pending \
+question per session; call blocks until answered, 10-minute timeout.",
+        );
+    }
+
+    if !agents_md.is_empty() {
+        prompt.push_str(&format!("\n\n## Project Description (AGENTS.md)\n{}", agents_md));
     }
 
     prompt
 }
 
-pub(crate) fn openai_tools_json(enabled: &HashSet<String>) -> Vec<Value> {
-    let mut tools = Vec::new();
+/// Single source of truth for the agent tool catalog. Each entry is
+/// `(name, description, JSON-schema parameters)`. `openai_tools_json` and
+/// `anthropic_tools_json` wrap these in their provider-specific envelopes, so a tool
+/// defined here is automatically exposed to both providers. (When adding a tool,
+/// also add the dispatch arm in `tools::execute_agent_tool`.)
+fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str, &'static str, Value)> {
+    let mut defs: Vec<(&'static str, &'static str, Value)> = Vec::new();
     if enabled.contains("run_command") {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "run_command",
-                "description": "Run a safe shell command in the local workspace and return text output.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "cwd": {"type": "string"}
-                    },
-                    "required": ["command"]
-                }
-            }
-        }));
-    }
-    if enabled.contains("read_file") {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a file within workspace.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"]
-                }
-            }
-        }));
-    }
-    if enabled.contains("write_file") {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "description": "Write content to a file within workspace.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"}
-                    },
-                    "required": ["path", "content"]
-                }
-            }
-        }));
-    }
-    if enabled.contains("list_files") {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "list_files",
-                "description": "List files in a workspace directory.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"]
-                }
-            }
-        }));
-    }
-    if enabled.contains("search_files") {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "search_files",
-                "description": "Search text recursively using ripgrep.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "pattern": {"type": "string"}
-                    },
-                    "required": ["path", "pattern"]
-                }
-            }
-        }));
-    }
-    if enabled.contains("web_search") {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the web using Brave Search API. Returns titles, URLs, and snippets.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "count": {"type": "integer", "description": "Number of results (default 5, max 20)"}
-                    },
-                    "required": ["query"]
-                }
-            }
-        }));
-    }
-    if enabled.contains("web_fetch") {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "web_fetch",
-                "description": "Fetch the text content of a URL. Returns the page body as plain text.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {"type": "string", "description": "The URL to fetch"}
-                    },
-                    "required": ["url"]
-                }
-            }
-        }));
-    }
-    if enabled.contains("generate_image") {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "generate_image",
-                "description": "Generate an image from a text description. Use when the user wants to create, draw, or visualize something.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "prompt": {"type": "string", "description": "Detailed description of the image to generate"},
-                        "style": {"type": "string", "description": "Art style hint: realistic, artistic, cartoon, abstract"}
-                    },
-                    "required": ["prompt"]
-                }
-            }
-        }));
-    }
-    if enabled.contains("search_places") {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "search_places",
-                "description": "Search for places, businesses, and points of interest. Results display on an interactive map.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "What to search for (e.g., 'coffee shops near downtown Seattle')"},
-                        "limit": {"type": "integer", "description": "Max results (default 5)"}
-                    },
-                    "required": ["query"]
-                }
-            }
-        }));
-    }
-    if enabled.contains("get_directions") {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "get_directions",
-                "description": "Get directions between two locations. Results display on an interactive map with the route.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "from": {"type": "string", "description": "Starting address or place"},
-                        "to": {"type": "string", "description": "Destination address or place"},
-                        "mode": {"type": "string", "description": "Transport mode: driving, walking, cycling (default driving)"}
-                    },
-                    "required": ["from", "to"]
-                }
-            }
-        }));
-    }
-    tools
-}
-
-pub(crate) fn anthropic_tools_json(enabled: &HashSet<String>) -> Vec<Value> {
-    let mut tools = Vec::new();
-    if enabled.contains("run_command") {
-        tools.push(json!({
-            "name": "run_command",
-            "description": "Run a safe shell command in the local workspace and return text output.",
-            "input_schema": {
+        defs.push((
+            "run_command",
+            "Run a shell command in the local workspace and return text output. Commands flagged as potentially dangerous pause and ask the user for approval before running.",
+            json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
                     "cwd": {"type": "string"}
                 },
                 "required": ["command"]
-            }
-        }));
+            }),
+        ));
     }
     if enabled.contains("read_file") {
-        tools.push(json!({
-            "name": "read_file",
-            "description": "Read a file within workspace.",
-            "input_schema": {
+        defs.push((
+            "read_file",
+            "Read a file within workspace.",
+            json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"]
-            }
-        }));
+            }),
+        ));
     }
     if enabled.contains("write_file") {
-        tools.push(json!({
-            "name": "write_file",
-            "description": "Write content to a file within workspace.",
-            "input_schema": {
+        defs.push((
+            "write_file",
+            "Write content to a file within workspace.",
+            json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string"}
                 },
                 "required": ["path", "content"]
-            }
-        }));
+            }),
+        ));
     }
     if enabled.contains("list_files") {
-        tools.push(json!({
-            "name": "list_files",
-            "description": "List files in a workspace directory.",
-            "input_schema": {
+        defs.push((
+            "list_files",
+            "List files in a workspace directory.",
+            json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"]
-            }
-        }));
+            }),
+        ));
     }
     if enabled.contains("search_files") {
-        tools.push(json!({
-            "name": "search_files",
-            "description": "Search text recursively using ripgrep.",
-            "input_schema": {
+        defs.push((
+            "search_files",
+            "Search text recursively for a regex pattern in workspace files.",
+            json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "pattern": {"type": "string"}
                 },
                 "required": ["path", "pattern"]
-            }
-        }));
+            }),
+        ));
     }
     if enabled.contains("web_search") {
-        tools.push(json!({
-            "name": "web_search",
-            "description": "Search the web using Brave Search API. Returns titles, URLs, and snippets.",
-            "input_schema": {
+        defs.push((
+            "web_search",
+            "Search the web using Brave Search API. Returns titles, URLs, and snippets.",
+            json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
                     "count": {"type": "integer", "description": "Number of results (default 5, max 20)"}
                 },
                 "required": ["query"]
-            }
-        }));
+            }),
+        ));
     }
     if enabled.contains("web_fetch") {
-        tools.push(json!({
-            "name": "web_fetch",
-            "description": "Fetch the text content of a URL. Returns the page body as plain text.",
-            "input_schema": {
+        defs.push((
+            "web_fetch",
+            "Fetch the text content of a URL. Returns the page body as plain text.",
+            json!({
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "The URL to fetch"}
                 },
                 "required": ["url"]
-            }
-        }));
+            }),
+        ));
     }
     if enabled.contains("generate_image") {
-        tools.push(json!({
-            "name": "generate_image",
-            "description": "Generate an image from a text description. Use when the user wants to create, draw, or visualize something.",
-            "input_schema": {
+        defs.push((
+            "generate_image",
+            "Generate an image from a text description. Use when the user wants to create, draw, or visualize something.",
+            json!({
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "Detailed description of the image to generate"},
                     "style": {"type": "string", "description": "Art style hint: realistic, artistic, cartoon, abstract"}
                 },
                 "required": ["prompt"]
-            }
-        }));
+            }),
+        ));
     }
     if enabled.contains("search_places") {
-        tools.push(json!({
-            "name": "search_places",
-            "description": "Search for places, businesses, and points of interest. Results display on an interactive map.",
-            "input_schema": {
+        defs.push((
+            "search_places",
+            "Pin-drop tool: locate and display a KNOWN place by name on the map (e.g., 'Arriba's Mexican Grill', 'LAX airport'). NOT for discovering new places — use search_nearby for that, or web_search for reviews.",
+            json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "What to search for (e.g., 'coffee shops near downtown Seattle')"},
-                    "limit": {"type": "integer", "description": "Max results (default 5)"}
+                    "query": {"type": "string", "description": "Search for a specific place or business by name. Include city/area for best results (e.g., 'Starbucks in Hemet CA', 'Arriba's Mexican Grill Idyllwild')."},
+                    "limit": {"type": "integer", "description": "Max results (default 5, max 10)"}
                 },
                 "required": ["query"]
-            }
-        }));
+            }),
+        ));
+        defs.push((
+            "search_nearby",
+            "Browse nearby points of interest by category. Uses the user's saved location. Best for 'find X near me' queries. Returns results sorted by distance.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "Mapbox category ID. Common: restaurant, mexican_restaurant, chinese_restaurant, italian_restaurant, pizza, coffee, cafe, bar, fast_food, gas_station, grocery, supermarket, pharmacy, hospital, hotel, gym, parking, bank, atm, laundry, post_office, library, park, beach, movie_theater, shopping_mall, clothing_store, hardware, auto_repair, car_wash, dentist, veterinarian, hair_salon"},
+                    "near": {"type": "string", "description": "Optional location to search near (e.g., 'Hemet, CA'). Uses saved user location if omitted."},
+                    "limit": {"type": "integer", "description": "Max results (default 10, max 25)"}
+                },
+                "required": ["category"]
+            }),
+        ));
     }
     if enabled.contains("get_directions") {
-        tools.push(json!({
-            "name": "get_directions",
-            "description": "Get directions between two locations. Results display on an interactive map with the route.",
-            "input_schema": {
+        defs.push((
+            "get_directions",
+            "Get directions between two locations. Results display on an interactive map with the route.",
+            json!({
                 "type": "object",
                 "properties": {
                     "from": {"type": "string", "description": "Starting address or place"},
@@ -907,234 +1218,658 @@ pub(crate) fn anthropic_tools_json(enabled: &HashSet<String>) -> Vec<Value> {
                     "mode": {"type": "string", "description": "Transport mode: driving, walking, cycling (default driving)"}
                 },
                 "required": ["from", "to"]
-            }
-        }));
+            }),
+        ));
     }
-    tools
+    if enabled.contains("create_task") {
+        defs.push((
+            "create_task",
+            "Schedule a future autonomous Muninn run. When the scheduled time arrives, a fresh session starts with `description` as the user prompt and your full toolset available. Use for recurring automations or one-off delayed actions, not for user reminders.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short label for the UI / feed (not sent to the LLM at run time)."},
+                    "description": {"type": "string", "description": "The prompt sent to future-Muninn when this task fires. Imperative voice, specific enough to act on without clarification — e.g. 'Fetch today's weather for Cupertino and post a one-line summary to the feed', not 'weather check'."},
+                    "schedule": {"type": "string", "description": "Recurrence string: 'every 30m', 'daily at 09:00', 'every friday at 17:00', 'hourly'. Omit for a one-shot run."},
+                    "next_run": {"type": "string", "description": "ISO timestamp for first run (YYYY-MM-DDTHH:MM:SS). Optional; computed from schedule if omitted."}
+                },
+                "required": ["name", "description"]
+            }),
+        ));
+    }
+    if enabled.contains("list_tasks") {
+        defs.push((
+            "list_tasks",
+            "List tasks with id, name, description, schedule, next_run, status, and last result. Use before updating or deleting so you have the task id.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "description": "Optional filter: scheduled, running, or completed"}
+                }
+            }),
+        ));
+    }
+    if enabled.contains("update_task") {
+        defs.push((
+            "update_task",
+            "Edit an existing task. Supply task id and any fields to change. Omitted fields are left as-is.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "Task id (from list_tasks)"},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "schedule": {"type": "string"},
+                    "next_run": {"type": "string"},
+                    "status": {"type": "string", "description": "scheduled, running, or completed"}
+                },
+                "required": ["id"]
+            }),
+        ));
+    }
+    if enabled.contains("delete_task") {
+        defs.push((
+            "delete_task",
+            "Delete a task by id. Call list_tasks first if you don't know the id.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "Task id"}
+                },
+                "required": ["id"]
+            }),
+        ));
+    }
+    if enabled.contains("list_inbox") {
+        defs.push((
+            "list_inbox",
+            "Read messages from the user's Apple Mail unified inbox (all configured accounts combined). Returns JSON: {count, messages: [{id, date, from, subject, status}, ...]}, newest first. Dates are ISO-8601 local time (YYYY-MM-DDTHH:MM:SS, no timezone). `id` is an opaque handle — pass it to read_mail for the full body. Use for 'what's in my inbox', 'any new mail', or as a starting point before reading a specific message. Supports optional date-range filtering via `since`/`until`. Reads Apple Mail's local cache; does not hit the server. Read-only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "How many messages to return (1–50, default 20)."},
+                    "unread_only": {"type": "boolean", "description": "If true, skip messages already marked read. Default false."},
+                    "since": {"type": "string", "description": "Optional ISO date/datetime (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) — only messages received at or after this moment. Today is a good reference: combine with `until` to filter to a single day. Local time."},
+                    "until": {"type": "string", "description": "Optional ISO date/datetime — only messages received strictly before this moment (half-open, so `until=2026-04-22` excludes anything on the 22nd)."}
+                }
+            }),
+        ));
+    }
+    if enabled.contains("search_mail") {
+        defs.push((
+            "search_mail",
+            "Search the user's Apple Mail inbox by subject line OR sender, optionally bounded by date. Returns the same JSON shape as list_inbox. Use when the user names a person, topic, or subject keyword ('did Alice email me?', 'find the AWS receipt from last week'). IMPORTANT: `query` matches Subject and From only, NOT body — if you need body-text search, narrow candidates here then read_mail each. Case-insensitive substring match. Searches the unified inbox (not Sent/Drafts/Trash). At least one of `query`, `since`, `until` must be supplied.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Substring to match against subject or sender. Plain text — no search operators or regex. Optional if you're doing a pure date-range search."},
+                    "limit": {"type": "integer", "description": "Max results (1–50, default 10)."},
+                    "since": {"type": "string", "description": "Optional ISO date/datetime (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) — only messages received at or after this moment. Local time."},
+                    "until": {"type": "string", "description": "Optional ISO date/datetime — only messages received strictly before this moment (half-open)."}
+                }
+            }),
+        ));
+    }
+    if enabled.contains("read_mail") {
+        defs.push((
+            "read_mail",
+            "Fetch the full plain-text body and headers (From / To / Subject / Date) of one message. Pass the opaque `id` handle that list_inbox or search_mail returned — it encodes the account+mailbox+local message id needed for a direct O(1) lookup. Handles are session-local to Mail.app: if Mail restarts, re-run list/search to get fresh ones. Body is truncated to ~20k chars if longer.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Opaque handle string as returned by list_inbox or search_mail. Treat as a black box — copy it verbatim. Do NOT construct one yourself or use a raw Message-ID here."}
+                },
+                "required": ["id"]
+            }),
+        ));
+    }
+    if enabled.contains("write_todos") {
+        defs.push((
+            "write_todos",
+            "Record or update your plan for this chat turn as a visible checklist. Rewrite the FULL list each call — there is no partial update. Use for any multi-step task (3+ steps) BEFORE starting work. Exactly one item may be `in_progress` at a time; the rest are `pending` or `completed`. After finishing each step, call write_todos again with that item marked `completed` and the next one `in_progress`. The list renders in the UI so the user sees progress.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "The full ordered list. Replaces any previous list for this session.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "Short imperative phrase describing the step, e.g. 'Read src/main.rs'."},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                                "activeForm": {"type": "string", "description": "Optional present-participle form shown while the item is the active one, e.g. 'Reading src/main.rs'."}
+                            },
+                            "required": ["content", "status"]
+                        }
+                    }
+                },
+                "required": ["items"]
+            }),
+        ));
+    }
+    if interactive && enabled.contains("ask_user") {
+        defs.push((
+            "ask_user",
+            "Pause and ask the user a clarifying question. The call blocks until the user responds (10-minute timeout). Returns the user's answer as a string. Use ONLY when you genuinely cannot proceed: ambiguous references ('which Alice?'), destructive-action confirmations, or required inputs no other tool can supply. Do NOT use to ask permission for every step, or when another tool would give you the answer.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to show the user. Phrase it conversationally, as if asking a colleague."},
+                    "choices": {
+                        "type": "array",
+                        "description": "Optional — if supplied, the UI renders buttons for each choice. Omit or pass an empty array for free-text input.",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["question"]
+            }),
+        ));
+    }
+    defs
 }
 
-pub(crate) async fn chat_with_openai(
-    app: &AppHandle,
-    state: &AppState,
-    session_id: &str,
-    model: &str,
-    history: &[(String, String)],
-    scope: Option<&WorkspaceScope>,
-) -> Result<String, String> {
-    let api_key = if let Some(value) = first_non_empty_setting(state, &["llm/openai_api_key"])? {
-        value
-    } else {
-        std::env::var("OPENAI_API_KEY")
-            .map_err(|_| "OPENAI API key missing (set OPENAI_API_KEY or save it in Settings).".to_string())?
-    };
-    let enabled_tools = enabled_tool_ids(state)?;
-    let tools = openai_tools_json(&enabled_tools);
+pub(crate) fn openai_tools_json(enabled: &HashSet<String>, interactive: bool) -> Vec<Value> {
+    tool_defs(enabled, interactive)
+        .into_iter()
+        .map(|(name, description, parameters)| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters
+                }
+            })
+        })
+        .collect()
+}
 
-    // Retrieve relevant memory context for the user's latest message
-    let system_prompt = if let Some(s) = scope {
-        build_project_system_prompt(state, &s.root.display().to_string())
-    } else {
-        let user_msg = history.last().map(|(_, c)| c.as_str()).unwrap_or("");
-        let relevant = retrieve_relevant_memory(state, user_msg).await;
-        build_system_prompt_with_context(state, relevant.as_deref())
-    };
-    let mut messages: Vec<Value> = vec![json!({
-        "role": "system",
-        "content": system_prompt
-    })];
+pub(crate) fn anthropic_tools_json(enabled: &HashSet<String>, interactive: bool) -> Vec<Value> {
+    tool_defs(enabled, interactive)
+        .into_iter()
+        .map(|(name, description, parameters)| {
+            json!({
+                "name": name,
+                "description": description,
+                "input_schema": parameters
+            })
+        })
+        .collect()
+}
 
-    for (role, content) in history {
-        messages.push(json!({ "role": role, "content": content }));
+// ---------------------------------------------------------------------------
+// Provider abstraction + shared chat/agent tool loop
+// ---------------------------------------------------------------------------
+
+/// One accumulated tool call from a streamed response.
+struct ToolCall {
+    id: String,
+    name: String,
+    /// Raw JSON argument text as accumulated from the stream.
+    args: String,
+}
+
+/// Everything a single streamed turn produced.
+struct StreamOutcome {
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    usage_input: u64,
+    usage_output: u64,
+}
+
+/// Provider-specific wire format. Everything the OpenAI chat/completions and the
+/// Anthropic messages APIs disagree on (auth, request body, SSE framing, tool-round
+/// message shapes) lives behind this enum; the shared loop is `run_tool_loop`.
+enum Provider {
+    OpenAi { endpoint: String, api_key: String },
+    Anthropic { endpoint: String, api_key: String },
+}
+
+impl Provider {
+    fn openai(state: &AppState) -> Result<Self, String> {
+        let api_key = if let Some(value) = first_non_empty_setting(state, &["llm/openai_api_key"])? {
+            value
+        } else {
+            std::env::var("OPENAI_API_KEY")
+                .map_err(|_| "OpenAI API key missing (set OPENAI_API_KEY or save it in Settings).".to_string())?
+        };
+        Ok(Self::OpenAi {
+            endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
+            api_key,
+        })
     }
 
-    let mut tool_round: u32 = 0;
+    fn minimax_anthropic(state: &AppState) -> Result<Self, String> {
+        let api_key = if let Some(value) =
+            first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])?
+        {
+            value
+        } else {
+            std::env::var("MINIMAX_API_KEY")
+                .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+                .map_err(|_| "MiniMax API key missing (set env var or save it in Settings).".to_string())?
+        };
+        let base = std::env::var("MINIMAX_ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
+        let endpoint = if base.ends_with("/v1/messages") {
+            base
+        } else {
+            format!("{}/v1/messages", base.trim_end_matches('/'))
+        };
+        Ok(Self::Anthropic { endpoint, api_key })
+    }
 
-    loop {
-        // Check if user requested stop
-        if check_stop_requested(state, session_id) {
-            let _ = app.emit("chat-done", ChatDoneEvent { session_id: session_id.to_string() });
-            return Ok("[Generation stopped by user]".to_string());
+    fn label(&self) -> &'static str {
+        match self {
+            Self::OpenAi { .. } => "OpenAI",
+            Self::Anthropic { .. } => "MiniMax Anthropic",
         }
+    }
 
-        let request_body = json!({
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "stream": true
-        });
+    fn tools_json(&self, enabled: &HashSet<String>, interactive: bool) -> Vec<Value> {
+        match self {
+            Self::OpenAi { .. } => openai_tools_json(enabled, interactive),
+            Self::Anthropic { .. } => anthropic_tools_json(enabled, interactive),
+        }
+    }
 
-        let response = state
-            .http
-            .post("https://api.openai.com/v1/chat/completions")
-            .bearer_auth(&api_key)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+    /// Provider-shaped starting message list. OpenAI carries the system prompt as the
+    /// first message; Anthropic passes it as a top-level request field instead.
+    fn initial_messages(&self, system_prompt: &str, history: &[HistoryMessage]) -> Vec<Value> {
+        match self {
+            Self::OpenAi { .. } => {
+                let mut messages = vec![json!({"role": "system", "content": system_prompt})];
+                messages.extend(history_to_openai(history));
+                messages
+            }
+            Self::Anthropic { .. } => history_to_anthropic(history),
+        }
+    }
 
+    fn build_request(&self, model: &str, system_prompt: &str, messages: &[Value], tools: &[Value]) -> Value {
+        match self {
+            Self::OpenAi { .. } => json!({
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "stream": true
+            }),
+            Self::Anthropic { .. } => json!({
+                "model": model,
+                "max_tokens": 4096,
+                "system": system_prompt,
+                "messages": messages,
+                "tools": tools,
+                "stream": true
+            }),
+        }
+    }
+
+    async fn send(&self, http: &reqwest::Client, body: &Value) -> Result<reqwest::Response, String> {
+        let request = match self {
+            Self::OpenAi { endpoint, api_key } => http.post(endpoint).bearer_auth(api_key),
+            Self::Anthropic { endpoint, api_key } => http
+                .post(endpoint)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01"),
+        };
+        let response = request.json(body).send().await.map_err(|e| e.to_string())?;
         let status = response.status();
         if !status.is_success() {
             let body: Value = response.json().await.map_err(|e| e.to_string())?;
-            return Err(format!("OpenAI API error {}: {}", status, body));
+            return Err(format!("{} API error {}: {}", self.label(), status, body));
         }
+        Ok(response)
+    }
 
-        let mut content_acc = String::new();
-        let mut tool_calls_acc: HashMap<u64, (String, String, String)> = HashMap::new();
-        let mut line_buf = String::new();
+    /// Drain the SSE stream, invoking `on_token` for each text delta.
+    async fn parse_stream(
+        &self,
+        mut response: reqwest::Response,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<StreamOutcome, String> {
+        let mut text = String::new();
         let mut usage_input: u64 = 0;
         let mut usage_output: u64 = 0;
+        let mut line_buf = String::new();
 
-        let mut stream = response;
-        while let Some(bytes) = stream.chunk().await.map_err(|e| e.to_string())? {
-            let text = String::from_utf8_lossy(&bytes);
-            line_buf.push_str(&text);
+        // OpenAI keys partial tool calls by stream index; Anthropic appends in order.
+        let mut openai_calls: HashMap<u64, ToolCall> = HashMap::new();
+        let mut anthropic_calls: Vec<ToolCall> = Vec::new();
+        let mut current_event_type = String::new();
+
+        while let Some(bytes) = response.chunk().await.map_err(|e| e.to_string())? {
+            line_buf.push_str(&String::from_utf8_lossy(&bytes));
 
             while let Some(newline_pos) = line_buf.find('\n') {
                 let line = line_buf[..newline_pos].trim().to_string();
                 line_buf = line_buf[newline_pos + 1..].to_string();
 
+                if matches!(self, Self::Anthropic { .. }) && line.starts_with("event: ") {
+                    current_event_type = line[7..].to_string();
+                    continue;
+                }
                 if line.is_empty() || line == "data: [DONE]" || !line.starts_with("data: ") {
                     continue;
                 }
-                let json_str = &line[6..];
-                let chunk: Value = match serde_json::from_str(json_str) {
+                let data: Value = match serde_json::from_str(&line[6..]) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
 
-                // Extract usage from final chunk (OpenAI format)
-                if let Some(usage) = chunk.get("usage") {
-                    if let Some(v) = usage.get("prompt_tokens").and_then(Value::as_u64) { usage_input = v; }
-                    if let Some(v) = usage.get("completion_tokens").and_then(Value::as_u64) { usage_output = v; }
-                }
-
-                let delta = match chunk
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .and_then(|arr| arr.first())
-                    .and_then(|c| c.get("delta"))
-                {
-                    Some(d) => d,
-                    None => continue,
-                };
-
-                if let Some(t) = delta.get("content").and_then(Value::as_str) {
-                    if !t.is_empty() {
-                        content_acc.push_str(t);
-                        let _ = app.emit(
-                            "chat-token",
-                            ChatTokenEvent {
-                                session_id: session_id.to_string(),
-                                token: t.to_string(),
-                            },
-                        );
-                    }
-                }
-
-                if let Some(tc_arr) = delta.get("tool_calls").and_then(Value::as_array) {
-                    for tc in tc_arr {
-                        let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
-                        let entry = tool_calls_acc.entry(idx).or_insert_with(|| {
-                            let id = tc
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let name = tc
-                                .get("function")
-                                .and_then(|f| f.get("name"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            (id, name, String::new())
-                        });
-                        if let Some(args_chunk) = tc
-                            .get("function")
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(Value::as_str)
+                match self {
+                    Self::OpenAi { .. } => {
+                        if let Some(usage) = data.get("usage") {
+                            if let Some(v) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+                                usage_input = v;
+                            }
+                            if let Some(v) = usage.get("completion_tokens").and_then(Value::as_u64) {
+                                usage_output = v;
+                            }
+                        }
+                        let delta = match data
+                            .get("choices")
+                            .and_then(Value::as_array)
+                            .and_then(|arr| arr.first())
+                            .and_then(|c| c.get("delta"))
                         {
-                            entry.2.push_str(args_chunk);
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        if let Some(t) = delta.get("content").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                text.push_str(t);
+                                on_token(t);
+                            }
+                        }
+                        if let Some(tc_arr) = delta.get("tool_calls").and_then(Value::as_array) {
+                            for tc in tc_arr {
+                                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                                let entry = openai_calls.entry(idx).or_insert_with(|| ToolCall {
+                                    id: tc.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                                    name: tc
+                                        .get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    args: String::new(),
+                                });
+                                if let Some(args_chunk) = tc
+                                    .get("function")
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(Value::as_str)
+                                {
+                                    entry.args.push_str(args_chunk);
+                                }
+                            }
                         }
                     }
+                    Self::Anthropic { .. } => match current_event_type.as_str() {
+                        "message_start" => {
+                            if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
+                                usage_input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                            }
+                        }
+                        "message_delta" => {
+                            if let Some(usage) = data.get("usage") {
+                                usage_output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                            }
+                        }
+                        "content_block_start" => {
+                            if let Some(block) = data.get("content_block") {
+                                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                                    anthropic_calls.push(ToolCall {
+                                        id: block.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                                        name: block.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                                        args: String::new(),
+                                    });
+                                }
+                            }
+                        }
+                        "content_block_delta" => {
+                            if let Some(delta) = data.get("delta") {
+                                match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+                                    "text_delta" => {
+                                        if let Some(t) = delta.get("text").and_then(Value::as_str) {
+                                            if !t.is_empty() {
+                                                text.push_str(t);
+                                                on_token(t);
+                                            }
+                                        }
+                                    }
+                                    "input_json_delta" => {
+                                        if let Some(chunk) =
+                                            delta.get("partial_json").and_then(Value::as_str)
+                                        {
+                                            if let Some(last) = anthropic_calls.last_mut() {
+                                                last.args.push_str(chunk);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
 
-        if !tool_calls_acc.is_empty() {
-            let mut sorted_calls: Vec<(u64, (String, String, String))> =
-                tool_calls_acc.into_iter().collect();
-            sorted_calls.sort_by_key(|(idx, _)| *idx);
-
-            let tool_calls_json: Vec<Value> = sorted_calls
-                .iter()
-                .map(|(_, (id, name, args))| {
-                    json!({
-                        "id": id,
-                        "type": "function",
-                        "function": { "name": name, "arguments": args }
-                    })
-                })
-                .collect();
-
-            let mut assistant_msg = json!({ "role": "assistant" });
-            if !content_acc.is_empty() {
-                assistant_msg["content"] = json!(content_acc);
-            } else {
-                assistant_msg["content"] = Value::Null;
+        let tool_calls = match self {
+            Self::OpenAi { .. } => {
+                let mut sorted: Vec<(u64, ToolCall)> = openai_calls.into_iter().collect();
+                sorted.sort_by_key(|(idx, _)| *idx);
+                sorted.into_iter().map(|(_, c)| c).collect()
             }
-            assistant_msg["tool_calls"] = json!(tool_calls_json);
-            messages.push(assistant_msg);
+            Self::Anthropic { .. } => anthropic_calls,
+        };
 
-            for (_, (call_id, tool_name, args_text)) in &sorted_calls {
+        Ok(StreamOutcome {
+            text,
+            tool_calls,
+            usage_input,
+            usage_output,
+        })
+    }
+
+    /// Append the assistant turn carrying tool calls in this provider's message shape.
+    fn push_assistant_tool_turn(&self, messages: &mut Vec<Value>, text: &str, calls: &[ToolCall]) {
+        match self {
+            Self::OpenAi { .. } => {
+                let tool_calls_json: Vec<Value> = calls
+                    .iter()
+                    .map(|c| {
+                        json!({"id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.args}})
+                    })
+                    .collect();
+                let mut msg = json!({"role": "assistant"});
+                msg["content"] = if text.is_empty() { Value::Null } else { json!(text) };
+                msg["tool_calls"] = json!(tool_calls_json);
+                messages.push(msg);
+            }
+            Self::Anthropic { .. } => {
+                let mut blocks: Vec<Value> = Vec::new();
+                if !text.is_empty() {
+                    blocks.push(json!({"type": "text", "text": text}));
+                }
+                for c in calls {
+                    let input: Value = serde_json::from_str(&c.args).unwrap_or_else(|_| json!({}));
+                    blocks.push(json!({"type": "tool_use", "id": c.id, "name": c.name, "input": input}));
+                }
+                messages.push(json!({"role": "assistant", "content": blocks}));
+            }
+        }
+    }
+
+    /// Append one tool result in this provider's message shape.
+    fn push_tool_result(&self, messages: &mut Vec<Value>, call_id: &str, output: &str) {
+        match self {
+            Self::OpenAi { .. } => {
+                messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
+            }
+            Self::Anthropic { .. } => {
+                messages.push(json!({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": call_id, "content": output}]
+                }));
+            }
+        }
+    }
+
+    /// Append a plain assistant-text + user-text round (used by the fenced-code-block
+    /// tool fallback, which has no tool_use ids).
+    fn push_text_round(&self, messages: &mut Vec<Value>, assistant_text: &str, user_text: &str) {
+        match self {
+            Self::OpenAi { .. } => {
+                messages.push(json!({"role": "assistant", "content": assistant_text}));
+                messages.push(json!({"role": "user", "content": user_text}));
+            }
+            Self::Anthropic { .. } => {
+                messages.push(json!({"role": "assistant", "content": [{"type": "text", "text": assistant_text}]}));
+                messages.push(json!({"role": "user", "content": [{"type": "text", "text": user_text}]}));
+            }
+        }
+    }
+}
+
+/// System prompt for a regular chat turn: the project prompt when scoped, otherwise
+/// the memory-augmented prompt built from the latest user message.
+async fn resolve_chat_system_prompt(
+    state: &AppState,
+    history: &[HistoryMessage],
+    scope: Option<&WorkspaceScope>,
+    interactive: bool,
+) -> String {
+    if let Some(s) = scope {
+        build_project_system_prompt(state, &s.root.display().to_string(), interactive)
+    } else {
+        let user_msg = history.last().map(|h| h.plain_text()).unwrap_or_default();
+        let relevant = retrieve_relevant_memory(state, &user_msg).await;
+        build_system_prompt_with_context(state, relevant.as_deref(), interactive)
+    }
+}
+
+/// The shared streaming chat/agent loop: request a turn, stream tokens to the UI,
+/// execute any tool calls, persist hidden tool-round turns, and repeat until the model
+/// produces a plain text reply. Used by both providers, for both regular chat and
+/// custom agents (agents pass `agent_name` to drive the agent-iteration UI event).
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_loop(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    provider: &Provider,
+    model: &str,
+    system_prompt: &str,
+    history: &[HistoryMessage],
+    exec_tools: &HashSet<String>,
+    scope: Option<&WorkspaceScope>,
+    interactive: bool,
+    agent_name: Option<&str>,
+) -> Result<(String, Vec<Value>), String> {
+    let tools = provider.tools_json(exec_tools, interactive);
+    let mut messages = provider.initial_messages(system_prompt, history);
+    let mut tool_round: u32 = 0;
+    let mut iteration: i64 = 0;
+
+    loop {
+        if check_stop_requested(state, session_id) {
+            let _ = app.emit("chat-done", ChatDoneEvent { session_id: session_id.to_string() });
+            let msg = "[Generation stopped by user]".to_string();
+            return Ok((msg.clone(), vec![json!({"type": "text", "text": msg})]));
+        }
+
+        if let Some(name) = agent_name {
+            iteration += 1;
+            let _ = app.emit("agent-iteration", AgentIterationEvent {
+                session_id: session_id.to_string(),
+                agent_name: name.to_string(),
+                iteration,
+                max_iterations: 0,
+            });
+        }
+
+        let request_body = provider.build_request(model, system_prompt, &messages, &tools);
+        let response = provider.send(&state.http, &request_body).await?;
+        let outcome = provider
+            .parse_stream(response, |t| {
+                let _ = app.emit("chat-token", ChatTokenEvent {
+                    session_id: session_id.to_string(),
+                    token: t.to_string(),
+                });
+            })
+            .await?;
+
+        if !outcome.tool_calls.is_empty() {
+            provider.push_assistant_tool_turn(&mut messages, &outcome.text, &outcome.tool_calls);
+
+            // Persist the assistant tool_use turn as Anthropic-style blocks (hidden=1) so
+            // reloads can replay it regardless of which provider produced it.
+            let mut assistant_blocks: Vec<Value> = Vec::new();
+            if !outcome.text.is_empty() {
+                assistant_blocks.push(json!({"type": "text", "text": outcome.text}));
+            }
+            for call in &outcome.tool_calls {
+                let input: Value = serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
+                assistant_blocks.push(json!({"type": "tool_use", "id": call.id, "name": call.name, "input": input}));
+            }
+            let _ = insert_message(state, session_id, "assistant", &outcome.text, &assistant_blocks, true);
+
+            let mut tool_result_blocks: Vec<Value> = Vec::new();
+            for call in &outcome.tool_calls {
+                let args_json: Value = serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
                 let _ = app.emit("tool-executed", json!({
                     "session_id": session_id,
-                    "tool": tool_name,
-                    "args": args_text,
+                    "tool": call.name,
+                    "args": call.args,
                     "status": "running"
                 }));
-                let args_json: Value =
-                    serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
                 let result = execute_agent_tool(
-                    app,
-                    state,
-                    session_id,
-                    &enabled_tools,
-                    tool_name,
-                    &args_json,
-                    scope,
-                ).await;
-                match result {
+                    app, state, session_id, exec_tools, &call.name, &args_json, scope, interactive,
+                )
+                .await;
+                let output = match result {
                     Ok(output) => {
-                        log_tool(state, session_id, tool_name, args_text, &output, "ok");
+                        log_tool(state, session_id, &call.name, &call.args, &output, "ok");
                         let _ = app.emit("tool-executed", json!({
                             "session_id": session_id,
-                            "tool": tool_name,
-                            "args": args_text,
+                            "tool": call.name,
+                            "args": call.args,
                             "status": "ok"
                         }));
-                        messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": output
-                        }));
+                        output
                     }
                     Err(error) => {
-                        log_tool(state, session_id, tool_name, args_text, &error, "error");
+                        log_tool(state, session_id, &call.name, &call.args, &error, "error");
                         let _ = app.emit("tool-executed", json!({
                             "session_id": session_id,
-                            "tool": tool_name,
-                            "args": args_text,
+                            "tool": call.name,
+                            "args": call.args,
                             "status": "error"
                         }));
-                        messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": format!("Tool error: {}", error)
-                        }));
+                        format!("Tool error: {}", error)
                     }
-                }
+                };
+                provider.push_tool_result(&mut messages, &call.id, &output);
+                tool_result_blocks.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": call.id,
+                    "content": output,
+                }));
             }
+            let _ = insert_message(
+                state,
+                session_id,
+                "user",
+                &tool_result_summary(&tool_result_blocks),
+                &tool_result_blocks,
+                true,
+            );
+
             tool_round += 1;
             if tool_round % 5 == 0 {
                 let _ = app.emit("chat-token", json!({
@@ -1145,7 +1880,10 @@ pub(crate) async fn chat_with_openai(
             continue;
         }
 
-        let text_content = content_acc;
+        let text_content = outcome.text;
+
+        // Fallback: some models emit tool calls as fenced ```tool code blocks instead of
+        // native tool_use. Execute it and feed the result back as plain text (no ids).
         if let Some((tool_name, args_str)) = parse_tool_code_block(&text_content) {
             let args_json: Value = serde_json::from_str(&args_str).unwrap_or_else(|_| json!({}));
             let args_text = args_str.to_string();
@@ -1156,8 +1894,10 @@ pub(crate) async fn chat_with_openai(
                 "args": args_text,
                 "status": "running"
             }));
-            let result =
-                execute_agent_tool(app, state, session_id, &enabled_tools, &tool_name, &args_json, scope).await;
+            let result = execute_agent_tool(
+                app, state, session_id, exec_tools, &tool_name, &args_json, scope, interactive,
+            )
+            .await;
             let output = match result {
                 Ok(output) => {
                     log_tool(state, session_id, &tool_name, &args_text, &output, "ok");
@@ -1181,14 +1921,26 @@ pub(crate) async fn chat_with_openai(
                 }
             };
 
-            messages.push(json!({
-                "role": "assistant",
-                "content": text_content
-            }));
-            messages.push(json!({
-                "role": "user",
-                "content": format!("Tool result: {}", output)
-            }));
+            provider.push_text_round(&mut messages, &text_content, &format!("Tool result: {}", output));
+
+            let _ = insert_message(
+                state,
+                session_id,
+                "assistant",
+                &text_content,
+                &[json!({"type": "text", "text": text_content})],
+                true,
+            );
+            let tool_report = format!("Tool result ({}): {}", tool_name, output);
+            let _ = insert_message(
+                state,
+                session_id,
+                "user",
+                &tool_report,
+                &[json!({"type": "text", "text": tool_report})],
+                true,
+            );
+
             tool_round += 1;
             if tool_round % 5 == 0 {
                 let _ = app.emit("chat-token", json!({
@@ -1199,22 +1951,36 @@ pub(crate) async fn chat_with_openai(
             continue;
         }
 
-        if usage_input > 0 || usage_output > 0 {
+        if outcome.usage_input > 0 || outcome.usage_output > 0 {
             let _ = app.emit("chat-usage", ChatUsageEvent {
                 session_id: session_id.to_string(),
-                input_tokens: usage_input,
-                output_tokens: usage_output,
+                input_tokens: outcome.usage_input,
+                output_tokens: outcome.usage_output,
             });
         }
-        let _ = app.emit(
-            "chat-done",
-            ChatDoneEvent {
-                session_id: session_id.to_string(),
-            },
-        );
-        return Ok(text_content);
+        let _ = app.emit("chat-done", ChatDoneEvent { session_id: session_id.to_string() });
+        let final_blocks = vec![json!({"type": "text", "text": text_content.clone()})];
+        return Ok((text_content, final_blocks));
     }
+}
 
+pub(crate) async fn chat_with_openai(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    model: &str,
+    history: &[HistoryMessage],
+    scope: Option<&WorkspaceScope>,
+    interactive: bool,
+) -> Result<(String, Vec<Value>), String> {
+    let provider = Provider::openai(state)?;
+    let enabled_tools = enabled_tool_ids(state)?;
+    let system_prompt = resolve_chat_system_prompt(state, history, scope, interactive).await;
+    run_tool_loop(
+        app, state, session_id, &provider, model, &system_prompt,
+        history, &enabled_tools, scope, interactive, None,
+    )
+    .await
 }
 
 pub(crate) async fn chat_with_minimax_anthropic(
@@ -1222,316 +1988,18 @@ pub(crate) async fn chat_with_minimax_anthropic(
     state: &AppState,
     session_id: &str,
     model: &str,
-    history: &[(String, String)],
+    history: &[HistoryMessage],
     scope: Option<&WorkspaceScope>,
-) -> Result<String, String> {
-    let api_key = if let Some(value) =
-        first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])?
-    {
-        value
-    } else {
-        std::env::var("MINIMAX_API_KEY")
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .map_err(|_| "MiniMax API key missing (set env var or save it in Settings).".to_string())?
-    };
-
-    let base = std::env::var("MINIMAX_ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
-    let endpoint = if base.ends_with("/v1/messages") {
-        base
-    } else {
-        format!("{}/v1/messages", base.trim_end_matches('/'))
-    };
-
-    let mut messages: Vec<Value> = Vec::new();
-    for (role, content) in history {
-        messages.push(json!({
-            "role": role,
-            "content": [{"type": "text", "text": content}]
-        }));
-    }
-
+    interactive: bool,
+) -> Result<(String, Vec<Value>), String> {
+    let provider = Provider::minimax_anthropic(state)?;
     let enabled_tools = enabled_tool_ids(state)?;
-    let tools = anthropic_tools_json(&enabled_tools);
-
-    // Retrieve relevant memory context for the user's latest message
-    let system_prompt = if let Some(s) = scope {
-        build_project_system_prompt(state, &s.root.display().to_string())
-    } else {
-        let user_msg = history.last().map(|(_, c)| c.as_str()).unwrap_or("");
-        let relevant = retrieve_relevant_memory(state, user_msg).await;
-        build_system_prompt_with_context(state, relevant.as_deref())
-    };
-
-    let mut tool_round: u32 = 0;
-
-    loop {
-        // Check if user requested stop
-        if check_stop_requested(state, session_id) {
-            let _ = app.emit("chat-done", ChatDoneEvent { session_id: session_id.to_string() });
-            return Ok("[Generation stopped by user]".to_string());
-        }
-
-        let request_body = json!({
-            "model": model,
-            "max_tokens": 4096,
-            "system": system_prompt,
-            "messages": messages,
-            "tools": tools,
-            "stream": true
-        });
-
-        let response = state
-            .http
-            .post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body: Value = response.json().await.map_err(|e| e.to_string())?;
-            return Err(format!("MiniMax Anthropic API error {}: {}", status, body));
-        }
-
-        let mut content_acc = String::new();
-        let mut tool_uses: Vec<(String, String, String)> = Vec::new();
-        let mut current_event_type = String::new();
-        let mut line_buf = String::new();
-        let mut usage_input: u64 = 0;
-        let mut usage_output: u64 = 0;
-
-        let mut stream = response;
-        while let Some(bytes) = stream.chunk().await.map_err(|e| e.to_string())? {
-            let text = String::from_utf8_lossy(&bytes);
-            line_buf.push_str(&text);
-
-            while let Some(newline_pos) = line_buf.find('\n') {
-                let line = line_buf[..newline_pos].trim().to_string();
-                line_buf = line_buf[newline_pos + 1..].to_string();
-
-                if line.starts_with("event: ") {
-                    current_event_type = line[7..].to_string();
-                    continue;
-                }
-                if line.is_empty() || !line.starts_with("data: ") {
-                    continue;
-                }
-                let json_str = &line[6..];
-                let data: Value = match serde_json::from_str(json_str) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                match current_event_type.as_str() {
-                    "message_start" => {
-                        if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
-                            usage_input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        }
-                    }
-                    "message_delta" => {
-                        if let Some(usage) = data.get("usage") {
-                            usage_output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        }
-                    }
-                    "content_block_start" => {
-                        if let Some(block) = data.get("content_block") {
-                            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                                let id = block
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string();
-                                let name = block
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string();
-                                tool_uses.push((id, name, String::new()));
-                            }
-                        }
-                    }
-                    "content_block_delta" => {
-                        if let Some(delta) = data.get("delta") {
-                            let delta_type =
-                                delta.get("type").and_then(Value::as_str).unwrap_or("");
-                            if delta_type == "text_delta" {
-                                if let Some(t) = delta.get("text").and_then(Value::as_str) {
-                                    if !t.is_empty() {
-                                        content_acc.push_str(t);
-                                        let _ = app.emit(
-                                            "chat-token",
-                                            ChatTokenEvent {
-                                                session_id: session_id.to_string(),
-                                                token: t.to_string(),
-                                            },
-                                        );
-                                    }
-                                }
-                            } else if delta_type == "input_json_delta" {
-                                if let Some(json_chunk) =
-                                    delta.get("partial_json").and_then(Value::as_str)
-                                {
-                                    if let Some(last) = tool_uses.last_mut() {
-                                        last.2.push_str(json_chunk);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if !tool_uses.is_empty() {
-            let mut content_blocks: Vec<Value> = Vec::new();
-            if !content_acc.is_empty() {
-                content_blocks.push(json!({"type": "text", "text": content_acc}));
-            }
-            for (id, name, input_str) in &tool_uses {
-                let input: Value =
-                    serde_json::from_str(input_str).unwrap_or_else(|_| json!({}));
-                content_blocks.push(json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": input
-                }));
-            }
-
-            messages.push(json!({
-                "role": "assistant",
-                "content": content_blocks
-            }));
-
-            for (tool_id, tool_name, input_str) in &tool_uses {
-                let args: Value =
-                    serde_json::from_str(input_str).unwrap_or_else(|_| json!({}));
-                let args_text = args.to_string();
-
-                let _ = app.emit("tool-executed", json!({
-                    "session_id": session_id,
-                    "tool": tool_name,
-                    "args": &args_text,
-                    "status": "running"
-                }));
-                let result =
-                    execute_agent_tool(app, state, session_id, &enabled_tools, tool_name, &args, scope).await;
-                let output = match result {
-                    Ok(output) => {
-                        log_tool(state, session_id, tool_name, &args_text, &output, "ok");
-                        let _ = app.emit("tool-executed", json!({
-                            "session_id": session_id,
-                            "tool": tool_name,
-                            "args": &args_text,
-                            "status": "ok"
-                        }));
-                        output
-                    }
-                    Err(error) => {
-                        log_tool(state, session_id, tool_name, &args_text, &error, "error");
-                        let _ = app.emit("tool-executed", json!({
-                            "session_id": session_id,
-                            "tool": tool_name,
-                            "args": &args_text,
-                            "status": "error"
-                        }));
-                        format!("Tool error: {}", error)
-                    }
-                };
-
-                messages.push(json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "content": output
-                    }]
-                }));
-            }
-            tool_round += 1;
-            if tool_round % 5 == 0 {
-                let _ = app.emit("chat-token", json!({
-                    "session_id": session_id,
-                    "token": format!("\n\n*[Progress: {} tool rounds completed so far. Type /stop to cancel.]*\n\n", tool_round)
-                }));
-            }
-            continue;
-        }
-
-        let text_content = content_acc;
-        if let Some((tool_name, args_str)) = parse_tool_code_block(&text_content) {
-            let args_json: Value = serde_json::from_str(&args_str).unwrap_or_else(|_| json!({}));
-            let args_text = args_str.to_string();
-
-            let _ = app.emit("tool-executed", json!({
-                "session_id": session_id,
-                "tool": &tool_name,
-                "args": &args_text,
-                "status": "running"
-            }));
-            let result =
-                execute_agent_tool(app, state, session_id, &enabled_tools, &tool_name, &args_json, scope).await;
-            let output = match result {
-                Ok(output) => {
-                    log_tool(state, session_id, &tool_name, &args_text, &output, "ok");
-                    let _ = app.emit("tool-executed", json!({
-                        "session_id": session_id,
-                        "tool": &tool_name,
-                        "args": &args_text,
-                        "status": "ok"
-                    }));
-                    output
-                }
-                Err(error) => {
-                    log_tool(state, session_id, &tool_name, &args_text, &error, "error");
-                    let _ = app.emit("tool-executed", json!({
-                        "session_id": session_id,
-                        "tool": &tool_name,
-                        "args": &args_text,
-                        "status": "error"
-                    }));
-                    format!("Tool error: {}", error)
-                }
-            };
-
-            messages.push(json!({
-                "role": "assistant",
-                "content": text_content
-            }));
-            messages.push(json!({
-                "role": "user",
-                "content": format!("Tool result: {}", output)
-            }));
-            tool_round += 1;
-            if tool_round % 5 == 0 {
-                let _ = app.emit("chat-token", json!({
-                    "session_id": session_id,
-                    "token": format!("\n\n*[Progress: {} tool rounds completed so far. Type /stop to cancel.]*\n\n", tool_round)
-                }));
-            }
-            continue;
-        }
-
-        if usage_input > 0 || usage_output > 0 {
-            let _ = app.emit("chat-usage", ChatUsageEvent {
-                session_id: session_id.to_string(),
-                input_tokens: usage_input,
-                output_tokens: usage_output,
-            });
-        }
-        let _ = app.emit(
-            "chat-done",
-            ChatDoneEvent {
-                session_id: session_id.to_string(),
-            },
-        );
-        return Ok(text_content);
-    }
+    let system_prompt = resolve_chat_system_prompt(state, history, scope, interactive).await;
+    run_tool_loop(
+        app, state, session_id, &provider, model, &system_prompt,
+        history, &enabled_tools, scope, interactive, None,
+    )
+    .await
 }
 
 pub(crate) fn load_agent_by_id(state: &AppState, agent_id: &str) -> Result<crate::models::AgentRecord, String> {
@@ -1564,8 +2032,8 @@ pub(crate) async fn run_agent(
     state: &AppState,
     session_id: &str,
     agent_id: &str,
-    history: &[(String, String)],
-) -> Result<String, String> {
+    history: &[HistoryMessage],
+) -> Result<(String, Vec<Value>), String> {
     let agent = load_agent_by_id(state, agent_id)?;
     if !agent.enabled {
         return Err(format!("Agent '{}' is disabled", agent.name));
@@ -1592,325 +2060,33 @@ pub(crate) async fn run_agent(
     };
 
     // Determine provider/model
-    let configured_provider =
+    let provider_name =
         get_app_setting_value(state, "llm/provider")?.unwrap_or_else(|| "minimax".to_string());
-    let provider = configured_provider;
     let model = get_app_setting_value(state, "llm/model")?
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| {
-            if provider == "minimax" {
+            if provider_name == "minimax" {
                 "MiniMax-M2.7".to_string()
             } else {
                 "gpt-4.1-mini".to_string()
             }
         });
 
-    let is_anthropic = provider == "minimax" || provider == "anthropic" || model.starts_with("MiniMax-");
-
-    if is_anthropic {
-        run_agent_anthropic(app, state, session_id, &agent, &agent_system, &allowed_tools, &model, history).await
+    let is_anthropic =
+        provider_name == "minimax" || provider_name == "anthropic" || model.starts_with("MiniMax-");
+    let provider = if is_anthropic {
+        Provider::minimax_anthropic(state)?
     } else {
-        run_agent_openai(app, state, session_id, &agent, &agent_system, &allowed_tools, &model, history).await
-    }
-}
-
-async fn run_agent_openai(
-    app: &AppHandle,
-    state: &AppState,
-    session_id: &str,
-    agent: &crate::models::AgentRecord,
-    system_prompt: &str,
-    allowed_tools: &HashSet<String>,
-    model: &str,
-    history: &[(String, String)],
-) -> Result<String, String> {
-    let api_key = if let Some(value) = first_non_empty_setting(state, &["llm/openai_api_key"])? {
-        value
-    } else {
-        std::env::var("OPENAI_API_KEY")
-            .map_err(|_| "OpenAI API key missing".to_string())?
-    };
-    let tools = openai_tools_json(allowed_tools);
-    let mut messages: Vec<Value> = vec![json!({
-        "role": "system",
-        "content": system_prompt
-    })];
-    for (role, content) in history {
-        messages.push(json!({ "role": role, "content": content }));
-    }
-
-    let mut iteration: i64 = 0;
-    loop {
-        iteration += 1;
-        let _ = app.emit("agent-iteration", AgentIterationEvent {
-            session_id: session_id.to_string(),
-            agent_name: agent.name.clone(),
-            iteration,
-            max_iterations: 0,
-        });
-
-        let request_body = json!({
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "stream": true
-        });
-
-        let response = state
-            .http
-            .post("https://api.openai.com/v1/chat/completions")
-            .bearer_auth(&api_key)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body: Value = response.json().await.map_err(|e| e.to_string())?;
-            return Err(format!("OpenAI API error {}: {}", status, body));
-        }
-
-        let mut content_acc = String::new();
-        let mut tool_calls_acc: HashMap<u64, (String, String, String)> = HashMap::new();
-        let mut line_buf = String::new();
-
-        let mut stream = response;
-        while let Some(bytes) = stream.chunk().await.map_err(|e| e.to_string())? {
-            let text = String::from_utf8_lossy(&bytes);
-            line_buf.push_str(&text);
-            while let Some(newline_pos) = line_buf.find('\n') {
-                let line = line_buf[..newline_pos].trim().to_string();
-                line_buf = line_buf[newline_pos + 1..].to_string();
-                if line.is_empty() || line == "data: [DONE]" || !line.starts_with("data: ") {
-                    continue;
-                }
-                let chunk: Value = match serde_json::from_str(&line[6..]) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let delta = match chunk.get("choices").and_then(Value::as_array)
-                    .and_then(|arr| arr.first()).and_then(|c| c.get("delta")) {
-                    Some(d) => d,
-                    None => continue,
-                };
-                if let Some(t) = delta.get("content").and_then(Value::as_str) {
-                    if !t.is_empty() {
-                        content_acc.push_str(t);
-                        let _ = app.emit("chat-token", ChatTokenEvent {
-                            session_id: session_id.to_string(),
-                            token: t.to_string(),
-                        });
-                    }
-                }
-                if let Some(tc_arr) = delta.get("tool_calls").and_then(Value::as_array) {
-                    for tc in tc_arr {
-                        let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
-                        let entry = tool_calls_acc.entry(idx).or_insert_with(|| {
-                            let id = tc.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                            let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("").to_string();
-                            (id, name, String::new())
-                        });
-                        if let Some(args_chunk) = tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str) {
-                            entry.2.push_str(args_chunk);
-                        }
-                    }
-                }
-            }
-        }
-
-        if !tool_calls_acc.is_empty() {
-            let mut sorted_calls: Vec<(u64, (String, String, String))> = tool_calls_acc.into_iter().collect();
-            sorted_calls.sort_by_key(|(idx, _)| *idx);
-            let tool_calls_json: Vec<Value> = sorted_calls.iter().map(|(_, (id, name, args))| {
-                json!({"id": id, "type": "function", "function": {"name": name, "arguments": args}})
-            }).collect();
-
-            let mut assistant_msg = json!({"role": "assistant"});
-            if !content_acc.is_empty() {
-                assistant_msg["content"] = json!(content_acc);
-            } else {
-                assistant_msg["content"] = Value::Null;
-            }
-            assistant_msg["tool_calls"] = json!(tool_calls_json);
-            messages.push(assistant_msg);
-
-            for (_, (call_id, tool_name, args_text)) in &sorted_calls {
-                let args_json: Value = serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
-                let result = execute_agent_tool(app, state, session_id, allowed_tools, tool_name, &args_json, None).await;
-                match result {
-                    Ok(output) => {
-                        log_tool(state, session_id, tool_name, args_text, &output, "ok");
-                        messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
-                    }
-                    Err(error) => {
-                        log_tool(state, session_id, tool_name, args_text, &error, "error");
-                        messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": format!("Tool error: {}", error)}));
-                    }
-                }
-            }
-            continue;
-        }
-
-        // No tool calls — we have a final text response
-        let _ = app.emit("chat-done", ChatDoneEvent { session_id: session_id.to_string() });
-        return Ok(content_acc);
-    }
-}
-
-async fn run_agent_anthropic(
-    app: &AppHandle,
-    state: &AppState,
-    session_id: &str,
-    agent: &crate::models::AgentRecord,
-    system_prompt: &str,
-    allowed_tools: &HashSet<String>,
-    model: &str,
-    history: &[(String, String)],
-) -> Result<String, String> {
-    let api_key = if let Some(value) = first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])? {
-        value
-    } else {
-        std::env::var("MINIMAX_API_KEY")
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .map_err(|_| "MiniMax/Anthropic API key missing".to_string())?
+        Provider::openai(state)?
     };
 
-    let base = std::env::var("MINIMAX_ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
-    let endpoint = if base.ends_with("/v1/messages") {
-        base
-    } else {
-        format!("{}/v1/messages", base.trim_end_matches('/'))
-    };
-
-    let tools = anthropic_tools_json(allowed_tools);
-    let mut messages: Vec<Value> = Vec::new();
-    for (role, content) in history {
-        messages.push(json!({"role": role, "content": [{"type": "text", "text": content}]}));
-    }
-
-    let mut iteration: i64 = 0;
-    loop {
-        iteration += 1;
-        let _ = app.emit("agent-iteration", AgentIterationEvent {
-            session_id: session_id.to_string(),
-            agent_name: agent.name.clone(),
-            iteration,
-            max_iterations: 0,
-        });
-
-        let request_body = json!({
-            "model": model,
-            "max_tokens": 4096,
-            "system": system_prompt,
-            "messages": messages,
-            "tools": tools,
-            "stream": true
-        });
-
-        let response = state
-            .http
-            .post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body: Value = response.json().await.map_err(|e| e.to_string())?;
-            return Err(format!("API error {}: {}", status, body));
-        }
-
-        let mut content_acc = String::new();
-        let mut tool_uses: Vec<(String, String, String)> = Vec::new();
-        let mut current_event_type = String::new();
-        let mut line_buf = String::new();
-
-        let mut stream = response;
-        while let Some(bytes) = stream.chunk().await.map_err(|e| e.to_string())? {
-            let text = String::from_utf8_lossy(&bytes);
-            line_buf.push_str(&text);
-            while let Some(newline_pos) = line_buf.find('\n') {
-                let line = line_buf[..newline_pos].trim().to_string();
-                line_buf = line_buf[newline_pos + 1..].to_string();
-                if line.starts_with("event: ") {
-                    current_event_type = line[7..].to_string();
-                    continue;
-                }
-                if line.is_empty() || !line.starts_with("data: ") { continue; }
-                let data: Value = match serde_json::from_str(&line[6..]) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                match current_event_type.as_str() {
-                    "content_block_start" => {
-                        if let Some(block) = data.get("content_block") {
-                            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                                let id = block.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                                let name = block.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                                tool_uses.push((id, name, String::new()));
-                            }
-                        }
-                    }
-                    "content_block_delta" => {
-                        if let Some(delta) = data.get("delta") {
-                            let dt = delta.get("type").and_then(Value::as_str).unwrap_or("");
-                            if dt == "text_delta" {
-                                if let Some(t) = delta.get("text").and_then(Value::as_str) {
-                                    if !t.is_empty() {
-                                        content_acc.push_str(t);
-                                        let _ = app.emit("chat-token", ChatTokenEvent {
-                                            session_id: session_id.to_string(),
-                                            token: t.to_string(),
-                                        });
-                                    }
-                                }
-                            } else if dt == "input_json_delta" {
-                                if let Some(json_chunk) = delta.get("partial_json").and_then(Value::as_str) {
-                                    if let Some(last) = tool_uses.last_mut() {
-                                        last.2.push_str(json_chunk);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if !tool_uses.is_empty() {
-            let mut content_blocks: Vec<Value> = Vec::new();
-            if !content_acc.is_empty() {
-                content_blocks.push(json!({"type": "text", "text": content_acc}));
-            }
-            for (id, name, input_str) in &tool_uses {
-                let input: Value = serde_json::from_str(input_str).unwrap_or_else(|_| json!({}));
-                content_blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
-            }
-            messages.push(json!({"role": "assistant", "content": content_blocks}));
-
-            for (tool_id, tool_name, input_str) in &tool_uses {
-                let args: Value = serde_json::from_str(input_str).unwrap_or_else(|_| json!({}));
-                let args_text = args.to_string();
-                let result = execute_agent_tool(app, state, session_id, allowed_tools, tool_name, &args, None).await;
-                let output = match result {
-                    Ok(output) => { log_tool(state, session_id, tool_name, &args_text, &output, "ok"); output }
-                    Err(error) => { log_tool(state, session_id, tool_name, &args_text, &error, "error"); format!("Tool error: {}", error) }
-                };
-                messages.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": output}]}));
-            }
-            continue;
-        }
-
-        let _ = app.emit("chat-done", ChatDoneEvent { session_id: session_id.to_string() });
-        return Ok(content_acc);
-    }
+    // Custom agents are user-invoked via slash commands — always interactive, and not
+    // project-scoped (scope: None matches the previous per-provider agent runners).
+    run_tool_loop(
+        app, state, session_id, &provider, &model, &agent_system,
+        history, &allowed_tools, None, true, Some(&agent.name),
+    )
+    .await
 }
 
 pub(crate) async fn run_extraction(app: &AppHandle, state: &AppState, user_msg: &str, assistant_msg: &str) {
