@@ -2158,6 +2158,76 @@ pub(crate) async fn run_agent(
     .await
 }
 
+/// The `/init` project analyzer: explores a project with read-only tools and returns the
+/// generated AGENTS.md content. Runs through the shared `run_tool_loop` like chat/agents —
+/// `session_id` is a throwaway id used only for streaming events (it has no `sessions` row,
+/// so the loop's `insert_message` calls no-op under the foreign-key constraint).
+pub(crate) async fn run_project_init(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    path: &str,
+    scope: &WorkspaceScope,
+) -> Result<String, String> {
+    let system_prompt = format!(
+        "You are Muninn, a project analyzer. You explore projects using tools and generate an AGENTS.md description file. \
+        The project root is: {path}. All file paths are relative to this root. Be thorough but efficient — \
+        explore the structure, read key files, then write a concise summary."
+    );
+
+    let prompt = format!(
+        "You are analyzing the project at: {path}\n\n\
+        Use the provided tools to explore the project thoroughly:\n\
+        - Use list_files to understand the directory structure (check subdirectories too)\n\
+        - Use read_file to read key files (README, config files, entry points, important source files)\n\
+        - Use run_command to check git log, dependency info, etc.\n\
+        - Use search_files to find patterns if needed\n\n\
+        After exploring, generate a concise AGENTS.md file (under 100 lines, markdown) that describes:\n\
+        1. What the project is (name, purpose)\n\
+        2. Tech stack and key dependencies\n\
+        3. Project structure overview\n\
+        4. How to build/run/test\n\
+        5. Key files and their purposes\n\n\
+        Output the final AGENTS.md content as your last message, with no preamble like \"Here is the AGENTS.md\"."
+    );
+
+    // Read-only exploration tools only.
+    let init_tools: HashSet<String> = ["read_file", "list_files", "search_files", "run_command"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let provider_name =
+        get_app_setting_value(state, "llm/provider")?.unwrap_or_else(|| "minimax".to_string());
+    let model = get_app_setting_value(state, "llm/model")?
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| {
+            if provider_name == "minimax" {
+                "MiniMax-M2.7".to_string()
+            } else {
+                "gpt-4.1-mini".to_string()
+            }
+        });
+
+    let is_anthropic =
+        provider_name == "minimax" || provider_name == "anthropic" || model.starts_with("MiniMax-");
+    let provider = if is_anthropic {
+        Provider::minimax_anthropic(state)?
+    } else {
+        Provider::openai(state)?
+    };
+
+    let history = vec![HistoryMessage::text("user", &prompt)];
+
+    let (text, _blocks) = run_tool_loop(
+        app, state, session_id, &provider, &model, &system_prompt,
+        &history, &init_tools, Some(scope), false, None,
+    )
+    .await?;
+
+    Ok(text)
+}
+
 pub(crate) async fn run_extraction(app: &AppHandle, state: &AppState, user_msg: &str, assistant_msg: &str) {
     if user_msg.len() + assistant_msg.len() < 50 {
         return;
