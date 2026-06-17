@@ -250,11 +250,33 @@ body::before {
 }
 
 /* ========== WORKSPACE ========== */
+/* Tiles flow into a wrapping grid: as many columns as fit at >= --tile-min wide,
+   then wrap onto new rows. Rows share height when they fit and the workspace
+   scrolls vertically once they don't, instead of cramming everything into one
+   ever-narrower row. `auto-fit` (not auto-fill) lets a single tile span full width. */
 .workspace {
   display: grid;
-  grid-template-columns: 1fr;
-  overflow: hidden;
+  grid-template-columns: repeat(auto-fit, minmax(var(--tile-min, 360px), 1fr));
+  grid-auto-rows: minmax(var(--tile-min-h, 260px), 1fr);
+  gap: 1px;
+  background: var(--border);
+  overflow-x: hidden;
+  overflow-y: auto;
   min-width: 0;
+}
+
+/* Empty workspace: when the last tile is closed (tilesys keeps data-tile-count
+   in sync), fill the area with a centered hint instead of bare border-color. */
+.workspace[data-tile-count="0"]::after {
+  content: "No tiles open — add one from the sidebar";
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  color: var(--dim);
+  font-family: 'Orbitron', sans-serif;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 
 /* ========== TILE CHROME ========== */
@@ -262,11 +284,9 @@ body::before {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border-right: 1px solid var(--border);
   min-width: 0;
+  background: var(--bg);
 }
-
-.tile:last-child { border-right: none; }
 
 .tile-header {
   display: flex;
@@ -1715,6 +1735,13 @@ body::before {
   margin-bottom: 8px;
 }
 
+.settings-hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+
 /* ========== FORM ELEMENTS ========== */
 input, select, textarea {
   font: inherit;
@@ -2626,3 +2653,197 @@ p.status-msg {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 2px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+
+/* ==================== SHARED UI KIT (uikit.js) ==================== */
+.uikit-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  margin: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+.uikit-banner-error {
+  border-color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, var(--surface));
+}
+.uikit-banner-info {
+  border-color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 12%, var(--surface));
+}
+.uikit-banner-msg { flex: 1; word-break: break-word; }
+.uikit-banner-actions { display: flex; align-items: center; gap: 6px; }
+.uikit-banner-retry,
+.uikit-banner-dismiss {
+  background: var(--overlay-toggle);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.uikit-banner-retry:hover,
+.uikit-banner-dismiss:hover { border-color: var(--border-hover); }
+.uikit-banner-dismiss { padding: 3px 8px; line-height: 1; }
+
+.uikit-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 16px;
+  color: var(--muted);
+  text-align: center;
+}
+.uikit-empty-icon { font-size: 28px; opacity: 0.6; }
+.uikit-empty-text { font-size: 13px; }
+.uikit-empty-action {
+  margin-top: 4px;
+  background: var(--overlay-toggle);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 14px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.uikit-empty-action:hover { border-color: var(--border-hover); }
+
+.uikit-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  vertical-align: -1px;
+  border: 2px solid var(--overlay-toggle);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: uikit-spin 0.6s linear infinite;
+}
+@keyframes uikit-spin { to { transform: rotate(360deg); } }
+
+/* ==================== KEYBOARD FOCUS ==================== */
+/* A single visible focus ring for keyboard users, replacing the scattered
+   `outline: none` rules. `:focus-visible` only triggers for keyboard/AT focus,
+   so mouse clicks stay clean. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Inputs that explicitly cleared their outline out-specify a bare :focus-visible,
+   so restore a visible ring at matching specificity. */
+.composer-box textarea:focus-visible,
+.web-url-input:focus-visible,
+.feeds-input:focus-visible,
+.feeds-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Focused tile: the accent is carried by the header divider (.tile.focused
+   .tile-header) alone. Keyboard focus still gets a full ring for accessibility.
+   Inset (box-shadow) instead of outline because tiles clip their overflow. */
+.tile:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+/* ==================== QUICK-ASK OVERLAY ==================== */
+/* Spotlight-style window (index.html?quickask=1). The window itself is
+   frameless and always-on-top; this fills it edge to edge. */
+.quickask {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--card);
+  border: 1px solid var(--border-hover);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.qa-inputrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.qa-logo {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 14px;
+  color: var(--accent);
+}
+.qa-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 15px;
+}
+.qa-answer {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.qa-answer[hidden] { display: none; }
+.qa-footer {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 16px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.qa-status, .qa-hint {
+  font-size: 10px;
+  color: var(--dim);
+}
+
+/* ==================== RESPONSIVE ==================== */
+/* Narrow windows: collapse the sidebar to an icon rail (colored dots) and stack
+   tiles into a single scrolling column. */
+@media (max-width: 860px) {
+  .shell { grid-template-columns: 56px 1fr; }
+  .sidebar { padding-top: 40px; }
+  .sidebar-logo,
+  .sidebar-version,
+  .sidebar-label,
+  .sidebar-footer { display: none; }
+  .sidebar-brand { padding: 0 0 12px; justify-content: center; }
+  .sidebar-nav { padding: 0 6px; }
+  .nav-item {
+    justify-content: center;
+    gap: 0;
+    padding: 9px 0;
+    font-size: 0; /* hides the text label node; the colored dot remains the icon */
+    letter-spacing: 0;
+  }
+  .nav-item .nav-dot { width: 8px; height: 8px; }
+  .nav-count,
+  .nav-pip,
+  .nav-add { display: none !important; }
+
+  /* One tile per row, each with a comfortable min height; workspace scrolls. */
+  .workspace { --tile-min: 100%; --tile-min-h: 320px; }
+}
+
+/* Reduced motion: honor the OS setting for the spinner and UI transitions. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

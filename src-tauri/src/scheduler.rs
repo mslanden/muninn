@@ -250,6 +250,64 @@ pub fn next_run_from_schedule_config(
     None
 }
 
+/// Reset tasks stranded in 'running' by a quit/crash mid-run. The scheduler only
+/// picks up 'scheduled' tasks, so without this a task interrupted once would never
+/// fire again. Recurring tasks rejoin their schedule; one-shot tasks retry
+/// immediately (their interrupted run never completed).
+pub fn recover_stuck_tasks(conn: &rusqlite::Connection) {
+    let now = Local::now().naive_local();
+    let stuck: Vec<(i64, String, String, String)> = match conn
+        .prepare("SELECT id, name, schedule, schedule_config FROM tasks WHERE status = 'running'")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(Result::ok).collect())
+        }) {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+
+    for (id, name, schedule, schedule_config) in stuck {
+        let next = if !schedule_config.trim().is_empty() {
+            next_run_from_schedule_config(&schedule_config, now)
+        } else if !schedule.trim().is_empty() {
+            next_run_from_schedule(&schedule, now)
+        } else {
+            None
+        };
+        let next_str = next.unwrap_or(now).format("%Y-%m-%dT%H:%M:%S").to_string();
+        let _ = conn.execute(
+            "UPDATE tasks SET status = 'scheduled', next_run = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id, next_str],
+        );
+        eprintln!(
+            "[Scheduler] recovered task '{}' (id {}) stuck in 'running'; next run {}",
+            name, id, next_str
+        );
+    }
+}
+
+/// "2d 4h", "6h 12m", "45m", "30s" — for labeling late catch-up runs.
+fn human_duration(d: TimeDelta) -> String {
+    let secs = d.num_seconds().max(0);
+    let (days, hours, mins) = (secs / 86_400, (secs % 86_400) / 3_600, (secs % 3_600) / 60);
+    if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, mins)
+    } else if mins > 0 {
+        format!("{}m", mins)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
 /// The main scheduler loop. Spawned once at app startup.
 pub async fn run_scheduler(app: AppHandle) {
     loop {
@@ -260,10 +318,10 @@ pub async fn run_scheduler(app: AppHandle) {
         let now_str = now.format("%Y-%m-%dT%H:%M:%S").to_string();
 
         // Find due tasks: status = 'scheduled', next_run is non-empty and <= now
-        let due_tasks: Vec<(i64, String, String, String, String)> = match with_db(&state, |db| {
+        let due_tasks: Vec<(i64, String, String, String, String, String)> = match with_db(&state, |db| {
             let mut stmt = db
                 .prepare(
-                    "SELECT id, name, description, schedule, schedule_config FROM tasks \
+                    "SELECT id, name, description, schedule, schedule_config, next_run FROM tasks \
                      WHERE status = 'scheduled' AND next_run != '' AND next_run <= ?1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -275,6 +333,7 @@ pub async fn run_scheduler(app: AppHandle) {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 })
                 .map_err(|e| e.to_string())?;
@@ -288,7 +347,14 @@ pub async fn run_scheduler(app: AppHandle) {
             Err(_) => continue,
         };
 
-        for (task_id, task_name, description, schedule, schedule_config) in due_tasks {
+        for (task_id, task_name, description, schedule, schedule_config, due_at) in due_tasks {
+            // A run firing well past its slot is a catch-up (the app or the Mac was
+            // down at the scheduled time) — label it so it doesn't look random.
+            let late_label = NaiveDateTime::parse_from_str(&due_at, "%Y-%m-%dT%H:%M:%S")
+                .ok()
+                .map(|slot| now - slot)
+                .filter(|late| *late > TimeDelta::minutes(5))
+                .map(|late| format!(" ({} late — missed the {} slot)", human_duration(late), due_at.replace('T', " ")));
             // Mark as running
             let _ = with_db(&state, |db| {
                 db.execute(
@@ -303,7 +369,7 @@ pub async fn run_scheduler(app: AppHandle) {
             add_feed_item(
                 &state,
                 "task",
-                &format!("Task started: {}", task_name),
+                &format!("Task started: {}{}", task_name, late_label.as_deref().unwrap_or("")),
                 &truncate_chars(&description, 120),
                 "clock",
                 "",
@@ -406,6 +472,17 @@ pub async fn run_scheduler(app: AppHandle) {
                 if result.is_ok() { "checkmark" } else { "error" },
                 &session_id,
             );
+
+            crate::notify_user::notify_user(
+                &app,
+                &format!(
+                    "Task {}: {}{}",
+                    if result.is_ok() { "completed" } else { "failed" },
+                    task_name,
+                    if late_label.is_some() { " (ran late)" } else { "" }
+                ),
+                &reply_preview,
+            );
         }
 
         // ---- Feed auto-refresh ----
@@ -445,6 +522,14 @@ pub async fn run_scheduler(app: AppHandle) {
                         "checkmark",
                         "",
                     );
+                    // Only interrupt the user when the refresh actually produced something.
+                    if items_added > 0 {
+                        crate::notify_user::notify_user(
+                            &app,
+                            &format!("{}: {} new item{}", feed_name, items_added, if items_added == 1 { "" } else { "s" }),
+                            "Open Muninn to read",
+                        );
+                    }
                 }
                 Err(e) => {
                     add_feed_item(
@@ -538,5 +623,55 @@ mod tests {
     fn test_invalid_returns_none() {
         let from = dt(2026, 3, 10, 14, 0);
         assert!(next_run_from_schedule("nonsense", from).is_none());
+    }
+
+    #[test]
+    fn human_duration_formats_each_magnitude() {
+        assert_eq!(human_duration(TimeDelta::seconds(30)), "30s");
+        assert_eq!(human_duration(TimeDelta::minutes(45)), "45m");
+        assert_eq!(human_duration(TimeDelta::minutes(372)), "6h 12m");
+        assert_eq!(human_duration(TimeDelta::hours(52)), "2d 4h");
+        assert_eq!(human_duration(TimeDelta::seconds(-5)), "0s");
+    }
+
+    #[test]
+    fn recover_resets_stuck_running_tasks() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (name, schedule, status) VALUES ('recurring', 'daily at 09:00', 'running')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (name, schedule, status) VALUES ('oneshot', '', 'running')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (name, schedule, status, next_run) VALUES ('healthy', '', 'scheduled', '2099-01-01T00:00:00')",
+            [],
+        )
+        .unwrap();
+
+        recover_stuck_tasks(&conn);
+
+        let rows: Vec<(String, String, String)> = conn
+            .prepare("SELECT name, status, next_run FROM tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+
+        // Recurring task rejoins its schedule with a fresh next_run.
+        assert_eq!(rows[0].1, "scheduled");
+        assert!(!rows[0].2.is_empty());
+        // One-shot task retries immediately (next_run = now, not empty).
+        assert_eq!(rows[1].1, "scheduled");
+        assert!(!rows[1].2.is_empty());
+        // Untouched tasks keep their state.
+        assert_eq!(rows[2].1, "scheduled");
+        assert_eq!(rows[2].2, "2099-01-01T00:00:00");
     }
 }

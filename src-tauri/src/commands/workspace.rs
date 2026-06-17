@@ -1,12 +1,10 @@
 //! Workspace root management, saved workspaces, scoped file ops, command safety check.
 
-use rusqlite::params;
 use std::path::PathBuf;
 use tauri::State;
 
 
 use crate::AppState;
-use crate::db::*;
 use crate::models::*;
 use crate::tools::*;
 
@@ -51,55 +49,8 @@ pub fn set_workspace_root(state: State<AppState>, req: WorkspaceRootRequest) -> 
         *c = canon;
     }
 
-    upsert_saved_workspace(&state, &root.display().to_string())?;
-
     Ok(PathResult {
         workspace_root: root.display().to_string(),
-    })
-}
-
-#[tauri::command]
-pub fn list_saved_workspaces(state: State<AppState>) -> Result<Vec<WorkspaceRecord>, String> {
-    with_db(&state, |db| {
-        let mut stmt = db
-            .prepare(
-                "SELECT path, last_used_at FROM saved_workspaces ORDER BY datetime(last_used_at) DESC",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(WorkspaceRecord {
-                    path: row.get(0)?,
-                    last_used_at: row.get(1)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| e.to_string())?);
-        }
-        Ok(out)
-    })
-}
-
-#[tauri::command]
-pub fn save_workspace(state: State<AppState>, req: WorkspacePathRequest) -> Result<(), String> {
-    let canon = PathBuf::from(req.path)
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
-    if !canon.is_dir() {
-        return Err("workspace path must be a directory".to_string());
-    }
-    upsert_saved_workspace(&state, &canon.display().to_string())
-}
-
-#[tauri::command]
-pub fn remove_saved_workspace(state: State<AppState>, req: WorkspacePathRequest) -> Result<(), String> {
-    with_db(&state, |db| {
-        db.execute("DELETE FROM saved_workspaces WHERE path = ?1", params![req.path])
-            .map_err(|e| e.to_string())?;
-        Ok(())
     })
 }
 

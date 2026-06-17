@@ -1,6 +1,7 @@
 import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
 import { escapeHtml, field } from "./utils.js";
+import { logError, emptyState } from "./uikit.js";
 
 // ========== TOOLS TILE ==========
 export function renderToolsTile(tileObj, body) {
@@ -17,12 +18,17 @@ export function renderToolsTile(tileObj, body) {
   async function doRefresh(query = "") {
     const list = body.querySelector(`[data-tools-list="${tileObj.id}"]`);
     let items;
-    try { items = await invoke("get_tools"); } catch { items = []; }
+    try {
+      items = await invoke("get_tools");
+    } catch (err) {
+      logError("tools/get_tools", err);
+      items = [];
+    }
     const filtered = query ? items.filter(i => (field(i, "name", "name") || "").toLowerCase().includes(query)) : items;
 
     list.innerHTML = "";
     if (!filtered.length) {
-      list.innerHTML = `<div class="feed-empty">No tools</div>`;
+      list.appendChild(emptyState({ icon: "⚙", text: query ? "No tools match your search" : "No tools" }));
       return;
     }
 
@@ -40,13 +46,19 @@ export function renderToolsTile(tileObj, body) {
           <div class="tool-desc">${escapeHtml(description)}</div>
         </div>
         <label class="toggle-switch">
-          <input type="checkbox" ${enabled ? "checked" : ""} />
+          <input type="checkbox" ${enabled ? "checked" : ""} aria-label="Enable ${escapeHtml(name)}" />
           <span class="toggle-track"></span>
         </label>
       `;
 
       row.querySelector("input").addEventListener("change", async (e) => {
-        await invoke("set_tool_enabled", { req: { toolId, enabled: e.target.checked } });
+        const checked = e.target.checked;
+        try {
+          await invoke("set_tool_enabled", { req: { toolId, enabled: checked } });
+        } catch (err) {
+          logError("tools/set_tool_enabled", err);
+          e.target.checked = !checked; // revert the toggle on failure
+        }
       });
 
       list.appendChild(row);

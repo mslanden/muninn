@@ -149,12 +149,6 @@ pub struct ProjectRecord {
 }
 
 #[derive(Serialize)]
-pub struct WorkspaceRecord {
-    pub path: String,
-    pub last_used_at: String,
-}
-
-#[derive(Serialize)]
 pub struct ToolConfigRecord {
     pub tool_id: String,
     pub name: String,
@@ -597,12 +591,6 @@ pub struct FileListRequest {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRootRequest {
     pub workspace_root: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspacePathRequest {
-    pub path: String,
 }
 
 #[derive(Deserialize)]

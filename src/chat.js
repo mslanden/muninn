@@ -1,5 +1,6 @@
 import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { chatStreams, ui } from "./state.js";
 import { escapeHtml, field, projectLabel, renderMarkdown, threadLabel } from "./utils.js";
 import { focusTile, addTile, getChatTileBySessionId, saveLayout } from "./tilesys.js";
@@ -116,6 +117,57 @@ export async function addProjectChatTile(projectPath) {
   }
 }
 
+// Reflect the current project path in a chat tile's header badge.
+function updateProjectBadge(badge, projectPath) {
+  if (projectPath) {
+    badge.textContent = projectLabel(projectPath);
+    badge.title = projectPath;
+    badge.hidden = false;
+  } else {
+    badge.textContent = "";
+    badge.title = "";
+    badge.hidden = true;
+  }
+}
+
+// Switch an existing chat tile to a new working folder. Registers the folder as
+// a project (which caches AGENTS.md), starts a fresh session scoped to it, and
+// rebinds the tile to that session.
+async function setTileProject(tileObj, projectPath) {
+  const stream = chatStreams[tileObj.id];
+  if (!stream) return;
+  try {
+    await invoke("add_project", { req: { path: projectPath } });
+  } catch (e) {
+    console.error("add_project error:", e);
+    return;
+  }
+  let session;
+  try {
+    session = await invoke("create_session", { req: { projectPath } });
+  } catch (e) {
+    console.error("Failed to create project session:", e);
+    return;
+  }
+  const newId = field(session, "id", "id");
+  stream.sessionId = newId;
+  stream.contextTokens = null;
+  stream.bubble = null;
+  stream.text = "";
+  tileObj.chatId = newId;
+  tileObj.projectPath = projectPath;
+
+  const chatLog = tileObj.el.querySelector(`[data-chat-stream="${tileObj.id}"]`);
+  if (chatLog) chatLog.innerHTML = "";
+  updateContextBar(tileObj.id, 0);
+
+  const badge = tileObj.el.querySelector(`[data-project-badge="${tileObj.id}"]`);
+  if (badge) updateProjectBadge(badge, projectPath);
+
+  await refreshThreadSelect(tileObj);
+  saveLayout();
+}
+
 export async function refreshThreadSelect(tileObj) {
   const select = tileObj.el.querySelector(`[data-thread-select="${tileObj.id}"]`);
   if (!select) return;
@@ -151,14 +203,12 @@ export function renderChatTile(tileObj, body) {
   if (header) {
     const spacer = header.querySelector(".tile-spacer");
     if (spacer) {
-      // Project badge
-      if (tileObj.projectPath) {
-        const badge = document.createElement("span");
-        badge.className = "project-badge";
-        badge.textContent = projectLabel(tileObj.projectPath);
-        badge.title = tileObj.projectPath;
-        spacer.before(badge);
-      }
+      // Project badge — always present so the folder button can update it.
+      const badge = document.createElement("span");
+      badge.className = "project-badge";
+      badge.dataset.projectBadge = tileObj.id;
+      updateProjectBadge(badge, tileObj.projectPath);
+      spacer.before(badge);
       // Thread select
       const sel = document.createElement("select");
       sel.className = "thread-select";
@@ -202,6 +252,7 @@ export function renderChatTile(tileObj, body) {
       <textarea rows="1" placeholder="Message..." data-chat-input="${tileObj.id}"></textarea>
       <div class="composer-bar">
         <div class="composer-left">
+          <button class="hint-chip" data-chat-folder="${tileObj.id}" title="Set working folder for this chat">📁</button>
           <button class="hint-chip" data-hint="slash">/</button>
         </div>
         <button class="send-btn" data-chat-send="${tileObj.id}">SEND</button>
@@ -214,6 +265,17 @@ export function renderChatTile(tileObj, body) {
 
   const input = composer.querySelector(`[data-chat-input="${tileObj.id}"]`);
   const sendBtn = composer.querySelector(`[data-chat-send="${tileObj.id}"]`);
+  const folderBtn = composer.querySelector(`[data-chat-folder="${tileObj.id}"]`);
+
+  folderBtn.addEventListener("click", async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Set working folder for this chat",
+    });
+    if (!selected) return;
+    await setTileProject(tileObj, selected);
+  });
 
   const doSend = async () => {
     const text = input.value.trim();

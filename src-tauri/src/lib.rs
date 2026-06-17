@@ -5,7 +5,9 @@ mod feeds;
 mod interactive;
 mod llm;
 mod mail;
+mod mcp;
 mod models;
+mod notify_user;
 mod scheduler;
 mod search;
 mod todos;
@@ -14,7 +16,6 @@ mod tools;
 use models::RunningProcess;
 use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::Client;
-use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -37,6 +38,42 @@ pub struct AppState {
     /// Outstanding `ask_user` questions, keyed by session_id. Sender fires when
     /// the user answers; drop the sender to cancel.
     pub pending_questions: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    /// Connections to configured MCP servers (lazy-spawned stdio children).
+    pub mcp: mcp::McpManager,
+}
+
+/// Show/hide the frameless quick-ask overlay (created on first use). Lives at
+/// module level because both the global shortcut handler and (potentially) the
+/// tray need it.
+fn toggle_quickask_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("quickask") {
+        if w.is_visible().unwrap_or(false) {
+            let _ = w.hide();
+        } else {
+            let _ = w.show();
+            let _ = w.set_focus();
+            let _ = w.emit("quickask-shown", ());
+        }
+        return;
+    }
+    let result = tauri::WebviewWindowBuilder::new(
+        app,
+        "quickask",
+        tauri::WebviewUrl::App("index.html?quickask=1".into()),
+    )
+    .title("Muninn Quick Ask")
+    .inner_size(680.0, 460.0)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .visible_on_all_workspaces(true)
+    .center()
+    .focused(true)
+    .build();
+    if let Err(e) = result {
+        eprintln!("[QuickAsk] failed to create window: {}", e);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -64,17 +101,10 @@ pub fn run() {
                 .map_err(|e| e.to_string())?;
             let conn = pool.get().map_err(|e| e.to_string())?;
             db::init_db(&conn)?;
+            // A quit/crash mid-run leaves tasks stuck in 'running'; reschedule them.
+            scheduler::recover_stuck_tasks(&conn);
 
             let (workspace_root, workspace_root_canon) = tools::default_workspace_root()?;
-            conn.execute(
-                r#"
-                INSERT INTO saved_workspaces (path, last_used_at)
-                VALUES (?1, CURRENT_TIMESTAMP)
-                ON CONFLICT(path) DO UPDATE SET last_used_at = CURRENT_TIMESTAMP
-                "#,
-                params![workspace_root.display().to_string()],
-            )
-            .map_err(|e| e.to_string())?;
             drop(conn);
             let http = Client::builder()
                 .timeout(std::time::Duration::from_secs(90))
@@ -91,6 +121,7 @@ pub fn run() {
                 stop_requests: Mutex::new(HashSet::new()),
                 todos: Mutex::new(HashMap::new()),
                 pending_questions: Mutex::new(HashMap::new()),
+                mcp: mcp::McpManager::default(),
             });
 
             // Plugins
@@ -99,6 +130,33 @@ pub fn run() {
                 None,
             ))?;
             app.handle().plugin(tauri_plugin_dialog::init())?;
+            app.handle().plugin(tauri_plugin_notification::init())?;
+
+            // Global quick-ask shortcut. The accelerator comes from settings
+            // (quickask/shortcut, default Cmd+Shift+Space); changes take effect
+            // on next launch.
+            app.handle().plugin(
+                tauri_plugin_global_shortcut::Builder::new()
+                    .with_handler(|app, _shortcut, event| {
+                        if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                            toggle_quickask_window(app);
+                        }
+                    })
+                    .build(),
+            )?;
+            {
+                use tauri_plugin_global_shortcut::GlobalShortcutExt;
+                let state: tauri::State<'_, AppState> = app.state();
+                let accel = db::get_app_setting_value(&state, "quickask/shortcut")
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "cmd+shift+space".to_string());
+                if let Err(e) = app.global_shortcut().register(accel.as_str()) {
+                    eprintln!("[QuickAsk] failed to register '{}': {} — falling back to cmd+shift+space", accel, e);
+                    let _ = app.global_shortcut().register("cmd+shift+space");
+                }
+            }
 
             // System tray
             let show_item = MenuItem::with_id(app, "show", "Show Muninn", true, None::<&str>)?;
@@ -233,9 +291,6 @@ pub fn run() {
             commands::check_command_safety,
             commands::get_workspace_root,
             commands::set_workspace_root,
-            commands::list_saved_workspaces,
-            commands::save_workspace,
-            commands::remove_saved_workspace,
             commands::get_projects,
             commands::add_project,
             commands::remove_project,
@@ -273,7 +328,9 @@ pub fn run() {
             commands::get_session_todos,
             commands::answer_user_question,
             commands::cancel_user_question,
-            commands::has_pending_question
+            commands::has_pending_question,
+            commands::get_mcp_status,
+            commands::reload_mcp_servers
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

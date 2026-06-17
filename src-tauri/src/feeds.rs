@@ -539,3 +539,52 @@ Rules:
 
     Ok(count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_fences_handles_plain_json_and_json_fence() {
+        assert_eq!(strip_json_fences("{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(strip_json_fences("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(strip_json_fences("```\n[1,2]\n```"), "[1,2]");
+        // Unterminated fence: take everything after the opening fence.
+        assert_eq!(strip_json_fences("```json\n{\"a\":1}"), "{\"a\":1}");
+    }
+
+    #[test]
+    fn extract_json_array_from_noisy_model_output() {
+        let raw = "Sure! Here are the items:\n```json\n[{\"title\":\"x\"},{\"title\":\"y\"}]\n```\nHope that helps.";
+        let arr = extract_json_array(raw).expect("should parse array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["title"], "x");
+    }
+
+    #[test]
+    fn extract_json_array_tolerates_surrounding_prose_without_fences() {
+        let raw = "Result: [1, 2, 3] done";
+        let arr = extract_json_array(raw).expect("should parse array");
+        assert_eq!(arr.len(), 3);
+    }
+
+    #[test]
+    fn extract_json_object_from_noisy_model_output() {
+        let raw = "```json\n{\"title\":\"hi\",\"summary\":\"s\"}\n```";
+        let obj = extract_json_object(raw).expect("should parse object");
+        assert_eq!(obj["title"], "hi");
+    }
+
+    #[test]
+    fn extract_json_array_errors_when_absent() {
+        assert!(extract_json_array("no json here").is_err());
+        // A bare object is not an array.
+        assert!(extract_json_array("{\"a\":1}").is_err());
+    }
+
+    #[test]
+    fn extract_json_object_errors_on_malformed() {
+        assert!(extract_json_object("not json").is_err());
+        assert!(extract_json_object("{ broken").is_err());
+    }
+}

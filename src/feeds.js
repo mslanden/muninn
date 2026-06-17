@@ -4,6 +4,7 @@ import { escapeHtml, feedTimeAgo } from "./utils.js";
 import { openReaderWindow, openArticleReader } from "./reader.js";
 import { openFeedItemInChat, playTts } from "./chat.js";
 import { renderScheduleWidget } from "./schedule.js";
+import { logError, showErrorBanner, setButtonLoading, attachEscClose } from "./uikit.js";
 
 // ========== FEEDS TILE ==========
 export function renderFeedsTile(tileObj, body) {
@@ -12,7 +13,7 @@ export function renderFeedsTile(tileObj, body) {
       <div class="feeds-sidebar">
         <div class="feeds-sidebar-header">
           <span class="feeds-sidebar-title">Feeds</span>
-          <button class="feeds-add-btn tile-btn" data-feeds-new="${tileObj.id}" title="New feed">+</button>
+          <button class="feeds-add-btn tile-btn" data-feeds-new="${tileObj.id}" title="New feed" aria-label="New feed">+</button>
         </div>
         <div class="feeds-feed-list" data-feeds-list="${tileObj.id}"></div>
       </div>
@@ -101,8 +102,21 @@ export function renderFeedsTile(tileObj, body) {
     }
   });
 
+  // Esc closes the new/edit feed form when it's open.
+  attachEscClose(() => {
+    if (form.classList.contains("visible")) {
+      form.classList.remove("visible");
+      resetForm();
+    }
+  });
+
   async function loadFeedList() {
-    try { allFeeds = await invoke("get_ai_feeds"); } catch { allFeeds = []; }
+    try {
+      allFeeds = await invoke("get_ai_feeds");
+    } catch (err) {
+      logError("feeds/get_ai_feeds", err);
+      allFeeds = [];
+    }
     feedList.innerHTML = "";
     if (!allFeeds.length) {
       feedList.innerHTML = `<div class="feeds-no-feeds">No feeds yet</div>`;
@@ -118,8 +132,8 @@ export function renderFeedsTile(tileObj, body) {
       el.innerHTML = `
         <div class="feeds-feed-item-top">
           <span class="feeds-feed-name">${escapeHtml(name)}</span>
-          <button class="feeds-feed-edit tile-btn" data-edit-id="${id}" title="Edit feed">&#9998;</button>
-          <button class="feeds-feed-del tile-btn" data-del-id="${id}" title="Delete feed">&times;</button>
+          <button class="feeds-feed-edit tile-btn" data-edit-id="${id}" title="Edit feed" aria-label="Edit feed ${escapeHtml(name)}">&#9998;</button>
+          <button class="feeds-feed-del tile-btn" data-del-id="${id}" title="Delete feed" aria-label="Delete feed ${escapeHtml(name)}">&times;</button>
         </div>
         <div class="feeds-feed-topics">${escapeHtml(topics)}</div>
       `;
@@ -141,7 +155,13 @@ export function renderFeedsTile(tileObj, body) {
       });
       el.querySelector(`[data-del-id="${id}"]`).addEventListener("click", async (e) => {
         e.stopPropagation();
-        await invoke("delete_ai_feed", { req: { id } });
+        try {
+          await invoke("delete_ai_feed", { req: { id } });
+        } catch (err) {
+          logError("feeds/delete_ai_feed", err);
+          showErrorBanner(itemsPanel, `Couldn't delete feed: ${err}`);
+          return;
+        }
         if (selectedFeedId === id) {
           selectedFeedId = null;
           showItemsEmpty();
@@ -172,12 +192,20 @@ export function renderFeedsTile(tileObj, body) {
   }
 
   async function loadFeedItems(feedId, feedName) {
+    // Preserve scroll position across reloads (e.g. after Refresh) so the user
+    // isn't yanked back to the top.
+    const prevScroll = itemsPanel.scrollTop;
     itemsPanel.innerHTML = `<div class="feeds-loading">Loading…</div>`;
     try {
       const items = await invoke("get_ai_feed_items", { req: { id: feedId } });
       renderFeedItems(feedId, feedName, items);
+      itemsPanel.scrollTop = prevScroll;
     } catch (err) {
-      itemsPanel.innerHTML = `<div class="feeds-error-msg">${escapeHtml(err)}</div>`;
+      logError("feeds/get_ai_feed_items", err);
+      itemsPanel.innerHTML = "";
+      showErrorBanner(itemsPanel, `Couldn't load feed items: ${err}`, {
+        onRetry: () => loadFeedItems(feedId, feedName),
+      });
     }
   }
 
@@ -189,12 +217,11 @@ export function renderFeedsTile(tileObj, body) {
     toolbar.innerHTML = `
       <span class="feeds-items-title">${escapeHtml(feedName)}</span>
       <span class="feeds-spacer"></span>
-      <button class="feeds-btn feeds-refresh-btn" data-refresh-id="${feedId}">&#8635; Refresh</button>
+      <button class="feeds-btn feeds-refresh-btn" data-refresh-id="${feedId}" aria-label="Refresh feed">&#8635; Refresh</button>
     `;
     toolbar.querySelector(`[data-refresh-id="${feedId}"]`).addEventListener("click", async (e) => {
       const btn = e.currentTarget;
-      btn.textContent = "Refreshing…";
-      btn.disabled = true;
+      const restore = setButtonLoading(btn, "Refreshing…");
       try {
         const result = await invoke("refresh_ai_feed", { req: { id: feedId } });
         const added = result.itemsAdded ?? result.items_added ?? 0;
@@ -206,13 +233,11 @@ export function renderFeedsTile(tileObj, body) {
           setTimeout(() => { if (newBtn) newBtn.textContent = "↻ Refresh"; }, 2500);
         }
       } catch (err) {
-        btn.textContent = "↻ Refresh";
-        btn.disabled = false;
-        const errEl = document.createElement("div");
-        errEl.className = "feeds-error-msg";
-        errEl.textContent = String(err);
-        itemsPanel.insertBefore(errEl, itemsPanel.firstChild);
-        setTimeout(() => errEl.remove(), 6000);
+        logError("feeds/refresh_ai_feed", err);
+        restore();
+        showErrorBanner(itemsPanel, `Refresh failed: ${err}`, {
+          onRetry: () => btn.click(),
+        });
       }
     });
     itemsPanel.appendChild(toolbar);

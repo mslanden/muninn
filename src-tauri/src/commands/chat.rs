@@ -78,8 +78,10 @@ pub async fn chat(app: AppHandle, state: State<'_, AppState>, req: ChatRequest) 
         .map_err(|e| e.to_string())
     })?;
 
+    // A chat without an explicit folder operates in the default workspace root
+    // ("main directory"); picking a folder scopes it to that project path.
     let scope = if session_project_path.is_empty() {
-        None
+        Some(WorkspaceScope::from_state(&state)?)
     } else {
         Some(WorkspaceScope::from_path(&session_project_path)?)
     };
@@ -119,7 +121,13 @@ pub async fn chat(app: AppHandle, state: State<'_, AppState>, req: ChatRequest) 
 #[tauri::command]
 pub fn stop_chat(state: State<AppState>, session_id: String) -> Result<(), String> {
     {
-        let mut stops = state.stop_requests.lock().map_err(|_| "lock error".to_string())?;
+        // Recover from a poisoned lock rather than propagating an error: a panic in
+        // an unrelated chat turn must never permanently disable the user's ability to
+        // stop generation. The HashSet contents are still valid after a poison.
+        let mut stops = state
+            .stop_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         stops.insert(session_id.clone());
     }
     // Also unblock any in-flight ask_user call — the provider loop can't

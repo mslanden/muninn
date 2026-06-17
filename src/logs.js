@@ -1,6 +1,7 @@
 import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
 import { escapeHtml, field, feedTimeAgo } from "./utils.js";
+import { logError, reconcileKeyedList, emptyState } from "./uikit.js";
 
 // ========== LOGS TILE ==========
 export function renderLogsTile(tileObj, body) {
@@ -35,7 +36,12 @@ export async function refreshLogsTile(tileId) {
   if (!list) return;
 
   let items;
-  try { items = await invoke("get_feed_items", { req: { limit: 200, unreadOnly: false } }); } catch { items = []; }
+  try {
+    items = await invoke("get_feed_items", { req: { limit: 200, unreadOnly: false } });
+  } catch (err) {
+    logError("logs/get_feed_items", err);
+    items = [];
+  }
   const unread = items.filter(item => !field(item, "isRead", "is_read")).length;
 
   if (badge) {
@@ -43,48 +49,61 @@ export async function refreshLogsTile(tileId) {
     badge.classList.toggle("has-unread", unread > 0);
   }
 
-  list.innerHTML = "";
   if (!items.length) {
-    list.innerHTML = `<div class="feed-empty">No activity yet</div>`;
+    list.replaceChildren(emptyState({ icon: "✓", text: "No activity yet" }));
     return;
   }
 
-  for (const item of items) {
-    const id = field(item, "id", "id");
-    const isRead = !!field(item, "isRead", "is_read");
+  const dotClass = (item) => {
     const kind = field(item, "kind", "kind") || "response";
-    const title = field(item, "title", "title");
-    const message = field(item, "message", "message");
-    const createdAt = field(item, "createdAt", "created_at");
+    return kind === "tool" ? "blue" : kind === "message" ? "green" : "amber";
+  };
 
-    const dotColor = kind === "tool" ? "blue" : kind === "message" ? "green" : "amber";
-    const el = document.createElement("div");
-    el.className = "logs-item";
-    el.innerHTML = `
-      <span class="logs-dot ${isRead ? "gray" : dotColor}"></span>
-      <div class="logs-info">
-        <strong>${escapeHtml(title)}</strong>
-        <span>${escapeHtml(message)}</span>
-        <span class="logs-time">${feedTimeAgo(createdAt)}</span>
-      </div>
-      <span class="logs-item-delete" title="Remove">&times;</span>
-    `;
-
-    if (!isRead) {
+  // Incremental keyed render: existing rows are kept (preserving scroll position),
+  // only changed read-state / time is patched, and removed items are dropped.
+  reconcileKeyedList(
+    list,
+    items,
+    (item) => field(item, "id", "id"),
+    (item) => {
+      const id = field(item, "id", "id");
+      const el = document.createElement("div");
+      el.className = "logs-item";
+      el.innerHTML = `
+        <span class="logs-dot"></span>
+        <div class="logs-info">
+          <strong>${escapeHtml(field(item, "title", "title"))}</strong>
+          <span>${escapeHtml(field(item, "message", "message"))}</span>
+          <span class="logs-time"></span>
+        </div>
+        <button type="button" class="logs-item-delete" title="Remove" aria-label="Remove activity item">&times;</button>
+      `;
       el.addEventListener("click", async (e) => {
-        if (e.target.classList.contains("logs-item-delete")) return;
+        if (e.target.closest(".logs-item-delete")) return;
+        if (el.dataset.read === "true") return;
         await invoke("mark_feed_item_read", { req: { id } });
         await refreshLogsTile(tileId);
       });
-    }
+      el.querySelector(".logs-item-delete").addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try {
+          await invoke("remove_feed_item", { req: { id } });
+        } catch (err) {
+          logError("logs/remove_feed_item", err);
+        }
+        await refreshLogsTile(tileId);
+      });
+      updateRow(el, item);
+      return el;
+    },
+    updateRow,
+  );
 
-    el.querySelector(".logs-item-delete").addEventListener("click", async (e) => {
-      e.stopPropagation();
-      try { await invoke("remove_feed_item", { req: { id } }); } catch {}
-      await refreshLogsTile(tileId);
-    });
-
-    list.appendChild(el);
+  function updateRow(el, item) {
+    const isRead = !!field(item, "isRead", "is_read");
+    el.dataset.read = String(isRead);
+    el.querySelector(".logs-dot").className = `logs-dot ${isRead ? "gray" : dotClass(item)}`;
+    el.querySelector(".logs-time").textContent = feedTimeAgo(field(item, "createdAt", "created_at"));
   }
 }
 

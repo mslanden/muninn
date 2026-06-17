@@ -6,7 +6,6 @@ export const sidebarWorkspace = document.getElementById("sidebar-workspace");
 export const sidebarModel = document.getElementById("sidebar-model");
 export const newChatBtn = document.getElementById("new-chat-btn");
 export const navSettingsBtn = document.getElementById("nav-settings");
-export const navWorkspacesBtn = document.getElementById("nav-workspaces");
 
 // Open tiles: { id, type, el, chatId?, projectPath?, webUrl?, cleanup? }
 export const tiles = [];

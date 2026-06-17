@@ -10,28 +10,19 @@ import "./toolspanel.js";
 import "./agents.js";
 import "./memory.js";
 import "./content.js";
-import "./workspaces.js";
 import "./settings.js";
 
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { workspace, sidebarWorkspace, sidebarModel, newChatBtn, navSettingsBtn, navWorkspacesBtn, ui } from "./state.js";
+import { workspace, sidebarWorkspace, sidebarModel, newChatBtn, navSettingsBtn, ui } from "./state.js";
 import { field, projectLabel } from "./utils.js";
-import { focusTile, addTile, getTilesByType, updateSidebar, isPopout, getPopoutParams, restoreLayout } from "./tilesys.js";
+import { focusTile, addTile, getTilesByType, updateSidebar, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav } from "./tilesys.js";
 import { addChatTile } from "./chat.js";
 import { setupEventListeners } from "./events.js";
+import { isQuickAsk, bootQuickAsk } from "./quickask.js";
 
 // ==================== SIDEBAR BUTTONS ====================
 newChatBtn.addEventListener("click", () => addChatTile());
-
-navWorkspacesBtn.addEventListener("click", () => {
-  const existing = getTilesByType("workspaces");
-  if (existing.length > 0) {
-    focusTile(existing[0].id);
-  } else {
-    addTile("workspaces");
-  }
-});
 
 navSettingsBtn.addEventListener("click", () => {
   const existing = getTilesByType("settings");
@@ -87,6 +78,7 @@ async function bootPopout() {
 
 async function bootMain() {
   await setupEventListeners();
+  setupTileKeyboardNav();
 
   try { ui.loadedSettings = await invoke("get_app_settings"); } catch { ui.loadedSettings = {}; }
   ui.mapboxToken = ui.loadedSettings["maps/mapbox_api_key"] || null;
@@ -108,8 +100,6 @@ async function bootMain() {
         await addChatTile(item.chatId || "", item.projectPath || "");
       } else if (item.type === "settings") {
         addTile("settings");
-      } else if (item.type === "workspaces") {
-        addTile("workspaces");
       } else {
         addTile(item.type, { webUrl: item.webUrl || "" });
       }
@@ -123,7 +113,9 @@ async function bootMain() {
 
 (async () => {
   try {
-    if (isPopout()) {
+    if (isQuickAsk()) {
+      await bootQuickAsk();
+    } else if (isPopout()) {
       await bootPopout();
     } else {
       await bootMain();

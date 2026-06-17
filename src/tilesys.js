@@ -1,6 +1,6 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getTileRenderer } from "./registry.js";
-import { workspace, sidebarNav, navSettingsBtn, navWorkspacesBtn, tiles, chatStreams, tileMaps, ui } from "./state.js";
+import { workspace, sidebarNav, navSettingsBtn, tiles, chatStreams, tileMaps, ui } from "./state.js";
 import { escapeHtml } from "./utils.js";
 import { addChatTile } from "./chat.js";
 
@@ -18,18 +18,10 @@ export const TILE_TYPES = [
 ];
 
 export function updateWorkspaceGrid() {
-  const count = tiles.length;
-  if (count === 0) {
-    workspace.style.gridTemplateColumns = "1fr";
-  } else if (count === 1) {
-    workspace.style.gridTemplateColumns = "1fr";
-  } else if (count === 2) {
-    workspace.style.gridTemplateColumns = "1fr 1fr";
-  } else if (count === 3) {
-    workspace.style.gridTemplateColumns = "1fr 1fr 1fr";
-  } else {
-    workspace.style.gridTemplateColumns = `repeat(${count}, 1fr)`;
-  }
+  // Column/row flow is owned by CSS (.workspace uses a wrapping auto-fit grid).
+  // Clear any legacy inline override and expose the count for potential styling.
+  workspace.style.gridTemplateColumns = "";
+  workspace.dataset.tileCount = String(tiles.length);
 }
 
 export function focusTile(tileId) {
@@ -45,9 +37,13 @@ export function addTile(type, opts = {}) {
   tile.className = "tile";
   tile.dataset.tileId = id;
   tile.dataset.tileType = type;
+  // Make tiles reachable by keyboard and announced as labelled regions.
+  tile.tabIndex = 0;
+  tile.setAttribute("role", "region");
 
   const label = TILE_TYPES.find(t => t.type === type)?.label || type;
   const subtitle = opts.subtitle || "";
+  tile.setAttribute("aria-label", subtitle ? `${label} — ${subtitle}` : label);
 
   tile.innerHTML = `
     <div class="tile-header">
@@ -63,6 +59,8 @@ export function addTile(type, opts = {}) {
   `;
 
   tile.addEventListener("mousedown", () => focusTile(id));
+  // Track focus reached via keyboard (Tab) so the focused-tile state stays in sync.
+  tile.addEventListener("focusin", () => focusTile(id));
 
   tile.querySelector(".tile-btn.pop").addEventListener("click", (e) => {
     e.stopPropagation();
@@ -131,6 +129,37 @@ export function removeTile(tileId) {
   saveLayout();
 }
 
+// Global keyboard shortcuts for moving between tiles:
+//   Cmd/Ctrl+1..9  → focus the Nth tile
+//   Cmd/Ctrl+]     → focus the next tile (wraps)
+//   Cmd/Ctrl+[     → focus the previous tile (wraps)
+// Focusing the tile element drives the focused-tile state via the `focusin`
+// handler and shows the keyboard focus ring.
+export function setupTileKeyboardNav() {
+  document.addEventListener("keydown", (e) => {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+
+    if (e.key >= "1" && e.key <= "9") {
+      const idx = Number(e.key) - 1;
+      if (idx < tiles.length) {
+        e.preventDefault();
+        tiles[idx].el.focus();
+      }
+      return;
+    }
+
+    if (e.key === "[" || e.key === "]") {
+      if (tiles.length === 0) return;
+      e.preventDefault();
+      const cur = tiles.findIndex(t => t.id === ui.focusedTileId);
+      const base = cur === -1 ? 0 : cur;
+      const delta = e.key === "]" ? 1 : -1;
+      const next = (base + delta + tiles.length) % tiles.length;
+      tiles[next].el.focus();
+    }
+  });
+}
+
 export function getTilesByType(type) {
   return tiles.filter(t => t.type === type);
 }
@@ -160,6 +189,8 @@ export function updateSidebar() {
 
     const btn = document.createElement("button");
     btn.className = `nav-item${isOpen ? " open" : ""}`;
+    // Title doubles as the tooltip when the sidebar collapses to its icon rail.
+    btn.title = def.label;
     btn.innerHTML = `
       <span class="nav-dot ${isOpen ? def.dot : "off"}"></span>
       ${def.label}
@@ -189,11 +220,6 @@ export function updateSidebar() {
   }
 
   // Update static sidebar buttons
-  const wsOpen = getTilesByType("workspaces").length > 0;
-  navWorkspacesBtn.classList.toggle("open", wsOpen);
-  const wsDot = navWorkspacesBtn.querySelector(".nav-dot");
-  if (wsDot) wsDot.className = `nav-dot ${wsOpen ? "blue" : "off"}`;
-
   const settingsOpen = getTilesByType("settings").length > 0;
   navSettingsBtn.classList.toggle("open", settingsOpen);
   const settingsDot = navSettingsBtn.querySelector(".nav-dot");

@@ -137,25 +137,16 @@ use crate::tools::{
 };
 
 /// Check if a stop has been requested for this session (and clear the flag).
+/// Recovers from a poisoned lock so a panic elsewhere can't wedge the stop signal.
 fn check_stop_requested(state: &AppState, session_id: &str) -> bool {
-    if let Ok(mut stops) = state.stop_requests.lock() {
-        stops.remove(session_id)
-    } else {
-        false
-    }
+    let mut stops = state
+        .stop_requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    stops.remove(session_id)
 }
 
 // --- Embeddings & Semantic Retrieval ---
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if mag_a == 0.0 || mag_b == 0.0 { 0.0 } else { dot / (mag_a * mag_b) }
-}
 
 fn f32_vec_to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -226,9 +217,40 @@ pub(crate) fn store_embedding(state: &AppState, source_type: &str, source_id: i6
     });
 }
 
+/// Cosine similarity against a query whose magnitude is already known. Lets the
+/// retrieval loop avoid recomputing the (large, fixed) query magnitude once per
+/// candidate entity. Returns 0 on dimension mismatch.
+fn cosine_with_query_mag(query: &[f32], query_mag: f32, b: &[f32]) -> f32 {
+    if query_mag == 0.0 || query.len() != b.len() || b.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut mag_b_sq = 0.0f32;
+    for (x, y) in query.iter().zip(b) {
+        dot += x * y;
+        mag_b_sq += y * y;
+    }
+    let mag_b = mag_b_sq.sqrt();
+    if mag_b == 0.0 { 0.0 } else { dot / (query_mag * mag_b) }
+}
+
 /// Retrieve top-k entity IDs most relevant to the query embedding.
+///
+/// SQLite has no native vector index, so we still scan the `entity` embeddings
+/// (the `UNIQUE(source_type, source_id)` constraint indexes the `source_type`
+/// filter). The hot path is kept tight: the query magnitude is computed once
+/// rather than per row, decoding/scoring happens in a single pass, and we select
+/// the top-k with an O(n) partial sort instead of a full O(n log n) sort.
 pub(crate) fn retrieve_relevant_entity_ids(state: &AppState, query_embedding: &[f32], top_k: usize) -> Vec<(i64, f32)> {
-    let rows: Vec<(i64, Vec<u8>)> = with_db(state, |db| {
+    if query_embedding.is_empty() || top_k == 0 {
+        return Vec::new();
+    }
+    let query_mag: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if query_mag == 0.0 {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(i64, f32)> = with_db(state, |db| {
         let mut stmt = db
             .prepare("SELECT source_id, embedding FROM embeddings WHERE source_type = 'entity'")
             .map_err(|e| e.to_string())?;
@@ -236,25 +258,22 @@ pub(crate) fn retrieve_relevant_entity_ids(state: &AppState, query_embedding: &[
             .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
-        for row in rows {
-            if let Ok(r) = row {
-                out.push(r);
-            }
+        for row in rows.flatten() {
+            let (id, blob) = row;
+            let emb = blob_to_f32_vec(&blob);
+            out.push((id, cosine_with_query_mag(query_embedding, query_mag, &emb)));
         }
         Ok(out)
     })
     .unwrap_or_default();
 
-    let mut scored: Vec<(i64, f32)> = rows
-        .iter()
-        .map(|(id, blob)| {
-            let emb = blob_to_f32_vec(blob);
-            (*id, cosine_similarity(query_embedding, &emb))
-        })
-        .collect();
-
+    if scored.len() > top_k {
+        scored.select_nth_unstable_by(top_k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(top_k);
+    }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(top_k);
     scored
 }
 
@@ -281,6 +300,98 @@ pub(crate) async fn retrieve_relevant_memory(state: &AppState, user_message: &st
     }
 }
 
+/// Resolved configuration for a one-shot (non-streaming) helper LLM call.
+pub(crate) struct LlmCallConfig {
+    #[allow(dead_code)]
+    pub provider: String,
+    pub model: String,
+    pub is_anthropic: bool,
+    pub api_key: String,
+    pub endpoint: String,
+}
+
+/// Resolve provider / model / API key / endpoint for the one-shot helper LLM calls
+/// (entity-summary compaction, feed-article generation, memory extraction). These three
+/// call sites previously duplicated this block verbatim. The interactive chat + agent
+/// paths use `Provider::openai` / `Provider::minimax_anthropic` instead and are unaffected.
+///
+/// Routing is provider-driven (`llm/provider` setting): `minimax`/`anthropic` use the
+/// Anthropic messages wire format; every other provider uses the OpenAI chat-completions
+/// format with a per-provider endpoint. Returns `Err` if no API key is configured.
+pub(crate) fn resolve_llm_config(state: &AppState) -> Result<LlmCallConfig, String> {
+    let provider = get_app_setting_value(state, "llm/provider")
+        .ok()
+        .flatten()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "minimax".to_string());
+
+    let model = get_app_setting_value(state, "llm/model")
+        .ok()
+        .flatten()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| {
+            if provider == "minimax" {
+                "MiniMax-M2.7".to_string()
+            } else {
+                "gpt-4.1-mini".to_string()
+            }
+        });
+
+    let (api_key_opt, endpoint, is_anthropic) = if provider == "minimax" {
+        let key = first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])
+            .ok()
+            .flatten()
+            .or_else(|| std::env::var("MINIMAX_API_KEY").ok())
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
+        let base = std::env::var("MINIMAX_ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
+        let ep = if base.ends_with("/v1/messages") {
+            base
+        } else {
+            format!("{}/v1/messages", base.trim_end_matches('/'))
+        };
+        (key, ep, true)
+    } else if provider == "anthropic" {
+        let key = first_non_empty_setting(state, &["llm/anthropic_api_key"])
+            .ok()
+            .flatten()
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
+        (key, "https://api.anthropic.com/v1/messages".to_string(), true)
+    } else {
+        let key_setting = format!("llm/{}_api_key", provider);
+        let key = first_non_empty_setting(state, &[&key_setting, "llm/openai_api_key"])
+            .ok()
+            .flatten()
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+        let ep = match provider.as_str() {
+            "openai" => "https://api.openai.com/v1/chat/completions".to_string(),
+            "together" => "https://api.together.xyz/v1/chat/completions".to_string(),
+            "groq" => "https://api.groq.com/openai/v1/chat/completions".to_string(),
+            "deepseek" => "https://api.deepseek.com/chat/completions".to_string(),
+            "xai" => "https://api.x.ai/v1/chat/completions".to_string(),
+            "google" => "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions".to_string(),
+            "mistral" => "https://api.mistral.ai/v1/chat/completions".to_string(),
+            "cohere" => "https://api.cohere.com/compatibility/v1/chat/completions".to_string(),
+            "fireworks" => "https://api.fireworks.ai/inference/v1/chat/completions".to_string(),
+            "openrouter" => "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            _ => "https://api.openai.com/v1/chat/completions".to_string(),
+        };
+        (key, ep, false)
+    };
+
+    let api_key = api_key_opt
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| "No API key configured".to_string())?;
+
+    Ok(LlmCallConfig {
+        provider,
+        model,
+        is_anthropic,
+        api_key,
+        endpoint,
+    })
+}
+
 /// Compact an entity summary that has grown too long.
 pub(crate) async fn compact_entity_summary(
     state: &AppState,
@@ -293,38 +404,7 @@ pub(crate) async fn compact_entity_summary(
         return None;
     }
 
-    let provider = get_app_setting_value(state, "llm/provider")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "minimax".to_string());
-
-    let model = get_app_setting_value(state, "llm/model")
-        .ok()
-        .flatten()
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| {
-            if provider == "minimax" { "MiniMax-M2.7".to_string() } else { "gpt-4.1-mini".to_string() }
-        });
-
-    let is_anthropic = provider == "minimax" || provider == "anthropic" || model.starts_with("MiniMax-");
-
-    let (api_key, endpoint) = if is_anthropic {
-        let key = first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("MINIMAX_API_KEY").ok())
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())?;
-        let base = std::env::var("MINIMAX_ANTHROPIC_BASE_URL")
-            .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
-        let ep = if base.ends_with("/v1/messages") { base } else { format!("{}/v1/messages", base.trim_end_matches('/')) };
-        (key, ep)
-    } else {
-        let key = first_non_empty_setting(state, &["llm/openai_api_key"])
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())?;
-        (key, "https://api.openai.com/v1/chat/completions".to_string())
-    };
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state).ok()?;
 
     let prompt = format!(
         "This entity has accumulated history over time. Rewrite it as a concise current-state summary (2-4 sentences), \
@@ -414,40 +494,7 @@ pub(crate) async fn generate_feed_article_text(
     source_name: &str,
     source_text: &str,
 ) -> Result<String, String> {
-    let provider = get_app_setting_value(state, "llm/provider")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "minimax".to_string());
-
-    let model = get_app_setting_value(state, "llm/model")
-        .ok()
-        .flatten()
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| {
-            if provider == "minimax" { "MiniMax-M2.7".to_string() } else { "gpt-4.1-mini".to_string() }
-        });
-
-    let is_anthropic = provider == "minimax" || provider == "anthropic" || model.starts_with("MiniMax-");
-
-    let (api_key, endpoint) = if is_anthropic {
-        let key = first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("MINIMAX_API_KEY").ok())
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-            .ok_or_else(|| "No API key configured".to_string())?;
-        let base = std::env::var("MINIMAX_ANTHROPIC_BASE_URL")
-            .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
-        let ep = if base.ends_with("/v1/messages") { base } else { format!("{}/v1/messages", base.trim_end_matches('/')) };
-        (key, ep)
-    } else {
-        let key = first_non_empty_setting(state, &["llm/openai_api_key"])
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-            .ok_or_else(|| "No API key configured".to_string())?;
-        (key, "https://api.openai.com/v1/chat/completions".to_string())
-    };
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
 
     // Cap fetched source so we stay within a sane token budget.
     let source_excerpt: String = source_text.chars().take(8000).collect();
@@ -1474,6 +1521,27 @@ impl Provider {
         }
     }
 
+    /// Shape MCP-discovered tools into this provider's tool-definition format.
+    fn mcp_tools_json(&self, defs: &[crate::mcp::McpToolDef]) -> Vec<Value> {
+        defs.iter()
+            .map(|t| match self {
+                Self::OpenAi { .. } => json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.full_name,
+                        "description": t.description,
+                        "parameters": t.schema,
+                    }
+                }),
+                Self::Anthropic { .. } => json!({
+                    "name": t.full_name,
+                    "description": t.description,
+                    "input_schema": t.schema,
+                }),
+            })
+            .collect()
+    }
+
     /// Provider-shaped starting message list. OpenAI carries the system prompt as the
     /// first message; Anthropic passes it as a top-level request field instead.
     fn initial_messages(&self, system_prompt: &str, history: &[HistoryMessage]) -> Vec<Value> {
@@ -1758,6 +1826,70 @@ async fn resolve_chat_system_prompt(
 /// produces a plain text reply. Used by both providers, for both regular chat and
 /// custom agents (agents pass `agent_name` to drive the agent-iteration UI event).
 #[allow(clippy::too_many_arguments)]
+/// Emit the lifecycle events for a single tool call, execute it, log the result, and
+/// return the string to feed back to the model. On error the returned string is
+/// prefixed with `Tool error:`. Shared by the native-tool-call and the
+/// fenced-```tool```-code-block paths in `run_tool_loop`, which were previously
+/// identical ~30-line blocks.
+#[allow(clippy::too_many_arguments)]
+async fn execute_and_log_tool_call(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    exec_tools: &HashSet<String>,
+    tool_name: &str,
+    args_json: &Value,
+    args_text: &str,
+    scope: Option<&WorkspaceScope>,
+    interactive: bool,
+) -> String {
+    let _ = app.emit("tool-executed", json!({
+        "session_id": session_id,
+        "tool": tool_name,
+        "args": args_text,
+        "status": "running"
+    }));
+    let result = execute_agent_tool(
+        app, state, session_id, exec_tools, tool_name, args_json, scope, interactive,
+    )
+    .await;
+    match result {
+        Ok(output) => {
+            log_tool(state, session_id, tool_name, args_text, &output, "ok");
+            let _ = app.emit("tool-executed", json!({
+                "session_id": session_id,
+                "tool": tool_name,
+                "args": args_text,
+                "status": "ok"
+            }));
+            output
+        }
+        Err(error) => {
+            log_tool(state, session_id, tool_name, args_text, &error, "error");
+            let _ = app.emit("tool-executed", json!({
+                "session_id": session_id,
+                "tool": tool_name,
+                "args": args_text,
+                "status": "error"
+            }));
+            format!("Tool error: {}", error)
+        }
+    }
+}
+
+/// Periodically nudge the UI with a progress note during long tool-calling runs. The
+/// agentic loop is intentionally unbounded, so this is purely informational and offers
+/// the `/stop` affordance.
+fn emit_tool_round_progress(app: &AppHandle, session_id: &str, tool_round: u32) {
+    if tool_round % 5 == 0 {
+        let _ = app.emit("chat-token", json!({
+            "session_id": session_id,
+            "token": format!("\n\n*[Progress: {} tool rounds completed so far. Type /stop to cancel.]*\n\n", tool_round)
+        }));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_tool_loop(
     app: &AppHandle,
     state: &AppState,
@@ -1771,7 +1903,10 @@ async fn run_tool_loop(
     interactive: bool,
     agent_name: Option<&str>,
 ) -> Result<(String, Vec<Value>), String> {
-    let tools = provider.tools_json(exec_tools, interactive);
+    let mut tools = provider.tools_json(exec_tools, interactive);
+    // Merge in tools from configured MCP servers (lazy-connects on first turn;
+    // resilient — a broken server contributes nothing rather than failing the turn).
+    tools.extend(provider.mcp_tools_json(&state.mcp.connected_tools(state).await));
     let mut messages = provider.initial_messages(system_prompt, history);
     let mut tool_round: u32 = 0;
     let mut iteration: i64 = 0;
@@ -1822,38 +1957,10 @@ async fn run_tool_loop(
             let mut tool_result_blocks: Vec<Value> = Vec::new();
             for call in &outcome.tool_calls {
                 let args_json: Value = serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
-                let _ = app.emit("tool-executed", json!({
-                    "session_id": session_id,
-                    "tool": call.name,
-                    "args": call.args,
-                    "status": "running"
-                }));
-                let result = execute_agent_tool(
-                    app, state, session_id, exec_tools, &call.name, &args_json, scope, interactive,
+                let output = execute_and_log_tool_call(
+                    app, state, session_id, exec_tools, &call.name, &args_json, &call.args, scope, interactive,
                 )
                 .await;
-                let output = match result {
-                    Ok(output) => {
-                        log_tool(state, session_id, &call.name, &call.args, &output, "ok");
-                        let _ = app.emit("tool-executed", json!({
-                            "session_id": session_id,
-                            "tool": call.name,
-                            "args": call.args,
-                            "status": "ok"
-                        }));
-                        output
-                    }
-                    Err(error) => {
-                        log_tool(state, session_id, &call.name, &call.args, &error, "error");
-                        let _ = app.emit("tool-executed", json!({
-                            "session_id": session_id,
-                            "tool": call.name,
-                            "args": call.args,
-                            "status": "error"
-                        }));
-                        format!("Tool error: {}", error)
-                    }
-                };
                 provider.push_tool_result(&mut messages, &call.id, &output);
                 tool_result_blocks.push(json!({
                     "type": "tool_result",
@@ -1871,12 +1978,7 @@ async fn run_tool_loop(
             );
 
             tool_round += 1;
-            if tool_round % 5 == 0 {
-                let _ = app.emit("chat-token", json!({
-                    "session_id": session_id,
-                    "token": format!("\n\n*[Progress: {} tool rounds completed so far. Type /stop to cancel.]*\n\n", tool_round)
-                }));
-            }
+            emit_tool_round_progress(app, session_id, tool_round);
             continue;
         }
 
@@ -1888,38 +1990,10 @@ async fn run_tool_loop(
             let args_json: Value = serde_json::from_str(&args_str).unwrap_or_else(|_| json!({}));
             let args_text = args_str.to_string();
 
-            let _ = app.emit("tool-executed", json!({
-                "session_id": session_id,
-                "tool": tool_name,
-                "args": args_text,
-                "status": "running"
-            }));
-            let result = execute_agent_tool(
-                app, state, session_id, exec_tools, &tool_name, &args_json, scope, interactive,
+            let output = execute_and_log_tool_call(
+                app, state, session_id, exec_tools, &tool_name, &args_json, &args_text, scope, interactive,
             )
             .await;
-            let output = match result {
-                Ok(output) => {
-                    log_tool(state, session_id, &tool_name, &args_text, &output, "ok");
-                    let _ = app.emit("tool-executed", json!({
-                        "session_id": session_id,
-                        "tool": &tool_name,
-                        "args": &args_text,
-                        "status": "ok"
-                    }));
-                    output
-                }
-                Err(error) => {
-                    log_tool(state, session_id, &tool_name, &args_text, &error, "error");
-                    let _ = app.emit("tool-executed", json!({
-                        "session_id": session_id,
-                        "tool": &tool_name,
-                        "args": &args_text,
-                        "status": "error"
-                    }));
-                    format!("Tool error: {}", error)
-                }
-            };
 
             provider.push_text_round(&mut messages, &text_content, &format!("Tool result: {}", output));
 
@@ -1942,12 +2016,7 @@ async fn run_tool_loop(
             );
 
             tool_round += 1;
-            if tool_round % 5 == 0 {
-                let _ = app.emit("chat-token", json!({
-                    "session_id": session_id,
-                    "token": format!("\n\n*[Progress: {} tool rounds completed so far. Type /stop to cancel.]*\n\n", tool_round)
-                }));
-            }
+            emit_tool_round_progress(app, session_id, tool_round);
             continue;
         }
 
@@ -2094,67 +2163,9 @@ pub(crate) async fn run_extraction(app: &AppHandle, state: &AppState, user_msg: 
         return;
     }
 
-    let provider = match get_app_setting_value(state, "llm/provider") {
-        Ok(Some(p)) if !p.trim().is_empty() => p,
-        _ => "minimax".to_string(),
-    };
-
-    let model = match get_app_setting_value(state, "llm/model") {
-        Ok(Some(m)) if !m.trim().is_empty() => m,
-        _ => {
-            if provider == "minimax" {
-                "MiniMax-M2.7".to_string()
-            } else {
-                "gpt-4.1-mini".to_string()
-            }
-        }
-    };
-
-    let (api_key, endpoint, is_anthropic) = if provider == "minimax" {
-        let key = first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("MINIMAX_API_KEY").ok())
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
-        let base = std::env::var("MINIMAX_ANTHROPIC_BASE_URL")
-            .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
-        let ep = if base.ends_with("/v1/messages") {
-            base
-        } else {
-            format!("{}/v1/messages", base.trim_end_matches('/'))
-        };
-        (key, ep, true)
-    } else if provider == "anthropic" {
-        let key = first_non_empty_setting(state, &["llm/anthropic_api_key"])
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
-        (key, "https://api.anthropic.com/v1/messages".to_string(), true)
-    } else {
-        let key_setting = format!("llm/{}_api_key", provider);
-        let key = first_non_empty_setting(state, &[&key_setting, "llm/openai_api_key"])
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-        let ep = match provider.as_str() {
-            "openai" => "https://api.openai.com/v1/chat/completions".to_string(),
-            "together" => "https://api.together.xyz/v1/chat/completions".to_string(),
-            "groq" => "https://api.groq.com/openai/v1/chat/completions".to_string(),
-            "deepseek" => "https://api.deepseek.com/chat/completions".to_string(),
-            "xai" => "https://api.x.ai/v1/chat/completions".to_string(),
-            "google" => "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions".to_string(),
-            "mistral" => "https://api.mistral.ai/v1/chat/completions".to_string(),
-            "cohere" => "https://api.cohere.com/compatibility/v1/chat/completions".to_string(),
-            "fireworks" => "https://api.fireworks.ai/inference/v1/chat/completions".to_string(),
-            "openrouter" => "https://openrouter.ai/api/v1/chat/completions".to_string(),
-            _ => "https://api.openai.com/v1/chat/completions".to_string(),
-        };
-        (key, ep, false)
-    };
-
-    let api_key = match api_key {
-        Some(k) if !k.is_empty() => k,
-        _ => return,
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = match resolve_llm_config(state) {
+        Ok(cfg) => cfg,
+        Err(_) => return,
     };
 
     let entities: Vec<(i64, String, String, String, String)> = with_db(state, |db| {
@@ -2767,4 +2778,52 @@ Rules:\n\
     }
 
     let _ = app.emit("memory-updated", json!({}));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mag(v: &[f32]) -> f32 {
+        v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    }
+
+    #[test]
+    fn cosine_identical_vectors_is_one() {
+        let q = [3.0f32, 4.0];
+        let s = cosine_with_query_mag(&q, mag(&q), &[3.0, 4.0]);
+        assert!((s - 1.0).abs() < 1e-6, "got {}", s);
+    }
+
+    #[test]
+    fn cosine_orthogonal_vectors_is_zero() {
+        let q = [1.0f32, 0.0];
+        let s = cosine_with_query_mag(&q, mag(&q), &[0.0, 1.0]);
+        assert!(s.abs() < 1e-6, "got {}", s);
+    }
+
+    #[test]
+    fn cosine_opposite_vectors_is_negative_one() {
+        let q = [1.0f32, 0.0];
+        let s = cosine_with_query_mag(&q, mag(&q), &[-1.0, 0.0]);
+        assert!((s + 1.0).abs() < 1e-6, "got {}", s);
+    }
+
+    #[test]
+    fn cosine_handles_degenerate_inputs() {
+        let q = [1.0f32, 2.0];
+        // Dimension mismatch → 0.
+        assert_eq!(cosine_with_query_mag(&q, mag(&q), &[1.0, 2.0, 3.0]), 0.0);
+        // Empty candidate → 0.
+        assert_eq!(cosine_with_query_mag(&q, mag(&q), &[]), 0.0);
+        // Zero query magnitude → 0.
+        assert_eq!(cosine_with_query_mag(&[0.0, 0.0], 0.0, &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn blob_roundtrip_preserves_vector() {
+        let v = vec![0.5f32, -1.25, 3.0, 0.0];
+        let restored = blob_to_f32_vec(&f32_vec_to_blob(&v));
+        assert_eq!(v, restored);
+    }
 }

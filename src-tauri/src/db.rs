@@ -125,12 +125,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS saved_workspaces (
-          path TEXT PRIMARY KEY,
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
         CREATE TABLE IF NOT EXISTS tools (
           tool_id TEXT PRIMARY KEY,
           name TEXT NOT NULL,

@@ -49,18 +49,11 @@ export function renderSettingsTile(tileObj, body) {
         <span class="muted" data-s-img-status="${tileObj.id}" style="font-size:10px;"></span>
       </div>
       <div class="settings-group">
-        <h3>Workspace</h3>
+        <h3>Default directory</h3>
+        <p class="settings-hint">The folder a chat operates in when no project folder is picked. Use the 📁 button in a chat to scope it to a specific folder.</p>
         <div class="form-row" style="margin-bottom:6px;">
-          <input type="text" placeholder="Workspace path" data-s-workspace="${tileObj.id}" />
+          <input type="text" placeholder="Default directory path" data-s-workspace="${tileObj.id}" />
           <button class="form-btn" data-s-setws="${tileObj.id}">Set</button>
-          <button class="form-btn" data-s-savews="${tileObj.id}">Save</button>
-        </div>
-        <select data-s-saved-ws="${tileObj.id}" style="margin-bottom:6px;">
-          <option value="">Saved workspaces</option>
-        </select>
-        <div class="form-row" style="margin-bottom:6px;">
-          <button class="form-btn" data-s-usews="${tileObj.id}">Use Selected</button>
-          <button class="form-btn danger" data-s-rmws="${tileObj.id}">Remove</button>
         </div>
       </div>
       <div class="settings-group">
@@ -78,6 +71,21 @@ export function renderSettingsTile(tileObj, body) {
         <label class="checkbox-inline">
           <input type="checkbox" data-s-autostart="${tileObj.id}" /> Launch at login
         </label>
+        <label class="checkbox-inline">
+          <input type="checkbox" data-s-notify="${tileObj.id}" /> Desktop notifications
+        </label>
+        <div class="form-row" style="margin-top:6px;">
+          <input type="text" placeholder="Quick-ask shortcut (e.g. cmd+shift+space)" data-s-qashortcut="${tileObj.id}" style="flex:1;" />
+        </div>
+        <span class="muted" style="font-size:10px;">Shortcut changes take effect after restarting Muninn.</span>
+      </div>
+      <div class="settings-group">
+        <h3>MCP Servers</h3>
+        <textarea rows="4" spellcheck="false" placeholder='[{"name": "github", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "..."}}]' data-s-mcp="${tileObj.id}"></textarea>
+        <div class="form-row" style="margin-top:6px;">
+          <button class="form-btn" data-s-mcp-reload="${tileObj.id}">Reload Servers</button>
+        </div>
+        <div class="muted" data-s-mcp-status="${tileObj.id}" style="font-size:10px; white-space:pre-line;"></div>
       </div>
       <div class="form-row" style="margin-top:12px;">
         <button class="form-btn" data-s-save="${tileObj.id}">Save Settings</button>
@@ -98,12 +106,37 @@ export function renderSettingsTile(tileObj, body) {
   const imgProvSelect = body.querySelector(`[data-s-imgprov="${tileObj.id}"]`);
   const imgModelSelect = body.querySelector(`[data-s-imgmodel="${tileObj.id}"]`);
   const wsInput = body.querySelector(`[data-s-workspace="${tileObj.id}"]`);
-  const savedWsSelect = body.querySelector(`[data-s-saved-ws="${tileObj.id}"]`);
   const voiceidInput = body.querySelector(`[data-s-voiceid="${tileObj.id}"]`);
   const autostartInput = body.querySelector(`[data-s-autostart="${tileObj.id}"]`);
+  const notifyInput = body.querySelector(`[data-s-notify="${tileObj.id}"]`);
+  const qaShortcutInput = body.querySelector(`[data-s-qashortcut="${tileObj.id}"]`);
+  const mcpInput = body.querySelector(`[data-s-mcp="${tileObj.id}"]`);
+  const mcpStatusEl = body.querySelector(`[data-s-mcp-status="${tileObj.id}"]`);
   const themeSelect = body.querySelector(`[data-s-theme="${tileObj.id}"]`);
   const statusEl = body.querySelector(`[data-s-status="${tileObj.id}"]`);
   const imgStatusEl = body.querySelector(`[data-s-img-status="${tileObj.id}"]`);
+
+  function renderMcpStatus(servers) {
+    if (!servers.length) {
+      mcpStatusEl.textContent = "No servers configured";
+      return;
+    }
+    mcpStatusEl.textContent = servers
+      .map(s => s.connected
+        ? `✓ ${s.name}: ${s.toolCount} tool${s.toolCount === 1 ? "" : "s"}`
+        : `✗ ${s.name}: ${s.error || "not connected"}`)
+      .join("\n");
+  }
+
+  async function refreshMcpStatus(reload = false) {
+    if (!(mcpInput.value || "").trim()) { mcpStatusEl.textContent = ""; return; }
+    mcpStatusEl.textContent = reload ? "Reloading servers…" : "Checking servers…";
+    try {
+      renderMcpStatus(await invoke(reload ? "reload_mcp_servers" : "get_mcp_status"));
+    } catch (e) {
+      mcpStatusEl.textContent = String(e);
+    }
+  }
 
   function ensureOption(select, value) {
     if (!value) return;
@@ -148,25 +181,18 @@ export function renderSettingsTile(tileObj, body) {
 
     try { autostartInput.checked = await isAutostartEnabled(); } catch {}
 
+    notifyInput.checked = s["notifications/enabled"] !== "false";
+    qaShortcutInput.value = s["quickask/shortcut"] || "cmd+shift+space";
+    mcpInput.value = s["mcp/servers"] || "";
+    refreshMcpStatus();
+
     themeSelect.value = localStorage.getItem("muninn-theme") || "dark";
 
-    // Workspace
+    // Default directory
     const pathInfo = await invoke("get_workspace_root");
     const workspaceRoot = field(pathInfo, "workspaceRoot", "workspace_root");
     wsInput.value = workspaceRoot;
     sidebarWorkspace.textContent = projectLabel(workspaceRoot);
-
-    // Saved workspaces
-    const items = await invoke("list_saved_workspaces");
-    savedWsSelect.innerHTML = '<option value="">Saved workspaces</option>';
-    for (const item of items) {
-      const path = field(item, "path", "path");
-      const opt = document.createElement("option");
-      opt.value = path;
-      opt.textContent = path;
-      savedWsSelect.appendChild(opt);
-    }
-    if (workspaceRoot) savedWsSelect.value = workspaceRoot;
   }
 
   // Save
@@ -189,8 +215,26 @@ export function renderSettingsTile(tileObj, body) {
       ui.mapboxToken = mapboxInput.value.trim();
     }
     updates["tts/voice_id"] = voiceidInput.value.trim();
+    updates["notifications/enabled"] = notifyInput.checked ? "true" : "false";
+    updates["quickask/shortcut"] = qaShortcutInput.value.trim();
+
+    const mcpJson = mcpInput.value.trim();
+    if (mcpJson) {
+      try {
+        JSON.parse(mcpJson);
+        updates["mcp/servers"] = mcpJson;
+      } catch {
+        statusEl.textContent = "MCP servers JSON is invalid — not saved";
+        setTimeout(() => { statusEl.textContent = ""; }, 3000);
+        return;
+      }
+    } else {
+      updates["mcp/servers"] = "";
+    }
 
     await invoke("set_app_settings", { req: { settings: updates } });
+    // Restart MCP connections so config edits (changed args/env) take effect.
+    if (mcpJson !== (ui.loadedSettings["mcp/servers"] || "")) refreshMcpStatus(true);
     // Geocode location if changed and Mapbox key available
     const loc = locationInput.value.trim();
     const token = ui.mapboxToken || updates["maps/mapbox_api_key"];
@@ -276,40 +320,19 @@ export function renderSettingsTile(tileObj, body) {
     }
   });
 
-  // Workspace controls
+  // Default directory
   body.querySelector(`[data-s-setws="${tileObj.id}"]`).addEventListener("click", async () => {
     try {
       const result = await invoke("set_workspace_root", { req: { workspaceRoot: wsInput.value.trim() } });
       wsInput.value = field(result, "workspaceRoot", "workspace_root");
       sidebarWorkspace.textContent = projectLabel(wsInput.value);
-      statusEl.textContent = "Workspace set";
+      statusEl.textContent = "Default directory set";
       setTimeout(() => { statusEl.textContent = ""; }, 2000);
     } catch (e) { statusEl.textContent = String(e); }
   });
 
-  body.querySelector(`[data-s-savews="${tileObj.id}"]`).addEventListener("click", async () => {
-    const path = wsInput.value.trim();
-    if (!path) return;
-    await invoke("save_workspace", { req: { path } });
-    await loadS();
-    statusEl.textContent = "Workspace saved";
-    setTimeout(() => { statusEl.textContent = ""; }, 2000);
-  });
-
-  body.querySelector(`[data-s-usews="${tileObj.id}"]`).addEventListener("click", async () => {
-    const selected = savedWsSelect.value;
-    if (!selected) return;
-    const result = await invoke("set_workspace_root", { req: { workspaceRoot: selected } });
-    wsInput.value = field(result, "workspaceRoot", "workspace_root");
-    sidebarWorkspace.textContent = projectLabel(wsInput.value);
-  });
-
-  body.querySelector(`[data-s-rmws="${tileObj.id}"]`).addEventListener("click", async () => {
-    const selected = savedWsSelect.value;
-    if (!selected) return;
-    await invoke("remove_saved_workspace", { req: { path: selected } });
-    await loadS();
-  });
+  // MCP reload
+  body.querySelector(`[data-s-mcp-reload="${tileObj.id}"]`).addEventListener("click", () => refreshMcpStatus(true));
 
   // Theme
   themeSelect.addEventListener("change", () => {

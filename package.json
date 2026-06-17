@@ -8,7 +8,10 @@
     "build": "vite build",
     "tauri": "tauri",
     "sign-dev": "/usr/libexec/PlistBuddy -c 'Delete :NSMicrophoneUsageDescription' src-tauri/target/debug/bundle/macos/Muninn.app/Contents/Info.plist 2>/dev/null; /usr/libexec/PlistBuddy -c 'Add :NSMicrophoneUsageDescription string \"Muninn needs microphone access for voice input.\"' src-tauri/target/debug/bundle/macos/Muninn.app/Contents/Info.plist && /usr/libexec/PlistBuddy -c 'Delete :NSSpeechRecognitionUsageDescription' src-tauri/target/debug/bundle/macos/Muninn.app/Contents/Info.plist 2>/dev/null; /usr/libexec/PlistBuddy -c 'Add :NSSpeechRecognitionUsageDescription string \"Muninn uses speech recognition for voice commands.\"' src-tauri/target/debug/bundle/macos/Muninn.app/Contents/Info.plist && codesign --force --sign - --entitlements src-tauri/Entitlements.plist src-tauri/target/debug/bundle/macos/Muninn.app",
-    "start": "npm run dev & sleep 2 && open src-tauri/target/debug/bundle/macos/Muninn.app"
+    "start": "npm run dev & sleep 2 && open src-tauri/target/debug/bundle/macos/Muninn.app",
+    "lint": "eslint src",
+    "format": "prettier --write src",
+    "format:check": "prettier --check src"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
@@ -16,7 +19,11 @@
     "@tauri-apps/plugin-dialog": "^2.6.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
     "@tauri-apps/cli": "^2.0.0",
+    "eslint": "^9.39.4",
+    "globals": "^15.15.0",
+    "prettier": "^3.8.4",
     "vite": "^5.4.0"
   }
 }
