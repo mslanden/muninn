@@ -1,7 +1,7 @@
 import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { chatStreams, ui } from "./state.js";
+import { tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml, field, projectLabel, renderMarkdown, threadLabel } from "./utils.js";
 import { focusTile, addTile, getChatTileBySessionId, saveLayout } from "./tilesys.js";
 
@@ -168,6 +168,79 @@ async function setTileProject(tileObj, projectPath) {
   saveLayout();
 }
 
+// ===== Voice input (native recorder -> Whisper transcription) =====
+// Only one recording at a time (single native AudioRecorder). Tracks which tile
+// initiated it so the "voice-recorded" event routes the transcript to the right input.
+let voiceTileId = null;
+
+function setMicState(tileObj, micState) {
+  const btn = tileObj?.el?.querySelector(`[data-chat-mic="${tileObj.id}"]`);
+  if (!btn) return;
+  btn.classList.toggle("recording", micState === "recording");
+  btn.classList.toggle("transcribing", micState === "transcribing");
+  btn.textContent = micState === "transcribing" ? "⏳" : "🎤";
+  btn.title =
+    micState === "recording" ? "Stop recording" :
+    micState === "transcribing" ? "Transcribing…" : "Voice input";
+}
+
+async function toggleVoiceRecording(tileObj) {
+  // Stop the in-progress recording for this tile.
+  if (voiceTileId === tileObj.id) {
+    setMicState(tileObj, "transcribing");
+    try {
+      await invoke("stop_voice_recording");
+      // The "voice-recorded" event delivers the WAV; voiceTileId stays set until then.
+    } catch (e) {
+      console.error("stop_voice_recording error:", e);
+      voiceTileId = null;
+      setMicState(tileObj, "idle");
+    }
+    return;
+  }
+  // Another tile is already recording — ignore.
+  if (voiceTileId !== null) return;
+  try {
+    await invoke("start_voice_recording");
+    voiceTileId = tileObj.id;
+    setMicState(tileObj, "recording");
+  } catch (e) {
+    console.error("start_voice_recording error:", e);
+  }
+}
+
+// Called from the global "voice-recorded" listener with the base64 WAV.
+export async function onVoiceRecorded(wavBase64) {
+  const tileId = voiceTileId;
+  voiceTileId = null;
+  if (tileId == null) return;
+  const tileObj = tiles.find((t) => t.id === tileId);
+  try {
+    const res = await invoke("transcribe_wav", { wavBase64 });
+    const text = (res && (res.text ?? res.Text)) || "";
+    if (tileObj) {
+      const input = tileObj.el.querySelector(`[data-chat-input="${tileObj.id}"]`);
+      if (input && text) {
+        input.value = input.value.trim() ? `${input.value.trimEnd()} ${text}` : text;
+        autoResize(input);
+        input.focus();
+      }
+    }
+  } catch (e) {
+    console.error("transcribe_wav error:", e);
+  } finally {
+    if (tileObj) setMicState(tileObj, "idle");
+  }
+}
+
+// Called from the global "voice-error" listener.
+export function onVoiceError(msg) {
+  console.error("voice-error:", msg);
+  const tileObj = tiles.find((t) => t.id === voiceTileId);
+  voiceTileId = null;
+  if (tileObj) setMicState(tileObj, "idle");
+}
+
 export async function refreshThreadSelect(tileObj) {
   const select = tileObj.el.querySelector(`[data-thread-select="${tileObj.id}"]`);
   if (!select) return;
@@ -253,6 +326,7 @@ export function renderChatTile(tileObj, body) {
       <div class="composer-bar">
         <div class="composer-left">
           <button class="hint-chip" data-chat-folder="${tileObj.id}" title="Set working folder for this chat">📁</button>
+          <button class="hint-chip" data-chat-mic="${tileObj.id}" title="Voice input">🎤</button>
           <button class="hint-chip" data-hint="slash">/</button>
         </div>
         <button class="send-btn" data-chat-send="${tileObj.id}">SEND</button>
@@ -276,6 +350,9 @@ export function renderChatTile(tileObj, body) {
     if (!selected) return;
     await setTileProject(tileObj, selected);
   });
+
+  const micBtn = composer.querySelector(`[data-chat-mic="${tileObj.id}"]`);
+  micBtn.addEventListener("click", () => toggleVoiceRecording(tileObj));
 
   const doSend = async () => {
     const text = input.value.trim();

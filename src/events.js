@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { tiles, chatStreams, tileMaps, ui } from "./state.js";
 import { escapeHtml, renderMarkdown } from "./utils.js";
 import { getTilesByType, getChatTileBySessionId } from "./tilesys.js";
-import { playTts, addToolCard, renderTodoPanel, showUserQuestion, showThinking, hideThinking, updateContextBar } from "./chat.js";
+import { playTts, addToolCard, renderTodoPanel, showUserQuestion, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError } from "./chat.js";
 import { renderTasksTile } from "./tasks.js";
 import { renderMemoryTile } from "./memory.js";
 import { renderContentTile } from "./content.js";
@@ -100,6 +100,14 @@ export async function setupEventListeners() {
       stream.text = "";
     }
     hideThinking(tile.id);
+  });
+
+  // Voice input: native recorder emits the WAV here; route it to the recording tile's input.
+  await listen("voice-recorded", (event) => {
+    onVoiceRecorded(event.payload);
+  });
+  await listen("voice-error", (event) => {
+    onVoiceError(event.payload);
   });
 
   await listen("chat-usage", (event) => {
