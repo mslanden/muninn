@@ -17,6 +17,7 @@ mod voice;
 mod ai_feeds;
 mod mcp;
 mod studio;
+mod safety;
 
 pub use sessions::*;
 pub use toolconfig::*;
@@ -34,3 +35,4 @@ pub use voice::*;
 pub use ai_feeds::*;
 pub use mcp::*;
 pub use studio::*;
+pub use safety::*;

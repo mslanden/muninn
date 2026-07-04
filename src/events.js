@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { tiles, chatStreams, tileMaps, ui } from "./state.js";
 import { escapeHtml, renderMarkdown } from "./utils.js";
 import { getTilesByType, getChatTileBySessionId } from "./tilesys.js";
-import { playTts, addToolCard, renderTodoPanel, showUserQuestion, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError } from "./chat.js";
+import { playTts, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn } from "./chat.js";
 import { renderTasksTile } from "./tasks.js";
 import { renderMemoryTile } from "./memory.js";
 import { renderContentTile } from "./content.js";
@@ -159,6 +159,29 @@ export async function setupEventListeners() {
     const tile = getChatTileBySessionId(sessionId);
     if (!tile) return;
     showThinking(tile.id, `${agentName} (${iteration}/${maxIterations})`);
+  });
+
+  // Goal auto-continue loop: update the banner's status/counter on every bound tile.
+  await listen("goal-iteration", (event) => {
+    const { session_id, iteration, reason, done } = event.payload;
+    const status = done
+      ? String(reason || "")
+      : `iteration ${iteration}: ${String(reason || "")}`;
+    tiles
+      .filter(t => t.type === "chat" && chatStreams[t.id]?.sessionId === session_id)
+      .forEach(t => setGoalBannerStatus(t, status));
+  });
+
+  // Goal met: hide the banner and append a system-style line to each bound tile's log.
+  await listen("goal-met", (event) => {
+    const { session_id, reason } = event.payload;
+    tiles
+      .filter(t => t.type === "chat" && chatStreams[t.id]?.sessionId === session_id)
+      .forEach(t => {
+        hideGoalBanner(t);
+        const chatLog = t.el.querySelector(`[data-chat-stream="${t.id}"]`);
+        if (chatLog) addTurn(chatLog, "muninn", `🎯 Goal met: ${String(reason || "")}`);
+      });
   });
 
   await listen("map-places", (event) => {
@@ -320,6 +343,20 @@ export async function setupEventListeners() {
     const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
     const existing = chatLog?.querySelector(".user-question");
     if (existing) existing.remove();
+  });
+
+  await listen("command-deferred", (event) => {
+    const payload = event.payload || {};
+    const sid = payload.session_id;
+    const tile = getChatTileBySessionId(sid);
+    if (!tile) return;
+    const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
+    if (!chatLog) return;
+    renderDeferredCard(chatLog, {
+      id: payload.id,
+      command: payload.command || "",
+      verifier_note: payload.verifier_note || "",
+    });
   });
 
   await listen("content-changed", () => {

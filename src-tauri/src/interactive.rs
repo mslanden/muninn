@@ -35,6 +35,29 @@ pub(crate) async fn ask_user(
     question: &str,
     choices: Vec<String>,
 ) -> Result<String, String> {
+    match ask_user_with_timeout(app, state, session_id, question, choices, QUESTION_TIMEOUT_SECS).await {
+        // Preserve the original human-readable timeout message for existing callers, which
+        // don't know about the sentinel.
+        Err(e) if e == QUESTION_TIMEOUT_SENTINEL => Err(format!(
+            "User did not respond within {} minutes. Proceed with your best judgment \
+             based on what you already know, or defer the task.",
+            QUESTION_TIMEOUT_SECS / 60
+        )),
+        other => other,
+    }
+}
+
+/// Same as [`ask_user`] but with a caller-supplied timeout (seconds). Used by the
+/// auto-verify escalation path, which uses a shorter, user-configurable window before
+/// deferring the command. Existing `ask_user` callers keep the 10-minute default.
+pub(crate) async fn ask_user_with_timeout(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    question: &str,
+    choices: Vec<String>,
+    timeout_secs: u64,
+) -> Result<String, String> {
     if question.trim().is_empty() {
         return Err("ask_user called with an empty question".to_string());
     }
@@ -75,23 +98,27 @@ pub(crate) async fn ask_user(
 
     // Race: answer vs. timeout. `stop_chat` cancels by dropping the sender,
     // which makes `rx` resolve with `Err` — handled as "cancelled".
-    match tokio::time::timeout(Duration::from_secs(QUESTION_TIMEOUT_SECS), rx).await {
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(answer)) => Ok(answer),
         Ok(Err(_)) => Err("question cancelled before the user answered".to_string()),
         Err(_) => {
-            // Timeout — drop the orphaned sender entry if it's still there.
+            // Timeout — drop the orphaned sender entry if it's still there so the UI
+            // card can be dismissed.
             if let Ok(mut pending) = state.pending_questions.lock() {
                 pending.remove(session_id);
             }
             let _ = app.emit("user-question-timeout", json!({"session_id": session_id}));
-            Err(format!(
-                "User did not respond within {} minutes. Proceed with your best judgment \
-                 based on what you already know, or defer the task.",
-                QUESTION_TIMEOUT_SECS / 60
-            ))
+            // A recognizable sentinel so timeout-parameterized callers (auto-verify
+            // escalation) can distinguish "user was away" from other failures.
+            Err(QUESTION_TIMEOUT_SENTINEL.to_string())
         }
     }
 }
+
+/// Marker string returned by `ask_user_with_timeout` when the wait timed out (as opposed to
+/// being cancelled or rejected). Callers that need to react to an unavailable user match on
+/// this exactly.
+pub(crate) const QUESTION_TIMEOUT_SENTINEL: &str = "__muninn_question_timeout__";
 
 /// Called by the tauri command `answer_user_question`. Delivers the answer to
 /// the waiting `ask_user` future and returns whether there was a pending

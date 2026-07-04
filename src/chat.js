@@ -324,6 +324,7 @@ export function renderChatTile(tileObj, body) {
           if (chatLog) chatLog.innerHTML = "";
           stream.bubble = null;
           stream.text = "";
+          hideGoalBanner(tileObj);
           updateContextBar(tileObj.id, 0);
           await refreshThreadSelect(tileObj);
         } else {
@@ -340,6 +341,12 @@ export function renderChatTile(tileObj, body) {
   const composer = document.createElement("div");
   composer.className = "composer";
   composer.innerHTML = `
+    <div class="goal-banner" data-goal-banner="${tileObj.id}" hidden>
+      <span class="goal-banner-icon">${icon("target")}</span>
+      <span class="goal-banner-text" data-goal-text="${tileObj.id}"></span>
+      <span class="goal-banner-status" data-goal-status="${tileObj.id}"></span>
+      <button class="goal-banner-x" data-goal-clear="${tileObj.id}" title="Clear goal" aria-label="Clear goal">${icon("x")}</button>
+    </div>
     <div class="context-bar" data-context-bar="${tileObj.id}">
       <div class="context-fill" data-context-fill="${tileObj.id}"></div>
       <span class="context-label" data-context-label="${tileObj.id}"></span>
@@ -381,6 +388,22 @@ export function renderChatTile(tileObj, body) {
 
   const micBtn = composer.querySelector(`[data-chat-mic="${tileObj.id}"]`);
   micBtn.addEventListener("click", () => toggleVoiceRecording(tileObj));
+
+  // Goal banner clear button.
+  const goalClearBtn = composer.querySelector(`[data-goal-clear="${tileObj.id}"]`);
+  if (goalClearBtn) {
+    goalClearBtn.addEventListener("click", async () => {
+      const stream = chatStreams[tileObj.id];
+      hideGoalBanner(tileObj);
+      if (stream && stream.sessionId) {
+        try {
+          await invoke("set_session_goal", { sessionId: stream.sessionId, goal: "" });
+        } catch (e) {
+          console.error("Failed to clear goal:", e);
+        }
+      }
+    });
+  }
 
   // ---- Image attachments (paste / drag-drop / file picker) ----
   const attachBtn = composer.querySelector(`[data-chat-attach="${tileObj.id}"]`);
@@ -578,6 +601,59 @@ export function renderChatTile(tileObj, body) {
         addTurn(chatLog, "muninn", `Error: ${String(e)}`);
       }
       return;
+    }
+
+    // Handle /goal command (set/show/clear the session's auto-continue goal).
+    if (text.toLowerCase() === "/goal" || text.toLowerCase().startsWith("/goal ")) {
+      const rest = text.slice("/goal".length).trim();
+      if (!stream.sessionId) {
+        addTurn(chatLog, "muninn", "Start a chat before setting a goal.");
+        input.value = "";
+        autoResize(input);
+        return;
+      }
+      if (rest === "") {
+        // Show the current goal.
+        try {
+          const goal = await invoke("get_session_goal", { sessionId: stream.sessionId });
+          if (goal && String(goal).trim()) {
+            addTurn(chatLog, "muninn", `🎯 Active goal: ${String(goal)}`);
+            showGoalBanner(tileObj, String(goal));
+          } else {
+            addTurn(chatLog, "muninn", "No active goal.");
+          }
+        } catch (e) {
+          addTurn(chatLog, "muninn", `Error: ${String(e)}`);
+        }
+        input.value = "";
+        autoResize(input);
+        return;
+      }
+      if (rest.toLowerCase() === "clear") {
+        try {
+          await invoke("set_session_goal", { sessionId: stream.sessionId, goal: "" });
+          hideGoalBanner(tileObj);
+          addTurn(chatLog, "muninn", "Goal cleared.");
+        } catch (e) {
+          addTurn(chatLog, "muninn", `Error: ${String(e)}`);
+        }
+        input.value = "";
+        autoResize(input);
+        return;
+      }
+      // /goal <text> — set the goal, show the banner, then send a kickoff message.
+      try {
+        await invoke("set_session_goal", { sessionId: stream.sessionId, goal: rest });
+        showGoalBanner(tileObj, rest);
+      } catch (e) {
+        addTurn(chatLog, "muninn", `Error: ${String(e)}`);
+        input.value = "";
+        autoResize(input);
+        return;
+      }
+      // Fall through into the normal send path with the kickoff message.
+      input.value = `Work toward this goal until it is fully met: ${rest}`;
+      return void doSend();
     }
 
     // Parse slash commands
@@ -900,6 +976,75 @@ export function showUserQuestion(tileId, sessionId, question, choices) {
   setTimeout(() => input.focus(), 0);
 }
 
+// Render a deferred-command card (auto-verify flow: the user was away when a verified
+// command needed approval). Styled like the ask_user card. `rec` is a deferred_commands
+// record (id, command, verifier_note, ...). `chatLog` is the tile's chat stream element.
+export function renderDeferredCard(chatLog, rec) {
+  if (!chatLog || !rec) return;
+  const id = rec.id;
+  // Don't double-render the same deferred command.
+  if (chatLog.querySelector(`.deferred-command[data-deferred-id="${id}"]`)) return;
+
+  const card = document.createElement("div");
+  card.className = "user-question deferred-command";
+  card.dataset.deferredId = String(id);
+  const note = rec.verifier_note || rec.verifierNote || "";
+  const command = rec.command || "";
+  card.innerHTML = `
+    <div class="question-header">Command awaiting approval</div>
+    <pre class="deferred-command-code">${escapeHtml(command)}</pre>
+    ${note ? `<div class="question-body">Safety verifier: ${escapeHtml(note)}</div>` : ""}
+    <div class="question-choices">
+      <button class="question-choice deferred-approve">Approve &amp; run</button>
+      <button class="question-choice deferred-dismiss">Dismiss</button>
+    </div>
+    <div class="deferred-command-output" hidden></div>
+  `;
+  chatLog.appendChild(card);
+  if (chatLog.parentElement) chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
+
+  const approveBtn = card.querySelector(".deferred-approve");
+  const dismissBtn = card.querySelector(".deferred-dismiss");
+  const outputEl = card.querySelector(".deferred-command-output");
+  const disableButtons = () => {
+    approveBtn.disabled = true;
+    dismissBtn.disabled = true;
+  };
+
+  approveBtn.addEventListener("click", async () => {
+    disableButtons();
+    approveBtn.textContent = "Running…";
+    try {
+      const output = await invoke("approve_deferred_command", { id });
+      card.classList.add("user-question-answered");
+      approveBtn.textContent = "Approved";
+      const capped = String(output || "").slice(0, 4000);
+      outputEl.hidden = false;
+      outputEl.textContent = capped + (String(output || "").length > 4000 ? "\n… (truncated)" : "");
+    } catch (e) {
+      console.error("approve_deferred_command failed:", e);
+      outputEl.hidden = false;
+      outputEl.textContent = "Failed: " + String(e);
+      // Re-enable so the user can retry or dismiss.
+      approveBtn.disabled = false;
+      dismissBtn.disabled = false;
+      approveBtn.textContent = "Approve & run";
+    }
+  });
+
+  dismissBtn.addEventListener("click", async () => {
+    disableButtons();
+    try {
+      await invoke("dismiss_deferred_command", { id });
+    } catch (e) {
+      console.error("dismiss_deferred_command failed:", e);
+    }
+    // Collapse the card either way.
+    card.classList.add("user-question-answered");
+    card.innerHTML = `<div class="question-header">Deferred command dismissed</div>`;
+  });
+}
+
 export function showThinking(tileId, label) {
   const stream = chatStreams[tileId];
   if (!stream) return;
@@ -973,8 +1118,66 @@ export async function loadMessagesForTile(tileObj) {
     }
     // Estimate context usage from loaded messages
     estimateContextFromMessages(tileObj.id, chatLog);
+
+    // Render any pending deferred commands for this session at the bottom.
+    try {
+      const deferred = await invoke("list_deferred_commands", { sessionId: stream.sessionId });
+      for (const rec of deferred || []) renderDeferredCard(chatLog, rec);
+    } catch (e) {
+      console.error("Failed to load deferred commands:", e);
+    }
+
+    // Restore the goal banner for this session (hidden when there's no active goal).
+    await restoreGoalBanner(tileObj);
   } catch (e) {
     console.error("Failed to load messages:", e);
+  }
+}
+
+// ---- Goal banner (the "/goal" auto-continue loop) --------------------------------------
+
+/** Show/refresh the goal banner on a tile with the given goal text. */
+export function showGoalBanner(tileObj, goalText) {
+  if (!tileObj || !tileObj.el) return;
+  const banner = tileObj.el.querySelector(`[data-goal-banner="${tileObj.id}"]`);
+  const textEl = tileObj.el.querySelector(`[data-goal-text="${tileObj.id}"]`);
+  const statusEl = tileObj.el.querySelector(`[data-goal-status="${tileObj.id}"]`);
+  if (!banner || !textEl) return;
+  textEl.innerHTML = escapeHtml(goalText);
+  if (statusEl) statusEl.textContent = "";
+  banner.hidden = false;
+}
+
+/** Hide the goal banner on a tile. */
+export function hideGoalBanner(tileObj) {
+  if (!tileObj || !tileObj.el) return;
+  const banner = tileObj.el.querySelector(`[data-goal-banner="${tileObj.id}"]`);
+  if (banner) banner.hidden = true;
+}
+
+/** Update just the iteration/status text of a tile's goal banner (escaped). */
+export function setGoalBannerStatus(tileObj, statusText) {
+  if (!tileObj || !tileObj.el) return;
+  const statusEl = tileObj.el.querySelector(`[data-goal-status="${tileObj.id}"]`);
+  if (statusEl) statusEl.innerHTML = escapeHtml(statusText);
+}
+
+/** Restore the goal banner for a tile from persisted state. */
+async function restoreGoalBanner(tileObj) {
+  const stream = chatStreams[tileObj.id];
+  if (!stream || !stream.sessionId) {
+    hideGoalBanner(tileObj);
+    return;
+  }
+  try {
+    const goal = await invoke("get_session_goal", { sessionId: stream.sessionId });
+    if (goal && String(goal).trim()) {
+      showGoalBanner(tileObj, String(goal));
+    } else {
+      hideGoalBanner(tileObj);
+    }
+  } catch (e) {
+    console.error("Failed to load session goal:", e);
   }
 }
 

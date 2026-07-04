@@ -883,6 +883,35 @@ body::before {
   border-style: dashed;
 }
 
+.deferred-command .deferred-command-code {
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-x: auto;
+}
+.deferred-command .question-choice[disabled] {
+  opacity: 0.5;
+  cursor: default;
+}
+.deferred-command .deferred-command-output {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
 @keyframes thinking-blink {
   0%, 80%, 100% { opacity: 0; }
   40% { opacity: 1; }
@@ -894,6 +923,57 @@ body::before {
   flex-shrink: 0;
   border-top: 1px solid var(--border);
 }
+
+/* Goal auto-continue banner (the "/goal" loop). Sits above the composer box. */
+.goal-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--overlay-light);
+  font-size: 12px;
+  color: var(--muted);
+}
+.goal-banner[hidden] { display: none; }
+.goal-banner-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.goal-banner-text {
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.goal-banner-status {
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.goal-banner-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 2px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 4px;
+}
+.goal-banner-x:hover { color: var(--accent); background: var(--overlay-medium); }
 
 .context-bar {
   display: none;

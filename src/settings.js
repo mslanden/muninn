@@ -102,6 +102,16 @@ export function renderSettingsTile(tileObj, body) {
         <span class="muted" style="font-size:10px;">Shortcut changes take effect after restarting Muninn.</span>
       </div>
       <div class="settings-group">
+        <h3>Safety</h3>
+        <label class="checkbox-inline">
+          <input type="checkbox" data-s-autoverify="${tileObj.id}" /> Auto-verify dangerous commands (LLM reviews before asking you)
+        </label>
+        <div class="form-row" style="margin-top:6px;">
+          <input type="number" min="15" max="3600" step="1" placeholder="120" data-s-approvaltimeout="${tileObj.id}" style="flex:1;" />
+        </div>
+        <span class="muted" style="font-size:10px;">Approval timeout (seconds) before a verified command is deferred for later. 15–3600.</span>
+      </div>
+      <div class="settings-group">
         <h3>MCP Servers</h3>
         <textarea rows="4" spellcheck="false" placeholder='[{"name": "github", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "..."}}]' data-s-mcp="${tileObj.id}"></textarea>
         <div class="form-row" style="margin-top:6px;">
@@ -137,6 +147,8 @@ export function renderSettingsTile(tileObj, body) {
   const autostartInput = body.querySelector(`[data-s-autostart="${tileObj.id}"]`);
   const notifyInput = body.querySelector(`[data-s-notify="${tileObj.id}"]`);
   const qaShortcutInput = body.querySelector(`[data-s-qashortcut="${tileObj.id}"]`);
+  const autoVerifyInput = body.querySelector(`[data-s-autoverify="${tileObj.id}"]`);
+  const approvalTimeoutInput = body.querySelector(`[data-s-approvaltimeout="${tileObj.id}"]`);
   const mcpInput = body.querySelector(`[data-s-mcp="${tileObj.id}"]`);
   const mcpStatusEl = body.querySelector(`[data-s-mcp-status="${tileObj.id}"]`);
   const themeSelect = body.querySelector(`[data-s-theme="${tileObj.id}"]`);
@@ -244,6 +256,8 @@ export function renderSettingsTile(tileObj, body) {
 
     notifyInput.checked = s["notifications/enabled"] !== "false";
     qaShortcutInput.value = s["quickask/shortcut"] || "cmd+shift+space";
+    autoVerifyInput.checked = s["safety/auto_verify"] === "1";
+    approvalTimeoutInput.value = s["safety/approval_timeout_secs"] || "";
     mcpInput.value = s["mcp/servers"] || "";
     refreshMcpStatus();
 
@@ -290,6 +304,19 @@ export function renderSettingsTile(tileObj, body) {
     updates["tts/voice_id"] = voiceidInput.value.trim();
     updates["notifications/enabled"] = notifyInput.checked ? "true" : "false";
     updates["quickask/shortcut"] = qaShortcutInput.value.trim();
+    updates["safety/auto_verify"] = autoVerifyInput.checked ? "1" : "0";
+    // Approval timeout: blank falls back to the Rust default (120); otherwise clamp to [15, 3600].
+    const approvalRaw = approvalTimeoutInput.value.trim();
+    if (approvalRaw === "") {
+      updates["safety/approval_timeout_secs"] = "";
+    } else if (/^\d+$/.test(approvalRaw)) {
+      const clamped = Math.min(3600, Math.max(15, parseInt(approvalRaw, 10)));
+      updates["safety/approval_timeout_secs"] = String(clamped);
+    } else {
+      statusEl.textContent = "Approval timeout must be a whole number of seconds — not saved";
+      setTimeout(() => { statusEl.textContent = ""; }, 3000);
+      return;
+    }
 
     const mcpJson = mcpInput.value.trim();
     if (mcpJson) {

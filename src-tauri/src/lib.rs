@@ -264,6 +264,8 @@ pub fn run() {
             commands::delete_session,
             commands::set_session_pinned,
             commands::rename_session,
+            commands::set_session_goal,
+            commands::get_session_goal,
             commands::get_messages,
             commands::export_session_markdown,
             commands::get_tool_logs,
@@ -352,7 +354,10 @@ pub fn run() {
             commands::cancel_user_question,
             commands::has_pending_question,
             commands::get_mcp_status,
-            commands::reload_mcp_servers
+            commands::reload_mcp_servers,
+            commands::list_deferred_commands,
+            commands::approve_deferred_command,
+            commands::dismiss_deferred_command
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -1,6 +1,6 @@
 //! Session lifecycle: create/list/delete sessions, message history, tool logs, search.
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use tauri::State;
 use uuid::Uuid;
 
@@ -361,5 +361,39 @@ pub fn rename_session(state: State<AppState>, session_id: String, title: String)
             )
             .map_err(|e| e.to_string())?;
         Ok(updated > 0)
+    })
+}
+
+/// Set a session's auto-continue goal. An empty/whitespace string clears it back to NULL,
+/// which disables the "/goal" loop. Returns whether a row was updated.
+#[tauri::command]
+pub fn set_session_goal(state: State<AppState>, session_id: String, goal: String) -> Result<bool, String> {
+    let trimmed = goal.trim();
+    let new_goal: Option<&str> = if trimmed.is_empty() { None } else { Some(trimmed) };
+    with_db(&state, |db| {
+        let updated = db
+            .execute(
+                "UPDATE sessions SET goal = ?1 WHERE id = ?2",
+                params![new_goal, session_id.as_str()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(updated > 0)
+    })
+}
+
+/// Fetch a session's active goal, or None if unset/cleared.
+#[tauri::command]
+pub fn get_session_goal(state: State<AppState>, session_id: String) -> Result<Option<String>, String> {
+    with_db(&state, |db| {
+        let goal: Option<String> = db
+            .query_row(
+                "SELECT goal FROM sessions WHERE id = ?1",
+                params![session_id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .flatten();
+        Ok(goal.filter(|g| !g.trim().is_empty()))
     })
 }

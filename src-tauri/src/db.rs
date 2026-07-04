@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 6;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -117,9 +117,46 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 4)?;
     }
 
+    if version < 5 {
+        // Deferred-command queue for the auto-verify safety flow: when the verifier
+        // escalates a dangerous command and the user is unavailable to approve it, the
+        // command is parked here for later approval/dismissal.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS deferred_commands (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id TEXT NOT NULL,
+              command TEXT NOT NULL,
+              cwd TEXT,
+              workspace_root TEXT,
+              reasons TEXT,
+              verifier_note TEXT,
+              status TEXT NOT NULL DEFAULT 'pending',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              resolved_at TEXT
+            );
+            "#,
+        )
+        .map_err(|e| e.to_string())?;
+        set_schema_version(conn, 5)?;
+    }
+
+    if version < 6 {
+        // Per-session goal for the "/goal" auto-continue loop: when set, the chat turn
+        // loop evaluates whether the goal is met after each assistant reply and, if not,
+        // re-prompts the agent to keep working. NULL/empty means no active goal.
+        conn.execute_batch(
+            r#"
+            ALTER TABLE sessions ADD COLUMN goal TEXT;
+            "#,
+        )
+        .map_err(|e| e.to_string())?;
+        set_schema_version(conn, 6)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 4, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 6, "add a migration block for the new version");
 
     Ok(())
 }
@@ -319,6 +356,19 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           is_read INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           FOREIGN KEY(feed_id) REFERENCES ai_feeds(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS deferred_commands (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL,
+          command TEXT NOT NULL,
+          cwd TEXT,
+          workspace_root TEXT,
+          reasons TEXT,
+          verifier_note TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          resolved_at TEXT
         );
         "#,
     )
@@ -1030,5 +1080,85 @@ mod tests {
             .unwrap();
         assert_eq!(pinned, 0);
         assert_eq!(title, None);
+    }
+
+    #[test]
+    fn v5_adds_deferred_commands_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Insert a row relying on column defaults (status pending, created_at now).
+        conn.execute(
+            "INSERT INTO deferred_commands (session_id, command, cwd, workspace_root, reasons, verifier_note) \
+             VALUES ('s1', 'rm -rf build', '/tmp/build', '/tmp', 'rm -rf', 'inside build dir')",
+            [],
+        )
+        .unwrap();
+        let (status, resolved): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, resolved_at FROM deferred_commands WHERE session_id = 's1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn v6_adds_session_goal_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A fresh session has a NULL goal, and the column accepts writes/clears.
+        conn.execute("INSERT INTO sessions (id) VALUES ('s1')", [])
+            .unwrap();
+        let goal: Option<String> = conn
+            .query_row("SELECT goal FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(goal, None);
+        conn.execute(
+            "UPDATE sessions SET goal = 'ship the feature' WHERE id = 's1'",
+            [],
+        )
+        .unwrap();
+        let goal: Option<String> = conn
+            .query_row("SELECT goal FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(goal.as_deref(), Some("ship the feature"));
+        conn.execute("UPDATE sessions SET goal = NULL WHERE id = 's1'", [])
+            .unwrap();
+        let goal: Option<String> = conn
+            .query_row("SELECT goal FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(goal, None);
+    }
+
+    #[test]
+    fn legacy_v4_database_gains_deferred_commands_on_migrate() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a DB at schema v4 (no deferred_commands table). A real v4 DB has a
+        // sessions table (later migrations ALTER it), so create a minimal one here.
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+        // deferred_commands does not exist yet.
+        assert!(conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='deferred_commands'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_none());
+        run_migrations(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        // Now it exists and is usable.
+        conn.execute(
+            "INSERT INTO deferred_commands (session_id, command) VALUES ('s1', 'rm -rf /')",
+            [],
+        )
+        .unwrap();
     }
 }

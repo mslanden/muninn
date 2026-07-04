@@ -2090,9 +2090,8 @@ pub(crate) async fn execute_agent_tool(
                     "Blocked dangerous command (no user available to approve). Reasons: {}",
                     safety.reasons.join("; ")
                 ))
-            } else {
-                // Pause the tool call and ask the user to approve via the existing
-                // ask_user plumbing (renders approve/deny buttons in the chat tile).
+            } else if get_app_setting_value(state, "safety/auto_verify")?.as_deref() != Some("1") {
+                // Auto-verify disabled → existing ask_user flow, unchanged.
                 let question = format!(
                     "Muninn wants to run a command flagged as potentially dangerous:\n\n{}\n\nFlagged because: {}\n\nAllow it to run?",
                     command,
@@ -2113,6 +2112,118 @@ pub(crate) async fn execute_agent_tool(
                         "The user declined to run this command (answered: {}). Do not retry it; choose a safer approach or ask the user what to do instead.",
                         answer
                     ))
+                }
+            } else {
+                // Auto-verify enabled: an LLM reviewer decides before we interrupt the user.
+                let workspace_root = effective_scope.root_canon.to_string_lossy().to_string();
+                let verdict = crate::llm::verify_dangerous_command(
+                    state,
+                    command,
+                    cwd,
+                    &workspace_root,
+                    &safety.reasons,
+                )
+                .await;
+                match verdict {
+                    crate::llm::CommandVerdict::Allow(note) => {
+                        log_tool(
+                            state,
+                            session_id,
+                            "safety_verify",
+                            command,
+                            &format!("ALLOW: {}", note),
+                            "ok",
+                        );
+                        let out = run_command_scoped_unchecked(&effective_scope, command, cwd)?;
+                        Ok(format!("[auto-verified: {}]\n{}", note, out))
+                    }
+                    crate::llm::CommandVerdict::Deny(note) => {
+                        log_tool(
+                            state,
+                            session_id,
+                            "safety_verify",
+                            command,
+                            &format!("DENY: {}", note),
+                            "error",
+                        );
+                        Ok(format!(
+                            "Command blocked by the safety verifier: {}\nDo not retry it verbatim; choose a safer alternative or ask the user.",
+                            note
+                        ))
+                    }
+                    crate::llm::CommandVerdict::Escalate(note) => {
+                        log_tool(
+                            state,
+                            session_id,
+                            "safety_verify",
+                            command,
+                            &format!("ESCALATE: {}", note),
+                            "ok",
+                        );
+                        // Timeout window for the escalation prompt, clamped to [15, 3600].
+                        let timeout_secs = get_app_setting_value(state, "safety/approval_timeout_secs")?
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                            .unwrap_or(120)
+                            .clamp(15, 3600);
+                        let question = format!(
+                            "Muninn wants to run a command flagged as potentially dangerous:\n\n{}\n\nFlagged because: {}\n\nSafety verifier: {}\n\nAllow it to run?",
+                            command,
+                            safety.reasons.join("; "),
+                            note
+                        );
+                        let answer = crate::interactive::ask_user_with_timeout(
+                            app,
+                            state,
+                            session_id,
+                            &question,
+                            vec!["Run it".to_string(), "Don't run it".to_string()],
+                            timeout_secs,
+                        )
+                        .await;
+                        match answer {
+                            Ok(a) if a.trim().eq_ignore_ascii_case("run it") => {
+                                run_command_scoped_unchecked(&effective_scope, command, cwd)
+                            }
+                            Ok(a) => Err(format!(
+                                "The user declined to run this command (answered: {}). Do not retry it; choose a safer approach or ask the user what to do instead.",
+                                a
+                            )),
+                            Err(e) if e == crate::interactive::QUESTION_TIMEOUT_SENTINEL => {
+                                // User was away — park the command in the deferred queue.
+                                let reasons_joined = safety.reasons.join("; ");
+                                let id = with_db(state, |db| {
+                                    db.execute(
+                                        "INSERT INTO deferred_commands (session_id, command, cwd, workspace_root, reasons, verifier_note) \
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                        rusqlite::params![
+                                            session_id,
+                                            command,
+                                            cwd,
+                                            workspace_root,
+                                            reasons_joined,
+                                            note
+                                        ],
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                                    Ok(db.last_insert_rowid())
+                                })?;
+                                let _ = app.emit(
+                                    "command-deferred",
+                                    serde_json::json!({
+                                        "session_id": session_id,
+                                        "id": id,
+                                        "command": command,
+                                        "verifier_note": note,
+                                    }),
+                                );
+                                Ok(format!(
+                                    "The user was unavailable to approve this command. It was saved to the deferred queue (id {}) for later approval. Continue with other work; do not retry this command yourself.",
+                                    id
+                                ))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
                 }
             }
         }

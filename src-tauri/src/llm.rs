@@ -136,9 +136,14 @@ use crate::tools::{
     truncate_chars, WorkspaceScope,
 };
 
+/// Reply text `run_tool_loop` returns when the user stops generation mid-turn. The goal
+/// auto-continue loop compares against this so a Stop click also halts the loop instead of
+/// being evaluated as an ordinary (unmet) reply and overridden by a re-prompt.
+pub(crate) const STOPPED_BY_USER_SENTINEL: &str = "[Generation stopped by user]";
+
 /// Check if a stop has been requested for this session (and clear the flag).
 /// Recovers from a poisoned lock so a panic elsewhere can't wedge the stop signal.
-fn check_stop_requested(state: &AppState, session_id: &str) -> bool {
+pub(crate) fn check_stop_requested(state: &AppState, session_id: &str) -> bool {
     let mut stops = state
         .stop_requests
         .lock()
@@ -569,6 +574,76 @@ pub(crate) async fn evaluate_chain_condition(
     parse_condition_verdict(&crate::feeds::strip_think_tags(text))
 }
 
+/// Evaluate whether a session's goal has been FULLY achieved, judging by the assistant's
+/// latest report. Returns `(met, reason)` where `reason` is the judge's one-sentence rationale.
+///
+/// Unlike `evaluate_chain_condition`, this does NOT fail closed: any API/parse error returns
+/// `Err(...)` so the goal loop can surface the failure and pause (rather than silently deciding
+/// the goal is or isn't met). Conservative on the affirmative side: partial progress → NO.
+pub(crate) async fn evaluate_goal_met(
+    state: &AppState,
+    goal: &str,
+    last_reply: &str,
+) -> Result<(bool, String), String> {
+    let cfg = resolve_llm_config(state).map_err(|e| format!("no LLM configured: {e}"))?;
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
+
+    let data = crate::tools::truncate_chars(last_reply, 6000);
+    let prompt = format!(
+        "An autonomous assistant is working toward a goal. Below is the goal and the assistant's \
+        latest report. Decide whether the goal has been FULLY achieved.\n\n\
+        GOAL: {goal}\n\n\
+        ASSISTANT'S LATEST REPORT:\n{data}\n\n\
+        Answer with exactly YES or NO on the first line, then one short sentence explaining why."
+    );
+    let system = "You are a strict judge deciding whether an objective has been FULLY achieved \
+        based on the assistant's latest report. The first line must be exactly YES (the goal is \
+        completely and verifiably met) or NO (it is not). Be conservative: if the work is only \
+        partially done, still in progress, uncertain, or the assistant is blocked, answer NO. \
+        Then add one short sentence explaining why.";
+
+    let request_body = if is_anthropic {
+        json!({
+            "model": model, "max_tokens": 150, "stream": false,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    } else {
+        json!({
+            "model": model, "max_tokens": 150, "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ]
+        })
+    };
+
+    let resp = if is_anthropic {
+        state.http.post(&endpoint)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body).send().await
+    } else {
+        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
+    };
+    let resp = match resp {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => return Err(format!("eval call failed: HTTP {}", r.status())),
+        Err(e) => return Err(format!("eval call error: {e}")),
+    };
+    let body: Value = resp.json().await.map_err(|e| format!("eval parse error: {e}"))?;
+    let text = if is_anthropic {
+        body.get("content").and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
+    } else {
+        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
+            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
+            .and_then(Value::as_str).unwrap_or("")
+    };
+    Ok(parse_condition_verdict(&crate::feeds::strip_think_tags(text)))
+}
+
 /// Interpret a gate model's reply: met only on an explicit affirmative first token, so blank
 /// or garbled output fails closed (no downstream action). Returns `(met, reason)`.
 fn parse_condition_verdict(text: &str) -> (bool, String) {
@@ -580,6 +655,147 @@ fn parse_condition_verdict(text: &str) -> (bool, String) {
         .rfind(|s| !s.is_empty())
         .unwrap_or(if met { "condition met" } else { "condition not met" });
     (met, reason.to_string())
+}
+
+/// Verdict from the auto-verify safety reviewer for a dangerous command. The `String`
+/// carries the reviewer's one-sentence rationale (or the error, when failing closed).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CommandVerdict {
+    /// Safe to run in context despite matching a broad danger pattern.
+    Allow(String),
+    /// Clearly harmful — do not run; report the reason back to the model.
+    Deny(String),
+    /// Uncertain / a genuine user judgment call — ask the user (or defer).
+    Escalate(String),
+}
+
+/// LLM security review of a dangerous shell command before we interrupt the user.
+///
+/// One-shot, non-streaming, modeled on `evaluate_chain_condition`. **Fails closed**: any
+/// API/parse error or unrecognized verdict returns `Escalate` (with the error as the note)
+/// so an ambiguous result always routes to human judgment rather than silently allowing.
+pub(crate) async fn verify_dangerous_command(
+    state: &AppState,
+    command: &str,
+    cwd: Option<&str>,
+    workspace_root: &str,
+    reasons: &[String],
+) -> CommandVerdict {
+    let cfg = match resolve_llm_config(state) {
+        Ok(c) => c,
+        Err(e) => return CommandVerdict::Escalate(format!("no LLM configured: {e}")),
+    };
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
+
+    let cwd_str = cwd.unwrap_or("(workspace root)");
+    let reasons_str = if reasons.is_empty() {
+        "(none provided)".to_string()
+    } else {
+        reasons.join("; ")
+    };
+    let cmd = crate::tools::truncate_chars(command, 2000);
+
+    let system = "You are a strict security reviewer for an autonomous agent that runs shell \
+        commands inside a workspace directory the user has already approved. Your job is to \
+        decide whether a command flagged as potentially dangerous should run, be blocked, or be \
+        escalated to the user. Your first line MUST be exactly one of: ALLOW, DENY, or ESCALATE. \
+        Then, on the next line, give one short sentence explaining why. \
+        Guidance: ALLOW only when the command is clearly safe in this context despite matching a \
+        broad pattern (for example, `rm -rf` of a path that is clearly inside the workspace build \
+        or cache directory). DENY when the command is clearly harmful, irreversible outside the \
+        workspace, or system-damaging (for example, deleting home/system paths, disabling \
+        security, exfiltrating secrets, or piping remote scripts to a shell). ESCALATE when you \
+        are uncertain or the decision is genuinely the user's to make. When in doubt, ESCALATE.";
+
+    let prompt = format!(
+        "Review this command flagged as potentially dangerous.\n\n\
+        COMMAND:\n{cmd}\n\n\
+        WORKING DIRECTORY: {cwd_str}\n\
+        WORKSPACE ROOT: {workspace_root}\n\
+        FLAGGED BECAUSE: {reasons_str}\n\n\
+        First line exactly ALLOW, DENY, or ESCALATE. Then one short sentence explaining why."
+    );
+
+    let request_body = if is_anthropic {
+        json!({
+            "model": model, "max_tokens": 150, "stream": false,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    } else {
+        json!({
+            "model": model, "max_tokens": 150, "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ]
+        })
+    };
+
+    let resp = if is_anthropic {
+        state.http.post(&endpoint)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body).send().await
+    } else {
+        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
+    };
+    let resp = match resp {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => return CommandVerdict::Escalate(format!("verifier call failed: HTTP {}", r.status())),
+        Err(e) => return CommandVerdict::Escalate(format!("verifier call error: {e}")),
+    };
+    let body: Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => return CommandVerdict::Escalate(format!("verifier parse error: {e}")),
+    };
+    let text = if is_anthropic {
+        body.get("content").and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
+    } else {
+        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
+            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
+            .and_then(Value::as_str).unwrap_or("")
+    };
+    parse_command_verdict(&crate::feeds::strip_think_tags(text))
+}
+
+/// Interpret the verifier model's reply. The first non-empty line must start with ALLOW,
+/// DENY, or ESCALATE; anything else fails closed to `Escalate`. The note is the reviewer's
+/// following sentence (or a default when the model gave none).
+fn parse_command_verdict(text: &str) -> CommandVerdict {
+    let trimmed = text.trim();
+    let mut lines = trimmed.lines().map(str::trim).filter(|s| !s.is_empty());
+    let first = lines.next().unwrap_or("");
+    let upper = first.to_uppercase();
+    // The note is the remaining text after the verdict line; fall back to any trailing
+    // words on the verdict line itself, then to a generic default.
+    let rest: String = lines.collect::<Vec<_>>().join(" ");
+    let note = if !rest.is_empty() {
+        rest
+    } else {
+        // Strip a leading verdict word from the first line, if the model put the reason inline.
+        let inline = first
+            .trim_start_matches(|c: char| c.is_alphabetic())
+            .trim_start_matches([':', '-', '.', ' '])
+            .trim();
+        inline.to_string()
+    };
+
+    // Match the first WORD exactly (allowing trailing punctuation), not a prefix — a reply
+    // like "ALLOWING this would be harmful" must fail closed, not parse as Allow.
+    let first_word = upper
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches([':', '.', ',', '!', '-']);
+    match first_word {
+        "ALLOW" => CommandVerdict::Allow(if note.is_empty() { "verifier allowed the command".to_string() } else { note }),
+        "DENY" => CommandVerdict::Deny(if note.is_empty() { "verifier denied the command".to_string() } else { note }),
+        "ESCALATE" => CommandVerdict::Escalate(if note.is_empty() { "verifier escalated for user judgment".to_string() } else { note }),
+        _ => CommandVerdict::Escalate(format!("unrecognized verifier verdict: {}", crate::tools::truncate_chars(trimmed, 200))),
+    }
 }
 
 /// One-shot, non-streaming LLM call that expands a short feed summary into a fuller
@@ -2730,7 +2946,7 @@ async fn run_tool_loop(
     loop {
         if check_stop_requested(state, session_id) {
             let _ = app.emit("chat-done", ChatDoneEvent { session_id: session_id.to_string() });
-            let msg = "[Generation stopped by user]".to_string();
+            let msg = STOPPED_BY_USER_SENTINEL.to_string();
             return Ok((msg.clone(), vec![json!({"type": "text", "text": msg})]));
         }
 
@@ -3755,6 +3971,61 @@ mod tests {
         // Single-line replies use that line as the reason; blank input uses the fallback.
         assert_eq!(parse_condition_verdict("NO").1, "NO");
         assert_eq!(parse_condition_verdict("").1, "condition not met");
+    }
+
+    #[test]
+    fn command_verdict_parses_each_first_line_and_note() {
+        assert_eq!(
+            parse_command_verdict("ALLOW\nThe path is inside the workspace build dir."),
+            CommandVerdict::Allow("The path is inside the workspace build dir.".to_string())
+        );
+        assert_eq!(
+            parse_command_verdict("DENY\nDeletes the user's home directory."),
+            CommandVerdict::Deny("Deletes the user's home directory.".to_string())
+        );
+        assert_eq!(
+            parse_command_verdict("ESCALATE\nThis is the user's call."),
+            CommandVerdict::Escalate("This is the user's call.".to_string())
+        );
+        // Case-insensitive first token.
+        assert!(matches!(parse_command_verdict("allow\nfine"), CommandVerdict::Allow(_)));
+    }
+
+    #[test]
+    fn command_verdict_handles_inline_note_and_blank() {
+        // Reason on the same line as the verdict word.
+        assert_eq!(
+            parse_command_verdict("DENY: removes system files"),
+            CommandVerdict::Deny("removes system files".to_string())
+        );
+        // Bare verdict with no note gets a sensible default.
+        assert_eq!(
+            parse_command_verdict("ALLOW"),
+            CommandVerdict::Allow("verifier allowed the command".to_string())
+        );
+    }
+
+    #[test]
+    fn command_verdict_fails_closed_on_garbage() {
+        // Unrecognized first line → Escalate (fail closed).
+        assert!(matches!(parse_command_verdict("maybe, it depends"), CommandVerdict::Escalate(_)));
+        assert!(matches!(parse_command_verdict(""), CommandVerdict::Escalate(_)));
+        assert!(matches!(parse_command_verdict("I think this is fine"), CommandVerdict::Escalate(_)));
+    }
+
+    #[test]
+    fn command_verdict_requires_exact_verdict_word_not_prefix() {
+        // A verdict word as a mere prefix of a longer word must fail closed, not match.
+        assert!(matches!(
+            parse_command_verdict("ALLOWING this would be harmful"),
+            CommandVerdict::Escalate(_)
+        ));
+        assert!(matches!(
+            parse_command_verdict("DENYING it outright seems wrong"),
+            CommandVerdict::Escalate(_)
+        ));
+        // Trailing punctuation on the exact word is still accepted.
+        assert!(matches!(parse_command_verdict("ALLOW."), CommandVerdict::Allow(_)));
     }
 
     #[test]

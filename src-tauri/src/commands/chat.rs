@@ -1,7 +1,7 @@
 //! The chat turn entrypoint, stop generation, session todos, ask_user plumbing.
 
 use rusqlite::params;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 
 use crate::AppState;
@@ -116,17 +116,10 @@ pub async fn chat(app: AppHandle, state: State<'_, AppState>, req: ChatRequest) 
         Some(WorkspaceScope::from_path(&session_project_path)?)
     };
 
-    let (reply, reply_blocks) = if let Some(agent_id) = req.agent_id.as_ref() {
-        run_agent(&app, &state, &req.session_id, agent_id, &history).await?
-    } else if provider == "minimax" || model.starts_with("MiniMax-") {
-        // MiniMax fast path — unchanged.
-        chat_with_minimax_anthropic(&app, &state, &req.session_id, &model, &history, scope.as_ref(), true).await?
-    } else if provider == "openai" {
-        chat_with_openai(&app, &state, &req.session_id, &model, &history, scope.as_ref(), true).await?
-    } else {
-        // Any other configured provider (anthropic/groq/deepseek/xai/…) routes here.
-        chat_dynamic(&app, &state, &req.session_id, &provider, &model, &history, scope.as_ref(), true).await?
-    };
+    let (reply, reply_blocks) = dispatch_chat_turn(
+        &app, &state, &req.session_id, req.agent_id.as_deref(), &provider, &model, &history, scope.as_ref(),
+    )
+    .await?;
 
     insert_message(&state, &req.session_id, "assistant", &reply, &reply_blocks, false)?;
     add_feed_item(
@@ -137,6 +130,153 @@ pub async fn chat(app: AppHandle, state: State<'_, AppState>, req: ChatRequest) 
         "robot",
         &req.session_id,
     );
+
+    // ---- Goal auto-continue loop -----------------------------------------------------------
+    // If this session has an active goal, evaluate whether the assistant's latest reply meets
+    // it. If not, re-prompt the agent (via a hidden user message) and run another turn, up to
+    // a configurable iteration cap, so the agent keeps working without the user in the loop.
+    let mut latest_reply = reply.clone();
+    // A stopped initial turn means the user wants everything halted — never enter the loop.
+    if latest_reply != STOPPED_BY_USER_SENTINEL {
+        let max_iterations: u32 = get_app_setting_value(&state, "goal/max_iterations")?
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(8)
+            .clamp(1, 25);
+
+        let mut iteration: u32 = 1;
+        loop {
+            // Re-read the goal each pass: it may have been met (cleared) or cleared by the user.
+            let goal: Option<String> = with_db(&state, |db| {
+                db.query_row(
+                    "SELECT goal FROM sessions WHERE id = ?1",
+                    params![req.session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(|e| e.to_string())
+            })?;
+            let goal = match goal {
+                Some(g) if !g.trim().is_empty() => g,
+                _ => break, // no active goal
+            };
+
+            // Honor a Stop click, mirroring run_tool_loop: check_stop_requested removes and
+            // returns the flag, so consuming it here halts the loop without leaving a stale
+            // entry that would block the session's next turn.
+            if check_stop_requested(&state, &req.session_id) {
+                break;
+            }
+
+            let (met, eval_reason) = match evaluate_goal_met(&state, &goal, &latest_reply).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = app.emit(
+                        "goal-iteration",
+                        serde_json::json!({
+                            "session_id": req.session_id,
+                            "iteration": iteration,
+                            "reason": format!("goal evaluation failed: {e} — pausing auto-continue"),
+                            "done": true,
+                        }),
+                    );
+                    break; // leave the goal set so the user can retry by sending a message
+                }
+            };
+
+            if met {
+                with_db(&state, |db| {
+                    db.execute(
+                        "UPDATE sessions SET goal = NULL WHERE id = ?1",
+                        params![req.session_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(())
+                })?;
+                let _ = app.emit(
+                    "goal-met",
+                    serde_json::json!({
+                        "session_id": req.session_id,
+                        "reason": eval_reason,
+                    }),
+                );
+                add_feed_item(
+                    &state,
+                    "response",
+                    "Goal met",
+                    &truncate_chars(&eval_reason, 140),
+                    "robot",
+                    &req.session_id,
+                );
+                break;
+            }
+
+            if iteration > max_iterations {
+                let _ = app.emit(
+                    "goal-iteration",
+                    serde_json::json!({
+                        "session_id": req.session_id,
+                        "iteration": iteration,
+                        "reason": "iteration cap reached — send a message to continue",
+                        "done": true,
+                    }),
+                );
+                break; // leave the goal set
+            }
+
+            // Not met and within the cap: re-prompt the agent to keep working.
+            let continue_msg = format!(
+                "[goal loop — iteration {iteration}] The goal is not yet achieved: {eval_reason}. \
+                Continue working toward: {goal}. If you are genuinely blocked, say exactly what you \
+                need from the user."
+            );
+            let continue_blocks =
+                vec![serde_json::json!({"type": "text", "text": continue_msg.clone()})];
+            insert_message(&state, &req.session_id, "user", &continue_msg, &continue_blocks, true)?;
+
+            let _ = app.emit(
+                "goal-iteration",
+                serde_json::json!({
+                    "session_id": req.session_id,
+                    "iteration": iteration,
+                    "reason": eval_reason,
+                    "done": false,
+                }),
+            );
+
+            // Reload history exactly like the initial turn (load + char-budget trim + sanitize).
+            let mut history = load_history_structured(&state, &req.session_id, 200)?;
+            let mut total_chars: usize = history.iter().map(|h| h.char_len()).sum();
+            while total_chars > max_history_chars && history.len() > 2 {
+                total_chars -= history[0].char_len();
+                history.remove(0);
+            }
+            sanitize_tool_pairs(&mut history);
+
+            let (iter_reply, iter_blocks) = dispatch_chat_turn(
+                &app, &state, &req.session_id, req.agent_id.as_deref(), &provider, &model, &history, scope.as_ref(),
+            )
+            .await?;
+
+            insert_message(&state, &req.session_id, "assistant", &iter_reply, &iter_blocks, false)?;
+            add_feed_item(
+                &state,
+                "response",
+                "Assistant Response",
+                &truncate_chars(&iter_reply, 140),
+                "robot",
+                &req.session_id,
+            );
+
+            latest_reply = iter_reply;
+
+            // The user stopped generation mid-iteration: run_tool_loop consumed the flag and
+            // returned the sentinel, so honor it here too instead of re-prompting over it.
+            if latest_reply == STOPPED_BY_USER_SENTINEL {
+                break;
+            }
+
+            iteration += 1;
+        }
+    }
 
     // Only run extraction for main chat (no project)
     if session_project_path.is_empty() {
@@ -149,7 +289,34 @@ pub async fn chat(app: AppHandle, state: State<'_, AppState>, req: ChatRequest) 
         });
     }
 
-    Ok(ChatResponse { reply })
+    // Return the last iteration's reply (equals the first reply when no goal loop ran).
+    Ok(ChatResponse { reply: latest_reply })
+}
+
+/// Run one chat turn against the appropriate provider branch. Written once so the initial
+/// turn and every goal-loop iteration dispatch identically.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_chat_turn(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    agent_id: Option<&str>,
+    provider: &str,
+    model: &str,
+    history: &[HistoryMessage],
+    scope: Option<&WorkspaceScope>,
+) -> Result<(String, Vec<serde_json::Value>), String> {
+    if let Some(agent_id) = agent_id {
+        run_agent(app, state, session_id, agent_id, history).await
+    } else if provider == "minimax" || model.starts_with("MiniMax-") {
+        // MiniMax fast path — unchanged.
+        chat_with_minimax_anthropic(app, state, session_id, model, history, scope, true).await
+    } else if provider == "openai" {
+        chat_with_openai(app, state, session_id, model, history, scope, true).await
+    } else {
+        // Any other configured provider (anthropic/groq/deepseek/xai/…) routes here.
+        chat_dynamic(app, state, session_id, provider, model, history, scope, true).await
+    }
 }
 
 #[tauri::command]
