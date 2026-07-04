@@ -12,7 +12,11 @@ use crate::tools::*;
 
 #[tauri::command]
 pub async fn chat(app: AppHandle, state: State<'_, AppState>, req: ChatRequest) -> Result<ChatResponse, String> {
-    with_db(&state, |db| {
+    chat_core(&app, &state, req).await
+}
+
+pub(crate) async fn chat_core(app: &AppHandle, state: &AppState, req: ChatRequest) -> Result<ChatResponse, String> {
+    with_db(state, |db| {
         // Ensure the session exists (it may have been cleaned up by a previous version)
         db.execute(
             "INSERT OR IGNORE INTO sessions (id) VALUES (?1)",
@@ -321,6 +325,10 @@ async fn dispatch_chat_turn(
 
 #[tauri::command]
 pub fn stop_chat(state: State<AppState>, session_id: String) -> Result<(), String> {
+    stop_chat_core(&state, &session_id)
+}
+
+pub(crate) fn stop_chat_core(state: &AppState, session_id: &str) -> Result<(), String> {
     {
         // Recover from a poisoned lock rather than propagating an error: a panic in
         // an unrelated chat turn must never permanently disable the user's ability to
@@ -329,11 +337,11 @@ pub fn stop_chat(state: State<AppState>, session_id: String) -> Result<(), Strin
             .stop_requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        stops.insert(session_id.clone());
+        stops.insert(session_id.to_string());
     }
     // Also unblock any in-flight ask_user call — the provider loop can't
     // terminate if it's parked on an awaited oneshot.
-    crate::interactive::cancel_question(&state, &session_id);
+    crate::interactive::cancel_question(state, session_id);
     Ok(())
 }
 
@@ -341,7 +349,11 @@ pub fn stop_chat(state: State<AppState>, session_id: String) -> Result<(), Strin
 
 #[tauri::command]
 pub fn get_session_todos(state: State<AppState>, session_id: String) -> Result<Vec<serde_json::Value>, String> {
-    Ok(crate::todos::get_todos(&state, &session_id))
+    get_session_todos_core(&state, &session_id)
+}
+
+pub(crate) fn get_session_todos_core(state: &AppState, session_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    Ok(crate::todos::get_todos(state, session_id))
 }
 
 #[tauri::command]

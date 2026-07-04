@@ -7,6 +7,7 @@ mod interactive;
 mod llm;
 mod mail;
 mod mcp;
+mod mobile;
 mod models;
 mod notify_user;
 mod scheduler;
@@ -219,6 +220,22 @@ pub fn run() {
                 scheduler::run_scheduler(scheduler_handle).await;
             });
 
+            // Auto-start the mobile companion server if the user left it enabled. Never crash
+            // boot on failure — log and continue.
+            {
+                let state: tauri::State<'_, AppState> = app.state();
+                let enabled = db::get_app_setting_value(&state, "mobile/server_enabled")
+                    .ok()
+                    .flatten()
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if enabled {
+                    if let Err(e) = mobile::start(app.handle().clone()) {
+                        eprintln!("[Mobile] autostart failed: {}", e);
+                    }
+                }
+            }
+
             // Backfill embeddings for entities created before embeddings were added
             let embed_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -357,7 +374,11 @@ pub fn run() {
             commands::reload_mcp_servers,
             commands::list_deferred_commands,
             commands::approve_deferred_command,
-            commands::dismiss_deferred_command
+            commands::dismiss_deferred_command,
+            commands::start_mobile_server,
+            commands::stop_mobile_server,
+            commands::get_mobile_server_status,
+            commands::regenerate_mobile_token
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

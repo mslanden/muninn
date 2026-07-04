@@ -3,8 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import { workspace, sidebarWorkspace, sidebarModel, ui } from "./state.js";
 import { applyTheme } from "./theme.js";
-import { field, projectLabel } from "./utils.js";
+import { field, projectLabel, escapeHtml } from "./utils.js";
 import { icon } from "./icons.js";
+import qrcode from "qrcode-generator";
 
 // ========== SETTINGS TILE ==========
 export function renderSettingsTile(tileObj, body) {
@@ -112,6 +113,28 @@ export function renderSettingsTile(tileObj, body) {
         <span class="muted" style="font-size:10px;">Approval timeout (seconds) before a verified command is deferred for later. 15–3600.</span>
       </div>
       <div class="settings-group">
+        <h3>Remote access (phone)</h3>
+        <p class="settings-hint">Run a local server so you can chat with Muninn from your phone on the same Wi-Fi.</p>
+        <div class="form-row" style="margin-bottom:6px; align-items:center;">
+          <button class="form-btn" data-s-mobile-toggle="${tileObj.id}">Enable</button>
+          <span class="muted" data-s-mobile-state="${tileObj.id}" style="font-size:10px;"></span>
+        </div>
+        <div class="form-row" style="margin-bottom:4px; align-items:center;">
+          <input type="number" min="1" max="65535" step="1" placeholder="8737" data-s-mobile-port="${tileObj.id}" style="flex:1;" />
+          <span class="muted" style="font-size:10px; white-space:nowrap;">applies on next start</span>
+        </div>
+        <span class="muted" data-s-mobile-error="${tileObj.id}" style="font-size:10px; color:var(--red);"></span>
+        <div class="mobile-pairing" data-s-mobile-pairing="${tileObj.id}" style="display:none; margin-top:10px;">
+          <div class="mobile-qr" data-s-mobile-qr="${tileObj.id}"></div>
+          <div class="mobile-urls" data-s-mobile-urls="${tileObj.id}"></div>
+          <div class="form-row" style="margin-top:8px;">
+            <button class="form-btn danger" data-s-mobile-regen="${tileObj.id}">Regenerate token</button>
+          </div>
+          <p class="settings-hint" style="margin-top:8px;">Works on your Wi-Fi. For access from anywhere, install Tailscale on both devices — the URL then works over it too.</p>
+        </div>
+        <p class="settings-hint" style="margin-top:8px; color:var(--red);">Anyone with this URL can chat and run commands as Muninn. Keep it private.</p>
+      </div>
+      <div class="settings-group">
         <h3>MCP Servers</h3>
         <textarea rows="4" spellcheck="false" placeholder='[{"name": "github", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "..."}}]' data-s-mcp="${tileObj.id}"></textarea>
         <div class="form-row" style="margin-top:6px;">
@@ -149,6 +172,14 @@ export function renderSettingsTile(tileObj, body) {
   const qaShortcutInput = body.querySelector(`[data-s-qashortcut="${tileObj.id}"]`);
   const autoVerifyInput = body.querySelector(`[data-s-autoverify="${tileObj.id}"]`);
   const approvalTimeoutInput = body.querySelector(`[data-s-approvaltimeout="${tileObj.id}"]`);
+  const mobileToggleBtn = body.querySelector(`[data-s-mobile-toggle="${tileObj.id}"]`);
+  const mobileStateEl = body.querySelector(`[data-s-mobile-state="${tileObj.id}"]`);
+  const mobilePortInput = body.querySelector(`[data-s-mobile-port="${tileObj.id}"]`);
+  const mobileErrorEl = body.querySelector(`[data-s-mobile-error="${tileObj.id}"]`);
+  const mobilePairingEl = body.querySelector(`[data-s-mobile-pairing="${tileObj.id}"]`);
+  const mobileQrEl = body.querySelector(`[data-s-mobile-qr="${tileObj.id}"]`);
+  const mobileUrlsEl = body.querySelector(`[data-s-mobile-urls="${tileObj.id}"]`);
+  const mobileRegenBtn = body.querySelector(`[data-s-mobile-regen="${tileObj.id}"]`);
   const mcpInput = body.querySelector(`[data-s-mcp="${tileObj.id}"]`);
   const mcpStatusEl = body.querySelector(`[data-s-mcp-status="${tileObj.id}"]`);
   const themeSelect = body.querySelector(`[data-s-theme="${tileObj.id}"]`);
@@ -176,6 +207,112 @@ export function renderSettingsTile(tileObj, body) {
       mcpStatusEl.textContent = String(e);
     }
   }
+
+  // ---------- Remote access (phone) ----------
+  // Build the pairing URL ourselves from status fields rather than trusting arbitrary strings.
+  function mobileUrl(ip, port, token) {
+    return `http://${ip}:${port}/?token=${encodeURIComponent(token)}`;
+  }
+
+  function renderMobileStatus(status) {
+    const running = !!(status && status.running);
+    mobileToggleBtn.textContent = running ? "Disable" : "Enable";
+    mobileToggleBtn.classList.toggle("danger", running);
+    const port = status && status.port ? status.port : 8737;
+    if (running) {
+      mobileStateEl.textContent = `Running on port ${port}`;
+    } else {
+      mobileStateEl.textContent = "Off";
+    }
+    // Don't clobber a port the user is editing; only set placeholder-backing value when empty.
+    if (!mobilePortInput.value && status && status.port) mobilePortInput.value = status.port;
+
+    if (!running) {
+      mobilePairingEl.style.display = "none";
+      mobileQrEl.innerHTML = "";
+      mobileUrlsEl.innerHTML = "";
+      return;
+    }
+
+    const token = (status && status.token) || "";
+    const ips = Array.isArray(status && status.lan_ips) ? status.lan_ips : [];
+    // Build our own URL list from status fields.
+    const urls = ips.map(ip => mobileUrl(ip, port, token));
+
+    mobilePairingEl.style.display = "block";
+
+    // QR of the first LAN URL. The SVG is generated from our own data.
+    mobileQrEl.innerHTML = "";
+    if (urls.length) {
+      const qr = qrcode(0, "M");
+      qr.addData(urls[0]);
+      qr.make();
+      mobileQrEl.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2 });
+    }
+
+    // URL rows: selectable text + copy button each.
+    mobileUrlsEl.innerHTML = urls.map((url, i) => `
+      <div class="mobile-url-row">
+        <span class="mobile-url-text" data-s-mobile-url="${tileObj.id}-${i}">${escapeHtml(url)}</span>
+        <button class="form-btn" data-s-mobile-copy="${tileObj.id}-${i}">Copy</button>
+      </div>
+    `).join("");
+    urls.forEach((url, i) => {
+      const btn = mobileUrlsEl.querySelector(`[data-s-mobile-copy="${tileObj.id}-${i}"]`);
+      if (btn) btn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(url);
+          btn.textContent = "Copied";
+          setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+        } catch {}
+      });
+    });
+  }
+
+  async function refreshMobileStatus() {
+    try {
+      renderMobileStatus(await invoke("get_mobile_server_status"));
+    } catch (e) {
+      mobileErrorEl.textContent = String(e);
+    }
+  }
+
+  mobileToggleBtn.addEventListener("click", async () => {
+    mobileErrorEl.textContent = "";
+    let status;
+    try { status = await invoke("get_mobile_server_status"); } catch {}
+    const running = !!(status && status.running);
+    mobileToggleBtn.disabled = true;
+    try {
+      if (running) {
+        await invoke("stop_mobile_server");
+      } else {
+        // Persist the port first if the user changed it.
+        const portRaw = mobilePortInput.value.trim();
+        if (portRaw && /^\d+$/.test(portRaw)) {
+          await invoke("set_app_settings", { req: { settings: { "mobile/server_port": portRaw } } });
+        }
+        const addr = await invoke("start_mobile_server");
+        mobileStateEl.textContent = `Started on ${addr}`;
+      }
+    } catch (e) {
+      mobileErrorEl.textContent = String(e);
+    } finally {
+      mobileToggleBtn.disabled = false;
+      await refreshMobileStatus();
+    }
+  });
+
+  mobileRegenBtn.addEventListener("click", async () => {
+    if (!confirm("This will disconnect the phone until you re-scan.")) return;
+    mobileErrorEl.textContent = "";
+    try {
+      await invoke("regenerate_mobile_token");
+    } catch (e) {
+      mobileErrorEl.textContent = String(e);
+    }
+    await refreshMobileStatus();
+  });
 
   function ensureOption(select, value) {
     if (!value) return;
@@ -258,6 +395,8 @@ export function renderSettingsTile(tileObj, body) {
     qaShortcutInput.value = s["quickask/shortcut"] || "cmd+shift+space";
     autoVerifyInput.checked = s["safety/auto_verify"] === "1";
     approvalTimeoutInput.value = s["safety/approval_timeout_secs"] || "";
+    mobilePortInput.value = s["mobile/server_port"] || "";
+    refreshMobileStatus();
     mcpInput.value = s["mcp/servers"] || "";
     refreshMcpStatus();
 

@@ -1,0 +1,879 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0d1117">
+<title>Muninn</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%230d1117'/%3E%3Ctext%20x='16'%20y='23'%20font-size='20'%20text-anchor='middle'%20fill='%2358d36e'%20font-family='monospace'%3EM%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg2: #161b22;
+    --bg3: #1c2430;
+    --border: #232c38;
+    --border2: #30363d;
+    --fg: #e6edf3;
+    --fg-dim: #8b98a8;
+    --fg-dimmer: #5f6b7a;
+    --green: #58d36e;
+    --blue: #58a6ff;
+    --red: #f85149;
+    --yellow: #e3b341;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sys: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --safe-b: env(safe-area-inset-bottom, 0px);
+    --safe-t: env(safe-area-inset-top, 0px);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font-family: var(--sys); font-size: 16px;
+    overflow: hidden;
+    -webkit-text-size-adjust: 100%;
+  }
+  #app { height: 100%; display: flex; flex-direction: column; }
+  .view { display: none; height: 100%; flex-direction: column; min-height: 0; }
+  .view.active { display: flex; }
+  button {
+    font-family: inherit; font-size: 16px; color: var(--fg);
+    background: var(--bg3); border: 1px solid var(--border2);
+    border-radius: 10px; padding: 10px 14px; cursor: pointer;
+    min-height: 44px;
+  }
+  button:active { opacity: .7; }
+  button:disabled { opacity: .4; }
+  .btn-primary { background: #17361f; border-color: #2ea043; color: var(--green); }
+  .btn-danger { background: #35171a; border-color: #6e2b2f; color: var(--red); }
+  .btn-ghost { background: transparent; border-color: transparent; }
+  a { color: var(--blue); }
+  code, pre { font-family: var(--mono); }
+
+  /* reconnect bar */
+  #recon {
+    display: none; position: fixed; top: 0; left: 0; right: 0;
+    padding: calc(4px + var(--safe-t)) 8px 4px; text-align: center;
+    background: #3a2f10; color: var(--yellow); font-size: 12px; z-index: 100;
+  }
+  #recon.show { display: block; }
+
+  /* ===== Sessions view ===== */
+  .topbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: calc(10px + var(--safe-t)) 12px 10px;
+    background: var(--bg); border-bottom: 1px solid var(--border);
+  }
+  .topbar h1 { font-size: 18px; margin: 0; flex: 1; font-weight: 600; }
+  .topbar .brand { color: var(--green); font-family: var(--mono); }
+  .icon-btn { min-width: 44px; padding: 8px; }
+  #sessList { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding-bottom: calc(20px + var(--safe-b)); }
+  .sect-label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--fg-dimmer); padding: 14px 16px 6px;
+  }
+  .srow {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    cursor: pointer; display: flex; flex-direction: column; gap: 3px;
+  }
+  .srow:active { background: var(--bg2); }
+  .srow .title { font-size: 15px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .srow .meta { font-size: 12px; color: var(--fg-dim); display: flex; gap: 8px; }
+  .srow .pin { color: var(--yellow); }
+  .newchat-wrap { padding: 14px 16px calc(14px + var(--safe-b)); }
+  #newChatBtn { width: 100%; }
+  .empty { padding: 40px 20px; text-align: center; color: var(--fg-dim); }
+
+  /* ===== Chat view ===== */
+  .chat-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: calc(8px + var(--safe-t)) 10px 8px;
+    background: var(--bg); border-bottom: 1px solid var(--border);
+  }
+  .chat-header .label { flex: 1; font-size: 14px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #goalBanner {
+    display: none; padding: 8px 12px; background: #1a2a1e;
+    border-bottom: 1px solid #24422b; color: var(--green); font-size: 13px;
+  }
+  #goalBanner.show { display: block; }
+  #transcript {
+    flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 12px 12px 8px; display: flex; flex-direction: column; gap: 10px;
+    min-height: 0;
+  }
+  .bubble { max-width: 85%; padding: 9px 12px; border-radius: 14px; font-size: 15px; line-height: 1.45; word-wrap: break-word; overflow-wrap: anywhere; }
+  .bubble.user { align-self: flex-end; background: #143d2a; border: 1px solid #1f5a3d; border-bottom-right-radius: 4px; }
+  .bubble.assistant { align-self: flex-start; background: var(--bg2); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .bubble p { margin: 0 0 8px; } .bubble p:last-child { margin-bottom: 0; }
+  .bubble pre { background: #0a0e14; border: 1px solid var(--border2); border-radius: 8px; padding: 10px; overflow-x: auto; font-size: 13px; margin: 6px 0; }
+  .bubble code { background: #0a0e14; padding: 1px 5px; border-radius: 5px; font-size: 13px; }
+  .bubble pre code { background: none; padding: 0; }
+  .bubble .cursor { display: inline-block; width: 7px; height: 14px; background: var(--green); animation: blink 1s steps(2) infinite; vertical-align: text-bottom; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .chip {
+    align-self: flex-start; font-family: var(--mono); font-size: 12px;
+    color: var(--fg-dim); background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 10px; max-width: 90%;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .chip.done { color: var(--green); }
+  .sysline { align-self: center; font-size: 12px; color: var(--fg-dimmer); text-align: center; padding: 2px 8px; max-width: 90%; }
+  .sysline.goal { color: var(--green); }
+  .sysline.err { color: var(--red); }
+
+  .card {
+    align-self: stretch; background: var(--bg2); border: 1px solid var(--border2);
+    border-radius: 12px; padding: 12px; font-size: 14px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .card .q { color: var(--fg); }
+  .card .cmd { font-family: var(--mono); font-size: 13px; background: #0a0e14; border: 1px solid var(--border2); border-radius: 8px; padding: 8px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .card .note { font-size: 12px; color: var(--fg-dim); }
+  .card .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .card .btns button { flex: 1; min-width: 100px; }
+  .card .out { font-family: var(--mono); font-size: 12px; background: #0a0e14; border: 1px solid var(--border2); border-radius: 8px; padding: 8px; overflow-x: auto; white-space: pre-wrap; max-height: 200px; overflow-y: auto; }
+  .card input[type=text] {
+    width: 100%; font-size: 16px; padding: 10px; border-radius: 8px;
+    background: var(--bg); border: 1px solid var(--border2); color: var(--fg);
+  }
+
+  .composer {
+    display: flex; align-items: flex-end; gap: 8px;
+    padding: 8px 10px calc(8px + var(--safe-b));
+    background: var(--bg); border-top: 1px solid var(--border);
+  }
+  .composer textarea {
+    flex: 1; resize: none; font-family: inherit; font-size: 16px;
+    line-height: 1.4; padding: 11px 12px; border-radius: 12px;
+    background: var(--bg2); border: 1px solid var(--border2); color: var(--fg);
+    max-height: 120px; overflow-y: auto;
+  }
+  .composer button { min-width: 44px; padding: 11px 14px; }
+
+  /* ===== No-token screen ===== */
+  #noToken { align-items: center; justify-content: center; text-align: center; padding: 30px; gap: 16px; }
+  #noToken .big { font-size: 44px; }
+  #noToken h2 { margin: 0; font-weight: 600; }
+  #noToken p { color: var(--fg-dim); max-width: 320px; line-height: 1.5; }
+</style>
+
+<div id="recon">reconnecting…</div>
+<div id="app">
+
+  <!-- No token -->
+  <div id="noToken" class="view">
+    <div class="big">🔗</div>
+    <h2>Connect to Muninn</h2>
+    <p>Open <span style="color:var(--green)">Muninn → Settings</span> on your Mac and scan the QR code to pair this phone.</p>
+  </div>
+
+  <!-- Sessions -->
+  <div id="sessionsView" class="view">
+    <div class="topbar">
+      <h1><span class="brand">Muninn</span></h1>
+      <button class="icon-btn btn-ghost" id="refreshBtn" title="Refresh">⟳</button>
+    </div>
+    <div id="sessList"><div class="empty">Loading…</div></div>
+    <div class="newchat-wrap">
+      <button class="btn-primary" id="newChatBtn">+ New Chat</button>
+    </div>
+  </div>
+
+  <!-- Chat -->
+  <div id="chatView" class="view">
+    <div class="chat-header">
+      <button class="icon-btn btn-ghost" id="backBtn">‹</button>
+      <span class="label" id="chatLabel">Chat</span>
+      <button class="icon-btn btn-ghost" id="chatRefreshBtn" title="Refresh">⟳</button>
+    </div>
+    <div id="goalBanner"></div>
+    <div id="transcript"></div>
+    <div class="composer">
+      <textarea id="composerInput" rows="1" placeholder="Message… (/goal to set a goal)"></textarea>
+      <button class="btn-danger" id="stopBtn" style="display:none">■</button>
+      <button class="btn-primary" id="sendBtn">↑</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+(function () {
+  // ---------- token / boot ----------
+  var TOKEN_KEY = "muninn.mobile.token";
+  var qToken = null;
+  try {
+    var params = new URLSearchParams(location.search);
+    qToken = params.get("token");
+  } catch (e) {}
+  if (qToken) {
+    try { localStorage.setItem(TOKEN_KEY, qToken); } catch (e) {}
+    try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  }
+  var TOKEN = null;
+  try { TOKEN = localStorage.getItem(TOKEN_KEY); } catch (e) {}
+
+  // ---------- helpers ----------
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    if (s == null) return "";
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+  function showView(id) {
+    var vs = document.querySelectorAll(".view");
+    for (var i = 0; i < vs.length; i++) vs[i].classList.remove("active");
+    $(id).classList.add("active");
+  }
+  function relTime(ts) {
+    if (!ts) return "";
+    var t;
+    if (typeof ts === "number") {
+      t = ts;
+    } else {
+      var s = String(ts);
+      // SQLite CURRENT_TIMESTAMP is "YYYY-MM-DD HH:MM:SS" (UTC, space-separated) —
+      // iOS Safari's Date.parse rejects that form, so normalize to ISO-8601 UTC.
+      if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) s = s.replace(" ", "T") + "Z";
+      t = Date.parse(s);
+    }
+    if (isNaN(t)) return "";
+    if (t < 1e12) t = t * 1000; // seconds -> ms
+    var d = (Date.now() - t) / 1000;
+    if (d < 0) d = 0;
+    if (d < 60) return "just now";
+    if (d < 3600) return Math.floor(d / 60) + "m";
+    if (d < 86400) return Math.floor(d / 3600) + "h";
+    if (d < 604800) return Math.floor(d / 86400) + "d";
+    return new Date(t).toLocaleDateString();
+  }
+
+  // ---------- minimal markdown (escape FIRST) ----------
+  function renderMarkdown(raw) {
+    var s = esc(raw);
+    var blocks = [];
+    s = s.replace(/```([\s\S]*?)```/g, function (_, code) {
+      var idx = blocks.length;
+      blocks.push('<pre><code>' + code.replace(/^\n/, "") + '</code></pre>');
+      return " B" + idx + " ";
+    });
+    var inline = [];
+    s = s.replace(/`([^`\n]+)`/g, function (_, code) {
+      var idx = inline.length;
+      inline.push('<code>' + code + '</code>');
+      return " I" + idx + " ";
+    });
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    // links [text](url); url is already HTML-escaped so http:// is fine, guard scheme
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]*)\)/g, function (_, txt, url) {
+      return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + txt + "</a>";
+    });
+    s = s.replace(/\n/g, "<br>");
+    s = s.replace(/I(\d+)/g, function (_, i) { return inline[+i]; });
+    s = s.replace(/B(\d+)/g, function (_, i) { return blocks[+i]; });
+    return s;
+  }
+
+  // ---------- API ----------
+  function api(method, path, body) {
+    var opts = {
+      method: method,
+      headers: { "Authorization": "Bearer " + TOKEN }
+    };
+    if (body !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(path, opts).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      var ct = r.headers.get("content-type") || "";
+      if (ct.indexOf("application/json") >= 0) return r.json();
+      return r.text();
+    });
+  }
+
+  // ---------- state ----------
+  var currentSession = null;   // session id string
+  var inFlight = false;        // is a turn running for currentSession
+  var liveBubble = null;       // { el, text } for streaming
+  var chipEls = {};            // tool_name -> chip element (best effort)
+
+  // ============================================================
+  // Sessions view
+  // ============================================================
+  function loadSessions() {
+    var list = $("sessList");
+    api("GET", "/api/sessions").then(function (sessions) {
+      renderSessions(sessions || []);
+    }).catch(function (e) {
+      list.innerHTML = '<div class="empty">Failed to load sessions.<br><span style="font-size:12px">' + esc(e.message) + "</span></div>";
+    });
+  }
+
+  function sessionLabel(s) {
+    return s.title || s.preview || "New chat";
+  }
+
+  function renderSessions(sessions) {
+    var list = $("sessList");
+    if (!sessions.length) {
+      list.innerHTML = '<div class="empty">No conversations yet.<br>Tap “+ New Chat” to begin.</div>';
+      return;
+    }
+    var pinned = sessions.filter(function (s) { return s.pinned; });
+    var recent = sessions.filter(function (s) { return !s.pinned; });
+    var html = "";
+    function rowHtml(s) {
+      var lbl = sessionLabel(s);
+      var count = (s.message_count != null) ? s.message_count : 0;
+      return '<div class="srow" data-id="' + esc(s.id) + '">' +
+        '<div class="title">' + (s.pinned ? '<span class="pin">★ </span>' : "") + esc(lbl) + "</div>" +
+        '<div class="meta"><span>' + esc(relTime(s.last_message_at || s.created_at)) + "</span>" +
+        '<span>· ' + count + ' msg</span></div></div>';
+    }
+    if (pinned.length) {
+      html += '<div class="sect-label">Pinned</div>';
+      html += pinned.map(rowHtml).join("");
+    }
+    if (recent.length) {
+      html += '<div class="sect-label">Recent</div>';
+      html += recent.map(rowHtml).join("");
+    }
+    list.innerHTML = html;
+    var rows = list.querySelectorAll(".srow");
+    for (var i = 0; i < rows.length; i++) {
+      (function (row) {
+        row.addEventListener("click", function () {
+          openChat(row.getAttribute("data-id"), row.querySelector(".title").textContent);
+        });
+      })(rows[i]);
+    }
+  }
+
+  function newChat() {
+    api("POST", "/api/sessions", {}).then(function (s) {
+      openChat(s.id, "New chat");
+    }).catch(function (e) {
+      alert("Could not create chat: " + e.message);
+    });
+  }
+
+  // ============================================================
+  // Chat view
+  // ============================================================
+  function openChat(id, label) {
+    currentSession = String(id);
+    inFlight = false;
+    liveBubble = null;
+    chipEls = {};
+    $("chatLabel").textContent = label || "Chat";
+    $("transcript").innerHTML = "";
+    $("goalBanner").classList.remove("show");
+    $("goalBanner").textContent = "";
+    setInFlight(false);
+    showView("chatView");
+    ensureWs();
+    refreshChatData();
+  }
+
+  function refreshChatData() {
+    var sid = currentSession;
+    if (!sid) return;
+    // messages
+    api("GET", "/api/messages?session_id=" + encodeURIComponent(sid)).then(function (msgs) {
+      if (sid !== currentSession) return;
+      $("transcript").innerHTML = "";
+      liveBubble = null;
+      (msgs || []).forEach(function (m) {
+        addMessageBubble(m.role, m.content);
+      });
+      scrollBottom();
+    }).catch(function (e) {
+      if (sid !== currentSession) return;
+      addSysLine("Failed to load messages: " + e.message, "err");
+    });
+    // goal
+    api("GET", "/api/goal?session_id=" + encodeURIComponent(sid)).then(function (r) {
+      if (sid !== currentSession) return;
+      setGoalBanner(r && r.goal);
+    }).catch(function () {});
+    // deferred
+    api("GET", "/api/deferred?session_id=" + encodeURIComponent(sid)).then(function (arr) {
+      if (sid !== currentSession) return;
+      (arr || []).forEach(function (d) {
+        if (d.status && d.status !== "pending") return;
+        addDeferredCard(d.id, d.command, d.verifier_note);
+      });
+      scrollBottom();
+    }).catch(function () {});
+  }
+
+  function setGoalBanner(goal) {
+    var b = $("goalBanner");
+    if (goal) {
+      b.textContent = "🎯 Goal: " + goal;
+      b.classList.add("show");
+    } else {
+      b.textContent = "";
+      b.classList.remove("show");
+    }
+  }
+
+  function scrollBottom() {
+    var t = $("transcript");
+    requestAnimationFrame(function () { t.scrollTop = t.scrollHeight; });
+  }
+  function nearBottom() {
+    var t = $("transcript");
+    return (t.scrollHeight - t.scrollTop - t.clientHeight) < 120;
+  }
+
+  function addMessageBubble(role, content) {
+    var t = $("transcript");
+    var el = document.createElement("div");
+    el.className = "bubble " + (role === "user" ? "user" : "assistant");
+    if (role === "user") {
+      el.innerHTML = esc(content).replace(/\n/g, "<br>");
+    } else {
+      el.innerHTML = renderMarkdown(content || "");
+    }
+    t.appendChild(el);
+    return el;
+  }
+
+  function addSysLine(text, cls) {
+    var t = $("transcript");
+    var stick = nearBottom();
+    var el = document.createElement("div");
+    el.className = "sysline" + (cls ? " " + cls : "");
+    el.textContent = text;
+    t.appendChild(el);
+    if (stick) scrollBottom();
+  }
+
+  // tool chips
+  function toolChip(toolName, args) {
+    var t = $("transcript");
+    var stick = nearBottom();
+    var el = document.createElement("div");
+    el.className = "chip";
+    var argStr = "";
+    try {
+      if (args && typeof args === "object") {
+        var k = Object.keys(args)[0];
+        if (k) argStr = " " + String(args[k]).slice(0, 40);
+      } else if (typeof args === "string") {
+        argStr = " " + args.slice(0, 40);
+      }
+    } catch (e) {}
+    el.textContent = "🔧 " + (toolName || "tool") + argStr + "…";
+    t.appendChild(el);
+    if (stick) scrollBottom();
+    return el;
+  }
+
+  // ---------- streaming live bubble ----------
+  function ensureLiveBubble() {
+    if (liveBubble) return liveBubble;
+    var t = $("transcript");
+    var el = document.createElement("div");
+    el.className = "bubble assistant";
+    el.innerHTML = '<span class="cursor"></span>';
+    t.appendChild(el);
+    liveBubble = { el: el, text: "" };
+    return liveBubble;
+  }
+  function appendToken(tok) {
+    var lb = ensureLiveBubble();
+    lb.text += tok;
+    var stick = nearBottom();
+    lb.el.innerHTML = renderMarkdown(lb.text) + '<span class="cursor"></span>';
+    if (stick) scrollBottom();
+  }
+  function finalizeBubble() {
+    if (liveBubble) {
+      liveBubble.el.innerHTML = renderMarkdown(liveBubble.text);
+      liveBubble = null;
+    }
+    setInFlight(false);
+  }
+
+  // ---------- cards ----------
+  function addQuestionCard(question, choices) {
+    var t = $("transcript");
+    var card = document.createElement("div");
+    card.className = "card";
+    card._qcard = true;
+    var q = document.createElement("div");
+    q.className = "q";
+    q.textContent = question || "Muninn is asking for approval:";
+    card.appendChild(q);
+
+    function answer(ans) {
+      api("POST", "/api/answer", { session_id: currentSession, answer: ans }).catch(function () {});
+      card.remove();
+      addSysLine("↳ answered: " + ans);
+    }
+
+    if (choices && choices.length) {
+      var btns = document.createElement("div");
+      btns.className = "btns";
+      choices.forEach(function (c) {
+        var b = document.createElement("button");
+        b.className = "btn-primary";
+        b.textContent = c;
+        b.addEventListener("click", function () { answer(c); });
+        btns.appendChild(b);
+      });
+      card.appendChild(btns);
+    } else {
+      var inp = document.createElement("input");
+      inp.type = "text";
+      inp.placeholder = "Your answer…";
+      card.appendChild(inp);
+      var row = document.createElement("div");
+      row.className = "btns";
+      var send = document.createElement("button");
+      send.className = "btn-primary";
+      send.textContent = "Send";
+      send.addEventListener("click", function () {
+        if (inp.value.trim()) answer(inp.value.trim());
+      });
+      row.appendChild(send);
+      card.appendChild(row);
+    }
+    t.appendChild(card);
+    scrollBottom();
+  }
+
+  function removeQuestionCards() {
+    var cards = $("transcript").querySelectorAll(".card");
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i]._qcard) cards[i].remove();
+    }
+  }
+
+  function addDeferredCard(id, command, note) {
+    var t = $("transcript");
+    var card = document.createElement("div");
+    card.className = "card";
+
+    var q = document.createElement("div");
+    q.className = "q";
+    q.textContent = "⚠️ Command deferred for approval";
+    card.appendChild(q);
+
+    var cmd = document.createElement("div");
+    cmd.className = "cmd";
+    cmd.textContent = command || "";
+    card.appendChild(cmd);
+
+    if (note) {
+      var n = document.createElement("div");
+      n.className = "note";
+      n.textContent = note;
+      card.appendChild(n);
+    }
+
+    var btns = document.createElement("div");
+    btns.className = "btns";
+    var approve = document.createElement("button");
+    approve.className = "btn-primary";
+    approve.textContent = "Approve & run";
+    var dismiss = document.createElement("button");
+    dismiss.className = "btn-danger";
+    dismiss.textContent = "Dismiss";
+    btns.appendChild(approve);
+    btns.appendChild(dismiss);
+    card.appendChild(btns);
+
+    approve.addEventListener("click", function () {
+      approve.disabled = true; dismiss.disabled = true;
+      approve.textContent = "Running…";
+      api("POST", "/api/deferred/approve", { id: id }).then(function (r) {
+        approve.textContent = "Ran ✓";
+        var out = document.createElement("div");
+        out.className = "out";
+        out.textContent = (r && r.output != null) ? String(r.output) : "(no output)";
+        card.appendChild(out);
+        scrollBottom();
+      }).catch(function (e) {
+        approve.textContent = "Failed";
+        var out = document.createElement("div");
+        out.className = "out";
+        out.textContent = "Error: " + e.message;
+        card.appendChild(out);
+      });
+    });
+    dismiss.addEventListener("click", function () {
+      approve.disabled = true; dismiss.disabled = true;
+      api("POST", "/api/deferred/dismiss", { id: id }).catch(function () {});
+      dismiss.textContent = "Dismissed";
+    });
+
+    t.appendChild(card);
+    scrollBottom();
+  }
+
+  // ---------- send / stop ----------
+  function setInFlight(v) {
+    inFlight = v;
+    $("stopBtn").style.display = v ? "" : "none";
+    $("sendBtn").disabled = v;
+  }
+
+  function sendMessage() {
+    var ta = $("composerInput");
+    var text = ta.value.trim();
+    if (!text || !currentSession) return;
+
+    // /goal handling
+    if (text === "/goal") {
+      api("GET", "/api/goal?session_id=" + encodeURIComponent(currentSession)).then(function (r) {
+        addSysLine(r && r.goal ? "Current goal: " + r.goal : "No goal set.");
+      }).catch(function () { addSysLine("No goal set."); });
+      ta.value = ""; autogrow();
+      return;
+    }
+    if (text === "/goal clear") {
+      api("POST", "/api/goal", { session_id: currentSession, goal: "" }).then(function () {
+        setGoalBanner(null);
+        addSysLine("Goal cleared.");
+      }).catch(function (e) { addSysLine("Failed to clear goal: " + e.message, "err"); });
+      ta.value = ""; autogrow();
+      return;
+    }
+    if (text.indexOf("/goal ") === 0) {
+      var goalText = text.slice(6).trim();
+      api("POST", "/api/goal", { session_id: currentSession, goal: goalText }).then(function () {
+        setGoalBanner(goalText);
+      }).catch(function () {});
+      var kickoff = "Work toward this goal until it is fully met: " + goalText;
+      ta.value = ""; autogrow();
+      dispatchChat(kickoff);
+      return;
+    }
+
+    ta.value = ""; autogrow();
+    dispatchChat(text);
+  }
+
+  function dispatchChat(message) {
+    addMessageBubble("user", message);
+    scrollBottom();
+    setInFlight(true);
+    var sid = currentSession;
+    api("POST", "/api/chat", { session_id: sid, message: message }).then(function (r) {
+      if (sid !== currentSession) return;
+      // Final confirmation. If streaming produced a live bubble it is finalized
+      // by chat-done; otherwise render the reply now.
+      if (liveBubble) {
+        finalizeBubble();
+      } else if (r && r.reply != null && String(r.reply).length) {
+        addMessageBubble("assistant", String(r.reply));
+        setInFlight(false);
+        scrollBottom();
+      } else {
+        setInFlight(false);
+      }
+    }).catch(function (e) {
+      if (sid !== currentSession) return;
+      finalizeBubble();
+      addSysLine("Request failed: " + e.message, "err");
+      setInFlight(false);
+    });
+  }
+
+  function stopChat() {
+    if (!currentSession) return;
+    api("POST", "/api/stop", { session_id: currentSession }).catch(function () {});
+    finalizeBubble();
+    addSysLine("Stopped.");
+  }
+
+  // ---------- composer autogrow ----------
+  function autogrow() {
+    var ta = $("composerInput");
+    ta.style.height = "auto";
+    var max = 120;
+    ta.style.height = Math.min(ta.scrollHeight, max) + "px";
+  }
+
+  // ============================================================
+  // WebSocket
+  // ============================================================
+  var ws = null;
+  var wsBackoff = 1000;
+  var wsWasDown = false;
+  var wsConnecting = false;
+
+  function wsUrl() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host + "/ws?token=" + encodeURIComponent(TOKEN);
+  }
+
+  function ensureWs() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    connectWs();
+  }
+
+  function connectWs() {
+    if (wsConnecting) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    wsConnecting = true;
+    var sock;
+    try {
+      sock = new WebSocket(wsUrl());
+    } catch (e) {
+      wsConnecting = false;
+      scheduleReconnect();
+      return;
+    }
+    ws = sock;
+    sock.onopen = function () {
+      wsConnecting = false;
+      wsBackoff = 1000;
+      hideRecon();
+      if (wsWasDown) {
+        wsWasDown = false;
+        if (currentSession && $("chatView").classList.contains("active")) {
+          refreshChatData();
+        }
+      }
+    };
+    sock.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      handleWsEvent(msg);
+    };
+    sock.onclose = function () {
+      wsConnecting = false;
+      showRecon();
+      scheduleReconnect();
+    };
+    sock.onerror = function () {
+      try { sock.close(); } catch (e) {}
+    };
+  }
+
+  function scheduleReconnect() {
+    wsWasDown = true;
+    var delay = wsBackoff;
+    wsBackoff = Math.min(wsBackoff * 2, 30000);
+    setTimeout(connectWs, delay);
+  }
+
+  function showRecon() { $("recon").classList.add("show"); }
+  function hideRecon() { $("recon").classList.remove("show"); }
+
+  function handleWsEvent(msg) {
+    var name = msg && msg.event;
+    var p = (msg && msg.payload) || {};
+    if (!name) return;
+    var sid = p.session_id != null ? String(p.session_id) : null;
+
+    // Only affect the transcript while the chat view is open.
+    if (!$("chatView").classList.contains("active")) return;
+
+    // Filter to the open session. Events with no session_id (e.g. todos-changed)
+    // are treated as global.
+    var forThis = (sid == null) || (currentSession != null && sid === currentSession);
+    if (!forThis) return;
+
+    switch (name) {
+      case "chat-token":
+        setInFlight(true);
+        appendToken(p.token != null ? String(p.token) : "");
+        break;
+      case "chat-done":
+        finalizeBubble();
+        break;
+      case "tool-start": {
+        var chip = toolChip(p.tool_name, p.arguments);
+        if (p.tool_name) chipEls[p.tool_name] = chip;
+        break;
+      }
+      case "tool-complete": {
+        var el = p.tool_name ? chipEls[p.tool_name] : null;
+        if (el) {
+          el.className = "chip done";
+          var status = p.status ? " (" + p.status + ")" : "";
+          el.textContent = "✓ " + (p.tool_name || "tool") + status;
+          delete chipEls[p.tool_name];
+        }
+        break;
+      }
+      case "agent-iteration":
+        addSysLine("· " + (p.agent_name || "agent") + " · step " + (p.iteration != null ? p.iteration : "?"));
+        break;
+      case "goal-iteration":
+        if (p.reason) addSysLine("🎯 checking goal: " + p.reason);
+        break;
+      case "goal-met":
+        setGoalBanner(null);
+        addSysLine("🎯 Goal met: " + (p.reason || ""), "goal");
+        break;
+      case "user-question":
+        addQuestionCard(p.question, p.choices);
+        break;
+      case "user-question-timeout":
+        removeQuestionCards();
+        addSysLine("question timed out — command deferred");
+        break;
+      case "command-deferred":
+        addDeferredCard(p.id, p.command, p.verifier_note);
+        break;
+      case "todos-changed":
+        // low priority — ignore
+        break;
+      default:
+        break;
+    }
+  }
+
+  // ============================================================
+  // Wiring
+  // ============================================================
+  function init() {
+    if (!TOKEN) {
+      showView("noToken");
+      return;
+    }
+    // sessions
+    $("refreshBtn").addEventListener("click", loadSessions);
+    $("newChatBtn").addEventListener("click", newChat);
+    // chat
+    $("backBtn").addEventListener("click", function () {
+      currentSession = null;
+      showView("sessionsView");
+      loadSessions();
+    });
+    $("chatRefreshBtn").addEventListener("click", refreshChatData);
+    $("sendBtn").addEventListener("click", sendMessage);
+    $("stopBtn").addEventListener("click", stopChat);
+    var ta = $("composerInput");
+    ta.addEventListener("input", autogrow);
+    ta.addEventListener("keydown", function (e) {
+      // Hardware-keyboard convenience: Enter sends, Shift+Enter = newline.
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    showView("sessionsView");
+    loadSessions();
+    ensureWs();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>

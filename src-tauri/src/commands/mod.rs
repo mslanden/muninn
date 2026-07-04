@@ -18,6 +18,7 @@ mod ai_feeds;
 mod mcp;
 mod studio;
 mod safety;
+mod mobile;
 
 pub use sessions::*;
 pub use toolconfig::*;
@@ -36,3 +37,4 @@ pub use ai_feeds::*;
 pub use mcp::*;
 pub use studio::*;
 pub use safety::*;
+pub use mobile::*;

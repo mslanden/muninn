@@ -28,7 +28,7 @@ tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-global-shortcut = "2"
 notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
-tokio = { version = "1", features = ["time", "sync", "process", "io-util"] }
+tokio = { version = "1", features = ["time", "sync", "process", "io-util", "rt", "rt-multi-thread", "net", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 which = "6"
 cpal = "0.17.3"
@@ -36,6 +36,8 @@ tauri-plugin-dialog = "2.6.0"
 futures = "0.3.32"
 dirs = "6.0.0"
 regex = "1"
+axum = { version = "0.8", features = ["ws"] }
+local-ip-address = "0.6"
 
 [features]
 default = ["custom-protocol"]

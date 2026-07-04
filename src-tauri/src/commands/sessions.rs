@@ -14,6 +14,13 @@ pub fn create_session(
     state: State<AppState>,
     req: Option<SessionCreateRequest>,
 ) -> Result<SessionRecord, String> {
+    create_session_core(&state, req)
+}
+
+pub(crate) fn create_session_core(
+    state: &AppState,
+    req: Option<SessionCreateRequest>,
+) -> Result<SessionRecord, String> {
     let id = Uuid::new_v4().to_string();
     let project_path = normalize_project_path(req.as_ref().and_then(|item| item.project_path.as_deref()));
 
@@ -44,7 +51,11 @@ pub fn create_session(
 
 #[tauri::command]
 pub fn get_messages(state: State<AppState>, session_id: String) -> Result<Vec<MessageRecord>, String> {
-    with_db(&state, |db| {
+    get_messages_core(&state, &session_id)
+}
+
+pub(crate) fn get_messages_core(state: &AppState, session_id: &str) -> Result<Vec<MessageRecord>, String> {
+    with_db(state, |db| {
         let mut stmt = db
             .prepare(
                 "SELECT role, content, content_json, created_at FROM messages WHERE session_id = ?1 AND hidden = 0 ORDER BY id ASC",
@@ -202,6 +213,10 @@ pub fn search_messages(state: State<AppState>, req: SearchMessagesRequest) -> Re
 
 #[tauri::command]
 pub fn get_sessions(state: State<AppState>, req: SessionQueryRequest) -> Result<Vec<SessionListItem>, String> {
+    get_sessions_core(&state, req)
+}
+
+pub(crate) fn get_sessions_core(state: &AppState, req: SessionQueryRequest) -> Result<Vec<SessionListItem>, String> {
     let limit = req.limit.unwrap_or(50).min(500) as i64;
     let query = req.query.unwrap_or_default().trim().to_string();
     let has_query = !query.is_empty();
@@ -368,13 +383,17 @@ pub fn rename_session(state: State<AppState>, session_id: String, title: String)
 /// which disables the "/goal" loop. Returns whether a row was updated.
 #[tauri::command]
 pub fn set_session_goal(state: State<AppState>, session_id: String, goal: String) -> Result<bool, String> {
+    set_session_goal_core(&state, &session_id, &goal)
+}
+
+pub(crate) fn set_session_goal_core(state: &AppState, session_id: &str, goal: &str) -> Result<bool, String> {
     let trimmed = goal.trim();
     let new_goal: Option<&str> = if trimmed.is_empty() { None } else { Some(trimmed) };
-    with_db(&state, |db| {
+    with_db(state, |db| {
         let updated = db
             .execute(
                 "UPDATE sessions SET goal = ?1 WHERE id = ?2",
-                params![new_goal, session_id.as_str()],
+                params![new_goal, session_id],
             )
             .map_err(|e| e.to_string())?;
         Ok(updated > 0)
@@ -384,11 +403,15 @@ pub fn set_session_goal(state: State<AppState>, session_id: String, goal: String
 /// Fetch a session's active goal, or None if unset/cleared.
 #[tauri::command]
 pub fn get_session_goal(state: State<AppState>, session_id: String) -> Result<Option<String>, String> {
-    with_db(&state, |db| {
+    get_session_goal_core(&state, &session_id)
+}
+
+pub(crate) fn get_session_goal_core(state: &AppState, session_id: &str) -> Result<Option<String>, String> {
+    with_db(state, |db| {
         let goal: Option<String> = db
             .query_row(
                 "SELECT goal FROM sessions WHERE id = ?1",
-                params![session_id.as_str()],
+                params![session_id],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()

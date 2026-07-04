@@ -34,8 +34,16 @@ pub fn list_deferred_commands(
     session_id: Option<String>,
     status: Option<String>,
 ) -> Result<Vec<DeferredCommand>, String> {
+    list_deferred_commands_core(&state, session_id, status)
+}
+
+pub(crate) fn list_deferred_commands_core(
+    state: &AppState,
+    session_id: Option<String>,
+    status: Option<String>,
+) -> Result<Vec<DeferredCommand>, String> {
     let status_filter = status.unwrap_or_else(|| "pending".to_string());
-    with_db(&state, |db| {
+    with_db(state, |db| {
         let mut sql = String::from(
             "SELECT id, session_id, command, cwd, workspace_root, reasons, verifier_note, status, created_at, resolved_at \
              FROM deferred_commands WHERE status = ?1",
@@ -80,8 +88,12 @@ pub fn list_deferred_commands(
 /// insert a hidden message so the agent sees the outcome next turn. Returns the output.
 #[tauri::command]
 pub fn approve_deferred_command(state: State<AppState>, id: i64) -> Result<String, String> {
+    approve_deferred_command_core(&state, id)
+}
+
+pub(crate) fn approve_deferred_command_core(state: &AppState, id: i64) -> Result<String, String> {
     // Load the pending row (guard: only pending rows can be approved).
-    let row: Option<(String, String, Option<String>, Option<String>)> = with_db(&state, |db| {
+    let row: Option<(String, String, Option<String>, Option<String>)> = with_db(state, |db| {
         db.query_row(
             "SELECT session_id, command, cwd, workspace_root FROM deferred_commands WHERE id = ?1 AND status = 'pending'",
             params![id],
@@ -141,7 +153,11 @@ pub fn approve_deferred_command(state: State<AppState>, id: i64) -> Result<Strin
 /// Dismiss a pending deferred command. Returns whether a pending row was updated.
 #[tauri::command]
 pub fn dismiss_deferred_command(state: State<AppState>, id: i64) -> Result<bool, String> {
-    with_db(&state, |db| {
+    dismiss_deferred_command_core(&state, id)
+}
+
+pub(crate) fn dismiss_deferred_command_core(state: &AppState, id: i64) -> Result<bool, String> {
+    with_db(state, |db| {
         let changed = db
             .execute(
                 "UPDATE deferred_commands SET status = 'dismissed', resolved_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'pending'",

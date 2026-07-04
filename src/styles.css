@@ -2557,6 +2557,38 @@ button.form-btn.danger:hover { border-color: rgba(239,68,68,0.3); }
   cursor: pointer;
 }
 
+/* ========== REMOTE ACCESS (PHONE) ========== */
+.mobile-qr {
+  display: inline-block;
+  background: #fff;
+  padding: 8px;
+  border-radius: 2px;
+  line-height: 0;
+}
+.mobile-qr svg { display: block; width: 160px; height: 160px; }
+
+.mobile-urls { margin-top: 10px; }
+.mobile-url-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.mobile-url-text {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10.5px;
+  color: var(--text);
+  user-select: all;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: var(--bg);
+}
+
 /* ========== WORKSPACES TILE ========== */
 .ws-toolbar {
   display: flex;

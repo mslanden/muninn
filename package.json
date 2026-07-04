@@ -17,7 +17,8 @@
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-autostart": "^2.5.1",
     "@tauri-apps/plugin-dialog": "^2.6.0",
-    "html2canvas": "^1.4.1"
+    "html2canvas": "^1.4.1",
+    "qrcode-generator": "^2.0.4"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
