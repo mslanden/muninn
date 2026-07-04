@@ -16,6 +16,7 @@ mod projects;
 mod voice;
 mod ai_feeds;
 mod mcp;
+mod studio;
 
 pub use sessions::*;
 pub use toolconfig::*;
@@ -32,3 +33,4 @@ pub use projects::*;
 pub use voice::*;
 pub use ai_feeds::*;
 pub use mcp::*;
+pub use studio::*;

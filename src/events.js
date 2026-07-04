@@ -330,10 +330,53 @@ export async function setupEventListeners() {
     }
   });
 
-  // Drag-and-drop file import (Tauri native drag-drop provides file paths)
+  // Drag-and-drop file import (Tauri native drag-drop provides file paths).
+  // Tauri intercepts OS file drops at the window level, so the webview's HTML5 drop
+  // event never receives them — we resolve the drop position to the element under the
+  // cursor here instead.
+  const IMG_EXT = /\.(png|jpe?g|gif|webp)$/i;
+
+  // Map a Tauri physical drop position to the chat tile under the cursor, if any.
+  function chatTileAt(position) {
+    if (!position) return null;
+    const dpr = window.devicePixelRatio || 1;
+    const el = document.elementFromPoint(position.x / dpr, position.y / dpr);
+    const tileEl = el && el.closest(".tile");
+    const tileId = tileEl && tileEl.dataset.tileId;
+    if (!tileId) return null;
+    return tiles.find(t => String(t.id) === String(tileId) && t.type === "chat") || null;
+  }
+
+  // Highlight the chat tile a dragged file is hovering over.
+  let dragHoverTile = null;
+  function setDragHover(tile) {
+    if (dragHoverTile === tile) return;
+    if (dragHoverTile && dragHoverTile.el) dragHoverTile.el.classList.remove("drop-target");
+    if (tile && tile.el) tile.el.classList.add("drop-target");
+    dragHoverTile = tile;
+  }
+  await listen("tauri://drag-over", (event) => setDragHover(chatTileAt(event.payload?.position)));
+  await listen("tauri://drag-leave", () => setDragHover(null));
+
   await listen("tauri://drag-drop", async (event) => {
+    setDragHover(null);
     const paths = event.payload?.paths;
     if (!paths || !paths.length) return;
+
+    // An image dropped on a chat tile becomes an attachment for that chat, not a content import.
+    const imagePaths = paths.filter(p => IMG_EXT.test(p));
+    const tile = imagePaths.length ? chatTileAt(event.payload?.position) : null;
+    if (tile && typeof tile.addDroppedImage === "function") {
+      for (const path of imagePaths) {
+        try {
+          const dataUrl = await invoke("read_image_base64", { path });
+          tile.addDroppedImage(dataUrl);
+        } catch {}
+      }
+      return;
+    }
+
+    // Otherwise fall back to importing the dropped files into the content library.
     try {
       await invoke("import_content_files", { req: { paths } });
     } catch {}

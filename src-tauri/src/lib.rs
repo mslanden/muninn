@@ -1,4 +1,5 @@
 mod audio;
+mod calendar;
 mod commands;
 mod db;
 mod feeds;
@@ -9,6 +10,7 @@ mod mcp;
 mod models;
 mod notify_user;
 mod scheduler;
+mod screen;
 mod search;
 mod todos;
 mod tools;
@@ -40,6 +42,11 @@ pub struct AppState {
     pub pending_questions: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     /// Connections to configured MCP servers (lazy-spawned stdio children).
     pub mcp: mcp::McpManager,
+    /// Images captured by `capture_screen` during a tool round, keyed by session_id, waiting
+    /// to be attached to the next tool_result so the vision model can see them. Each entry is
+    /// (media_type, base64). Drained per tool call by the chat loop. Side-channel because the
+    /// tool dispatch returns plain text — see `tools::execute_agent_tool`.
+    pub captured_images: Mutex<HashMap<String, Vec<(String, String)>>>,
 }
 
 /// Show/hide the frameless quick-ask overlay (created on first use). Lives at
@@ -122,6 +129,7 @@ pub fn run() {
                 todos: Mutex::new(HashMap::new()),
                 pending_questions: Mutex::new(HashMap::new()),
                 mcp: mcp::McpManager::default(),
+                captured_images: Mutex::new(HashMap::new()),
             });
 
             // Plugins
@@ -198,6 +206,13 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // One-time migration: fold the old, unviewable gallery dirs (media/images,
+            // media/audio) into the Content library so previously-saved assets are visible.
+            let moved = tools::migrate_gallery_to_content(&app.handle().clone());
+            if moved > 0 {
+                println!("Muninn: migrated {} media file(s) from old gallery dirs into Content.", moved);
+            }
+
             // Start the background task scheduler
             let scheduler_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -247,7 +262,10 @@ pub fn run() {
             commands::create_session,
             commands::get_sessions,
             commands::delete_session,
+            commands::set_session_pinned,
+            commands::rename_session,
             commands::get_messages,
+            commands::export_session_markdown,
             commands::get_tool_logs,
             commands::get_tools,
             commands::set_tool_enabled,
@@ -260,6 +278,7 @@ pub fn run() {
             commands::add_task,
             commands::update_task,
             commands::set_task_status,
+            commands::get_task_runs,
             commands::remove_task,
             commands::get_agents,
             commands::add_agent,
@@ -280,10 +299,6 @@ pub fn run() {
             commands::upsert_relationship,
             commands::delete_relationship,
             commands::search_messages,
-            commands::get_gallery_paths,
-            commands::get_gallery_images,
-            commands::get_gallery_audio,
-            commands::delete_gallery_media,
             commands::open_content_dir,
             commands::get_content_path,
             commands::get_content_files,
@@ -321,6 +336,13 @@ pub fn run() {
             commands::get_ai_feed_items,
             commands::mark_ai_feed_item_read,
             commands::generate_feed_item_image,
+            commands::generate_post_copy,
+            commands::writing_assist,
+            commands::generate_doc_html,
+            commands::open_html,
+            commands::generate_carousel,
+            commands::studio_save_png,
+            commands::studio_generate_image,
             commands::generate_feed_article,
             commands::refresh_ai_feed,
             commands::ai_web_search,

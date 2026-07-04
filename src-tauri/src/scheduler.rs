@@ -4,9 +4,67 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::AppState;
 use crate::db::{add_feed_item, get_app_setting_value, insert_message, with_db};
-use crate::llm::{chat_with_minimax_anthropic, chat_with_openai};
+use crate::llm::{chat_dynamic, chat_with_minimax_anthropic, chat_with_openai};
 use crate::models::{DayConfig, HistoryMessage, ScheduleConfig};
 use crate::tools::truncate_chars;
+
+/// Safety cap on how deep a chain of triggered tasks can run before we assume a loop.
+const MAX_CHAIN_DEPTH: i64 = 10;
+
+/// Decode a child task's `pending_input` (JSON written by an upstream task on success) into
+/// What an upstream task left for a chained child in its `pending_input`.
+#[derive(Default)]
+struct ChainTrigger {
+    /// Prompt-context prefix (the upstream output), or None for a normal scheduled run.
+    context: Option<String>,
+    /// Chain depth so far (loop guard).
+    depth: i64,
+    /// Parent task id (0 for a scheduled run).
+    from_id: i64,
+    /// Short note on why this run fired (e.g. the condition verdict).
+    via: String,
+}
+
+/// a prompt-context prefix, chain depth, and provenance. Returns the default (no context,
+/// depth 0, from_id 0) for a normal scheduled run or invalid input.
+fn parse_pending_input(pending_input: &str) -> ChainTrigger {
+    if pending_input.trim().is_empty() {
+        return ChainTrigger::default();
+    }
+    match serde_json::from_str::<serde_json::Value>(pending_input) {
+        Ok(v) => {
+            let from = v.get("from").and_then(|x| x.as_str()).unwrap_or("a previous task");
+            let output = v.get("output").and_then(|x| x.as_str()).unwrap_or("");
+            let depth = v.get("depth").and_then(|x| x.as_i64()).unwrap_or(0);
+            let from_id = v.get("from_id").and_then(|x| x.as_i64()).unwrap_or(0);
+            let via = v.get("via").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let context = if output.trim().is_empty() {
+                None
+            } else {
+                Some(format!("Output from the upstream task \"{}\":\n\n{}", from, output))
+            };
+            ChainTrigger { context, depth, from_id, via }
+        }
+        Err(_) => ChainTrigger::default(),
+    }
+}
+
+/// Parse a task's `chain_next` column (JSON array of id strings, e.g. `["3","7"]`) into ids.
+/// Tolerates bare numbers and a single id string; returns empty on blank/invalid input.
+fn parse_chain_next(chain_next: &str) -> Vec<i64> {
+    let trimmed = chain_next.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return items
+            .iter()
+            .filter_map(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+            .collect();
+    }
+    // Fall back to a single bare id ("5").
+    trimmed.parse().map(|id| vec![id]).unwrap_or_default()
+}
 
 /// Parse a human-friendly schedule string into the next run time from `now`.
 ///
@@ -318,10 +376,10 @@ pub async fn run_scheduler(app: AppHandle) {
         let now_str = now.format("%Y-%m-%dT%H:%M:%S").to_string();
 
         // Find due tasks: status = 'scheduled', next_run is non-empty and <= now
-        let due_tasks: Vec<(i64, String, String, String, String, String)> = match with_db(&state, |db| {
+        let due_tasks: Vec<(i64, String, String, String, String, String, String, String)> = match with_db(&state, |db| {
             let mut stmt = db
                 .prepare(
-                    "SELECT id, name, description, schedule, schedule_config, next_run FROM tasks \
+                    "SELECT id, name, description, schedule, schedule_config, next_run, chain_next, pending_input FROM tasks \
                      WHERE status = 'scheduled' AND next_run != '' AND next_run <= ?1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -334,6 +392,8 @@ pub async fn run_scheduler(app: AppHandle) {
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 })
                 .map_err(|e| e.to_string())?;
@@ -347,7 +407,7 @@ pub async fn run_scheduler(app: AppHandle) {
             Err(_) => continue,
         };
 
-        for (task_id, task_name, description, schedule, schedule_config, due_at) in due_tasks {
+        for (task_id, task_name, description, schedule, schedule_config, due_at, chain_next, pending_input) in due_tasks {
             // A run firing well past its slot is a catch-up (the app or the Mac was
             // down at the scheduled time) — label it so it doesn't look random.
             let late_label = NaiveDateTime::parse_from_str(&due_at, "%Y-%m-%dT%H:%M:%S")
@@ -355,10 +415,16 @@ pub async fn run_scheduler(app: AppHandle) {
                 .map(|slot| now - slot)
                 .filter(|late| *late > TimeDelta::minutes(5))
                 .map(|late| format!(" ({} late — missed the {} slot)", human_duration(late), due_at.replace('T', " ")));
-            // Mark as running
+
+            // If a chained upstream task fired this run, it left its output in pending_input.
+            // Pull the context prefix + provenance out of it, then clear the column.
+            let trigger = parse_pending_input(&pending_input);
+            let run_started_at = now_str.clone();
+
+            // Mark as running; clear consumed chain input so it can't replay on a later tick.
             let _ = with_db(&state, |db| {
                 db.execute(
-                    "UPDATE tasks SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    "UPDATE tasks SET status = 'running', pending_input = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
                     params![task_id],
                 )
                 .map_err(|e| e.to_string())
@@ -386,10 +452,15 @@ pub async fn run_scheduler(app: AppHandle) {
             });
 
             // Build the task prompt
-            let prompt = if description.trim().is_empty() {
+            let base_prompt = if description.trim().is_empty() {
                 format!("Execute the scheduled task: {}", task_name)
             } else {
                 description.clone()
+            };
+            // Prepend upstream output when this run was triggered by a chained task.
+            let prompt = match &trigger.context {
+                Some(ctx) => format!("{}\n\n---\n\n{}", ctx, base_prompt),
+                None => base_prompt,
             };
 
             // Save user message (structured so future replays keep the turn intact).
@@ -418,16 +489,18 @@ pub async fn run_scheduler(app: AppHandle) {
             // Run LLM
             let result = if provider == "minimax" || model.starts_with("MiniMax-") {
                 chat_with_minimax_anthropic(&app, &state, &session_id, &model, &history, None, false).await
-            } else {
+            } else if provider == "openai" {
                 chat_with_openai(&app, &state, &session_id, &model, &history, None, false).await
+            } else {
+                chat_dynamic(&app, &state, &session_id, &provider, &model, &history, None, false).await
             };
 
-            let (status, reply_preview) = match &result {
+            let (status, reply_preview, full_output) = match &result {
                 Ok((reply, blocks)) => {
                     let _ = insert_message(&state, &session_id, "assistant", reply, blocks, false);
-                    ("completed", truncate_chars(reply, 200))
+                    ("completed", truncate_chars(reply, 200), reply.clone())
                 }
-                Err(e) => ("scheduled", format!("Error: {}", truncate_chars(e, 180))),
+                Err(e) => ("scheduled", format!("Error: {}", truncate_chars(e, 180)), String::new()),
             };
 
             // Calculate next run (prefer schedule_config over legacy schedule)
@@ -483,6 +556,123 @@ pub async fn run_scheduler(app: AppHandle) {
                 ),
                 &reply_preview,
             );
+
+            // ---- Record this run (independent of the task's reset status) ----
+            let run_status = if result.is_ok() { "completed" } else { "failed" };
+            let run_output = match &result {
+                Ok((reply, _)) => reply.clone(),
+                Err(e) => format!("Error: {}", e),
+            };
+            let trigger_kind = if trigger.from_id != 0 { "chain" } else { "scheduled" };
+            // Note: condition verdict for chain runs, else the late/catch-up label if any.
+            let run_note = if !trigger.via.is_empty() {
+                trigger.via.clone()
+            } else {
+                late_label.as_deref().map(|s| s.trim().trim_matches(['(', ')']).to_string()).unwrap_or_default()
+            };
+            crate::db::insert_task_run(
+                &state, task_id, &session_id, trigger_kind, trigger.from_id,
+                run_status, &run_output, &run_note, &run_started_at,
+            );
+
+            // ---- Chaining ----
+            // On success, fire downstream tasks listed in chain_next. Each child is queued for
+            // the next tick (next_run = now) with this task's full output as pending_input.
+            if result.is_ok() {
+                let child_ids = parse_chain_next(&chain_next);
+                let next_depth = trigger.depth + 1;
+                if !child_ids.is_empty() && next_depth > MAX_CHAIN_DEPTH {
+                    add_feed_item(
+                        &state,
+                        "task",
+                        &format!("Chain stopped: {} (max depth {} reached)", task_name, MAX_CHAIN_DEPTH),
+                        "Possible loop in chained tasks — children were not triggered.",
+                        "error",
+                        "",
+                    );
+                } else {
+                    for child_id in child_ids {
+                        if child_id == task_id {
+                            continue; // never chain a task to itself
+                        }
+
+                        // A child may carry a natural-language gate condition; evaluate it
+                        // against this task's output before deciding whether to fire it.
+                        let condition: String = with_db(&state, |db| {
+                            db.query_row(
+                                "SELECT conditions FROM tasks WHERE id = ?1",
+                                params![child_id],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                        .unwrap_or_default();
+
+                        let (proceed, via_note) = if condition.trim().is_empty() {
+                            (true, String::new())
+                        } else {
+                            let (met, reason) =
+                                crate::llm::evaluate_chain_condition(&state, &condition, &full_output).await;
+                            let note = format!(
+                                "{} — {}: {}",
+                                now_str.replace('T', " "),
+                                if met { "met" } else { "not met" },
+                                truncate_chars(&reason, 160)
+                            );
+                            let _ = with_db(&state, |db| {
+                                db.execute(
+                                    "UPDATE tasks SET condition_status = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                                    params![child_id, note],
+                                )
+                                .map_err(|e| e.to_string())
+                            });
+                            if !met {
+                                add_feed_item(
+                                    &state,
+                                    "task",
+                                    &format!("Chain skipped: {} → task #{} (condition not met)", task_name, child_id),
+                                    &truncate_chars(&reason, 120),
+                                    "info",
+                                    "",
+                                );
+                            }
+                            (met, if met { format!("condition met — {}", truncate_chars(&reason, 120)) } else { String::new() })
+                        };
+                        if !proceed {
+                            continue;
+                        }
+
+                        let pending = serde_json::json!({
+                            "from": task_name,
+                            "from_id": task_id,
+                            "via": via_note,
+                            "output": full_output,
+                            "depth": next_depth,
+                        })
+                        .to_string();
+                        let updated = with_db(&state, |db| {
+                            db.execute(
+                                "UPDATE tasks SET pending_input = ?2, triggered_by = ?3, next_run = ?4, \
+                                 status = 'scheduled', updated_at = CURRENT_TIMESTAMP \
+                                 WHERE id = ?1 AND status != 'running'",
+                                params![child_id, pending, task_id.to_string(), now_str],
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                        if matches!(updated, Ok(n) if n > 0) {
+                            add_feed_item(
+                                &state,
+                                "task",
+                                &format!("Chain triggered: {} → task #{}", task_name, child_id),
+                                &truncate_chars(&reply_preview, 120),
+                                "clock",
+                                "",
+                            );
+                        }
+                    }
+                    let _ = app.emit("tasks-changed", ());
+                }
+            }
         }
 
         // ---- Feed auto-refresh ----
@@ -570,6 +760,38 @@ mod tests {
             .unwrap()
             .and_hms_opt(h, min, 0)
             .unwrap()
+    }
+
+    #[test]
+    fn parse_chain_next_handles_arrays_and_bare_ids() {
+        assert_eq!(parse_chain_next(""), Vec::<i64>::new());
+        assert_eq!(parse_chain_next("   "), Vec::<i64>::new());
+        assert_eq!(parse_chain_next("[3,7]"), vec![3, 7]);
+        assert_eq!(parse_chain_next(r#"["3","7"]"#), vec![3, 7]);
+        assert_eq!(parse_chain_next("5"), vec![5]);
+        assert_eq!(parse_chain_next("garbage"), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn parse_pending_input_extracts_context_and_provenance() {
+        let t = parse_pending_input(
+            r#"{"from":"Refresh","from_id":3,"via":"condition met — 2 unread","output":"hello","depth":2}"#,
+        );
+        assert_eq!(t.depth, 2);
+        assert_eq!(t.from_id, 3);
+        assert_eq!(t.via, "condition met — 2 unread");
+        let ctx = t.context.unwrap();
+        assert!(ctx.contains("Refresh"));
+        assert!(ctx.contains("hello"));
+
+        // Blank / invalid → no context, defaults.
+        let blank = parse_pending_input("");
+        assert!(blank.context.is_none() && blank.depth == 0 && blank.from_id == 0);
+        assert!(parse_pending_input("not json").context.is_none());
+        // Empty output yields no context but preserves depth for the loop guard.
+        let empty = parse_pending_input(r#"{"output":"","depth":4}"#);
+        assert!(empty.context.is_none());
+        assert_eq!(empty.depth, 4);
     }
 
     #[test]

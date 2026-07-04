@@ -10,19 +10,24 @@ import "./toolspanel.js";
 import "./agents.js";
 import "./memory.js";
 import "./content.js";
+import "./studio.js";
 import "./settings.js";
 
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { workspace, sidebarWorkspace, sidebarModel, newChatBtn, navSettingsBtn, ui } from "./state.js";
 import { field, projectLabel } from "./utils.js";
-import { focusTile, addTile, getTilesByType, updateSidebar, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav } from "./tilesys.js";
+import { focusTile, addTile, getTilesByType, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav } from "./tilesys.js";
 import { addChatTile } from "./chat.js";
+import { initSidebar, refreshSessionList } from "./sidebar.js";
 import { setupEventListeners } from "./events.js";
 import { isQuickAsk, bootQuickAsk } from "./quickask.js";
 
 // ==================== SIDEBAR BUTTONS ====================
-newChatBtn.addEventListener("click", () => addChatTile());
+newChatBtn.addEventListener("click", async () => {
+  await addChatTile();
+  try { refreshSessionList(); } catch {}
+});
 
 navSettingsBtn.addEventListener("click", () => {
   const existing = getTilesByType("settings");
@@ -108,7 +113,7 @@ async function bootMain() {
     await addChatTile();
   }
 
-  updateSidebar();
+  initSidebar();
 }
 
 (async () => {

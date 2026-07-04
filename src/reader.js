@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { escapeHtml, renderMarkdown } from "./utils.js";
 import { openFeedItemInChat, playTts } from "./chat.js";
+import { icon } from "./icons.js";
 
 export async function openReaderWindow(url, title) {
   if (!url) return;
@@ -47,10 +48,10 @@ export function openArticleReader(item) {
           <div class="article-reader-title">${escapeHtml(title)}</div>
         </div>
         <div class="article-reader-tools">
-          <button class="article-reader-btn article-reader-tts" data-action="tts" title="Read aloud" disabled>&#9654;</button>
-          <button class="article-reader-btn" data-action="chat">💬 Open in chat</button>
-          ${url ? `<button class="article-reader-btn" data-action="original">Original ↗</button>` : ""}
-          <button class="article-reader-btn article-reader-close" data-action="close" title="Close">✕</button>
+          <button class="article-reader-btn article-reader-tts" data-action="tts" title="Read aloud" aria-label="Read aloud" disabled>${icon("play", 12)}</button>
+          <button class="article-reader-btn" data-action="chat" aria-label="Open in chat">${icon("message-square", 12)} Open in chat</button>
+          ${url ? `<button class="article-reader-btn" data-action="original" aria-label="Open original">${icon("arrow-up-right", 12)} Original</button>` : ""}
+          <button class="article-reader-btn article-reader-close" data-action="close" title="Close" aria-label="Close">${icon("x", 12)}</button>
         </div>
       </div>
       <div class="article-reader-body" data-article-body></div>

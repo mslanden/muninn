@@ -28,7 +28,7 @@ export function renderToolsTile(tileObj, body) {
 
     list.innerHTML = "";
     if (!filtered.length) {
-      list.appendChild(emptyState({ icon: "⚙", text: query ? "No tools match your search" : "No tools" }));
+      list.appendChild(emptyState({ icon: "wrench", text: query ? "No tools match your search" : "No tools" }));
       return;
     }
 

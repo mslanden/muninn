@@ -337,6 +337,24 @@ pub(crate) fn resolve_llm_config(state: &AppState) -> Result<LlmCallConfig, Stri
             }
         });
 
+    let (is_anthropic, endpoint, api_key) = resolve_provider_wire(state, &provider)?;
+
+    Ok(LlmCallConfig {
+        provider,
+        model,
+        is_anthropic,
+        api_key,
+        endpoint,
+    })
+}
+
+/// The single source of truth mapping a provider name → (is_anthropic wire format,
+/// endpoint URL, API key). Shared by the one-shot helper path (`resolve_llm_config`) and
+/// the streaming chat/agent path (`Provider::from_provider_name`), so adding a provider in
+/// one place covers both. `minimax`/`anthropic` use the Anthropic messages wire format;
+/// every other provider uses the OpenAI chat-completions format. Returns `Err` if the
+/// matching API key is not configured.
+fn resolve_provider_wire(state: &AppState, provider: &str) -> Result<(bool, String, String), String> {
     let (api_key_opt, endpoint, is_anthropic) = if provider == "minimax" {
         let key = first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])
             .ok()
@@ -363,7 +381,7 @@ pub(crate) fn resolve_llm_config(state: &AppState) -> Result<LlmCallConfig, Stri
             .ok()
             .flatten()
             .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-        let ep = match provider.as_str() {
+        let ep = match provider {
             "openai" => "https://api.openai.com/v1/chat/completions".to_string(),
             "together" => "https://api.together.xyz/v1/chat/completions".to_string(),
             "groq" => "https://api.groq.com/openai/v1/chat/completions".to_string(),
@@ -381,15 +399,9 @@ pub(crate) fn resolve_llm_config(state: &AppState) -> Result<LlmCallConfig, Stri
 
     let api_key = api_key_opt
         .filter(|k| !k.is_empty())
-        .ok_or_else(|| "No API key configured".to_string())?;
+        .ok_or_else(|| format!("No API key configured for provider '{}'", provider))?;
 
-    Ok(LlmCallConfig {
-        provider,
-        model,
-        is_anthropic,
-        api_key,
-        endpoint,
-    })
+    Ok((is_anthropic, endpoint, api_key))
 }
 
 /// Compact an entity summary that has grown too long.
@@ -481,6 +493,93 @@ pub(crate) async fn compact_entity_summary(
     });
 
     Some(compacted)
+}
+
+/// Evaluate a chained task's natural-language gate condition against the upstream task's
+/// output. Returns `(should_proceed, reason)`. One-shot, non-streaming, deliberately cheap.
+///
+/// Fails *closed*: any API/parse error returns `(false, ...)` so an ambiguous result never
+/// fires a downstream action (which could send mail, write files, etc.). A missed run is
+/// recoverable; a spurious one may not be.
+pub(crate) async fn evaluate_chain_condition(
+    state: &AppState,
+    condition: &str,
+    upstream_output: &str,
+) -> (bool, String) {
+    let cfg = match resolve_llm_config(state) {
+        Ok(c) => c,
+        Err(e) => return (false, format!("no LLM configured: {e}")),
+    };
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
+
+    // Cap the data we send — gate decisions don't need the full payload.
+    let data = crate::tools::truncate_chars(upstream_output, 6000);
+    let prompt = format!(
+        "A scheduled automation produced the output below. Decide whether this condition is satisfied:\n\n\
+        CONDITION: {condition}\n\n\
+        OUTPUT:\n{data}\n\n\
+        Answer with exactly YES or NO on the first line, then one short sentence explaining why."
+    );
+    let system = "You are a strict gate that decides whether a condition is met by some data. \
+        Answer YES only when the condition is clearly satisfied; answer NO if it is not satisfied or you are unsure. \
+        First line must be exactly YES or NO.";
+
+    let request_body = if is_anthropic {
+        json!({
+            "model": model, "max_tokens": 150, "stream": false,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    } else {
+        json!({
+            "model": model, "max_tokens": 150, "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ]
+        })
+    };
+
+    let resp = if is_anthropic {
+        state.http.post(&endpoint)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body).send().await
+    } else {
+        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
+    };
+    let resp = match resp {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => return (false, format!("eval call failed: HTTP {}", r.status())),
+        Err(e) => return (false, format!("eval call error: {e}")),
+    };
+    let body: Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => return (false, format!("eval parse error: {e}")),
+    };
+    let text = if is_anthropic {
+        body.get("content").and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
+    } else {
+        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
+            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
+            .and_then(Value::as_str).unwrap_or("")
+    };
+    parse_condition_verdict(&crate::feeds::strip_think_tags(text))
+}
+
+/// Interpret a gate model's reply: met only on an explicit affirmative first token, so blank
+/// or garbled output fails closed (no downstream action). Returns `(met, reason)`.
+fn parse_condition_verdict(text: &str) -> (bool, String) {
+    let trimmed = text.trim();
+    let met = trimmed.to_uppercase().starts_with("YES");
+    let reason = trimmed
+        .lines()
+        .map(str::trim)
+        .rfind(|s| !s.is_empty())
+        .unwrap_or(if met { "condition met" } else { "condition not met" });
+    (met, reason.to_string())
 }
 
 /// One-shot, non-streaming LLM call that expands a short feed summary into a fuller
@@ -587,6 +686,392 @@ pub(crate) async fn generate_feed_article_text(
     Ok(article)
 }
 
+/// Per-platform copywriting guidance baked into the social-copy prompt.
+fn platform_guidance(platform: &str) -> &'static str {
+    match platform.to_lowercase().replace(['/', ' '], "").as_str() {
+        "x" | "twitter" | "xtwitter" => "≤280 characters, punchy, a strong hook in the first words, 0–2 hashtags, no filler.",
+        "linkedin" => "Professional but human. A scroll-stopping first line, 2–4 short value-packed paragraphs, a clear takeaway, 0–3 hashtags.",
+        "instagram" => "An engaging caption with a hook and light emoji, a call-to-action, then 5–10 relevant hashtags on a new line.",
+        "tiktok" => "Very short, hook-driven caption in a trend-aware voice, 2–4 hashtags.",
+        "youtube" => "A compelling video title, then a 2–3 sentence description with searchable keywords. Keep Shorts snappy.",
+        _ => "Platform-appropriate copy with a strong hook and no generic filler.",
+    }
+}
+
+/// Pull a JSON array out of a model response, tolerating code fences / stray prose.
+fn extract_json_array(text: &str) -> Option<Vec<Value>> {
+    if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(text.trim()) {
+        return Some(a);
+    }
+    let start = text.find('[')?;
+    let end = text.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<Value>(&text[start..=end])
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+}
+
+/// Generate tailored social-media post copy (3 variants per platform) in one LLM call.
+/// Returns structured per-platform variants for the Studio tile.
+pub(crate) async fn generate_social_copy(
+    state: &AppState,
+    topic: &str,
+    platforms: &[String],
+    tone: Option<&str>,
+) -> Result<Vec<crate::models::PlatformCopy>, String> {
+    if platforms.is_empty() {
+        return Err("Select at least one platform.".to_string());
+    }
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+
+    // Shared brand voice (persisted in Settings via the Studio header) + the per-request tone.
+    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
+    let mut tone_line = String::new();
+    if !brand_voice.trim().is_empty() {
+        tone_line.push_str(&format!("Brand voice (apply to all copy): {}\n", brand_voice.trim()));
+    }
+    if let Some(t) = tone.map(str::trim).filter(|t| !t.is_empty()) {
+        tone_line.push_str(&format!("Tone for this batch: {}\n", t));
+    }
+    let mut platform_specs = String::new();
+    for p in platforms {
+        platform_specs.push_str(&format!("- {}: {}\n", p, platform_guidance(p)));
+    }
+
+    let prompt = format!(
+        "Write social media post copy about this topic.\n\nTopic: {topic}\n{tone_line}\n\
+        Generate copy for these platforms, each tailored to its norms:\n{platform_specs}\n\
+        For EACH platform write 3 distinct variants that take different angles or hooks.\n\n\
+        Return ONLY valid JSON — an array where each element is \
+        {{\"platform\": \"<platform name exactly as given above>\", \"variants\": [\"variant 1\", \"variant 2\", \"variant 3\"]}}. \
+        No markdown, no code fences, no commentary — output the JSON array and nothing else."
+    );
+    let system = "You are an expert social media copywriter. You tailor copy precisely to each platform's format and audience, write scroll-stopping hooks, and never use generic filler. You output strict JSON only.";
+
+    let request_body = if is_anthropic {
+        json!({
+            "model": model, "max_tokens": 4000, "stream": false, "system": system,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    } else {
+        json!({
+            "model": model, "max_tokens": 4000, "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ]
+        })
+    };
+
+    let resp = if is_anthropic {
+        state.http.post(&endpoint)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body)
+            .send().await.map_err(|e| e.to_string())?
+    } else {
+        state.http.post(&endpoint)
+            .bearer_auth(&api_key)
+            .json(&request_body)
+            .send().await.map_err(|e| e.to_string())?
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Copy generation failed ({status}): {body}"));
+    }
+
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = if is_anthropic {
+        body.get("content")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+            .and_then(|b| b.get("text"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+    } else {
+        body.get("choices")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+    }
+    .ok_or_else(|| "Copy generation returned no text".to_string())?;
+
+    let parsed = extract_json_array(&text)
+        .ok_or_else(|| format!("Could not parse copy as JSON. Model said:\n{}", text.trim()))?;
+    let mut out = Vec::new();
+    for el in parsed {
+        let platform = el.get("platform").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let variants: Vec<String> = el
+            .get("variants")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+        if !platform.is_empty() && !variants.is_empty() {
+            out.push(crate::models::PlatformCopy { platform, variants });
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("No usable copy was generated. Model said:\n{}", text.trim()));
+    }
+    Ok(out)
+}
+
+/// Writing-section assistant: apply `instruction` to `text` (or, when `text` is empty,
+/// treat the instruction as a "write this" request). Returns the revised/written prose,
+/// honoring the persisted brand voice. One-shot, non-streaming.
+pub(crate) async fn writing_assist(
+    state: &AppState,
+    text: &str,
+    instruction: &str,
+) -> Result<String, String> {
+    if instruction.trim().is_empty() {
+        return Err("Tell me what to do (e.g. improve, shorten, continue, or write…).".to_string());
+    }
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+
+    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
+    let voice_line = if brand_voice.trim().is_empty() {
+        String::new()
+    } else {
+        format!("Write in this brand voice: {}\n\n", brand_voice.trim())
+    };
+
+    let body_block = if text.trim().is_empty() {
+        "(No existing draft — produce the text from scratch per the instruction.)".to_string()
+    } else {
+        format!("Here is the current draft:\n\"\"\"\n{}\n\"\"\"", text.trim())
+    };
+
+    let prompt = format!(
+        "{voice_line}{body_block}\n\nInstruction: {instruction}\n\n\
+        Return ONLY the resulting text (Markdown is fine). No preamble, no explanation, no quotes around it."
+    );
+    let system = "You are a sharp, versatile writing assistant and editor. You improve clarity, flow, and impact while preserving the author's intent. You return only the requested text.";
+
+    let max_tokens = resolve_max_output_tokens(state);
+    let request_body = if is_anthropic {
+        json!({"model": model, "max_tokens": max_tokens, "stream": false, "system": system,
+               "messages": [{"role": "user", "content": prompt}]})
+    } else {
+        json!({"model": model, "max_tokens": max_tokens, "stream": false,
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
+    };
+
+    let resp = if is_anthropic {
+        state.http.post(&endpoint)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body)
+            .send().await.map_err(|e| e.to_string())?
+    } else {
+        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Writing request failed ({status}): {body}"));
+    }
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let out = if is_anthropic {
+        body.get("content").and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
+    } else {
+        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
+            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
+    }
+    .ok_or_else(|| "Writing assistant returned no text".to_string())?;
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        return Err("Writing assistant returned empty text".to_string());
+    }
+    Ok(out)
+}
+
+/// Generate a social carousel/graphic as inline-styled HTML slides (one string per slide).
+/// Inline styles only — no `<style>` blocks (which would leak into the app) and no external
+/// resources — so the frontend can rasterize each slide with html2canvas reliably.
+pub(crate) async fn generate_carousel(
+    state: &AppState,
+    topic: &str,
+    slides: u32,
+    width: u32,
+    height: u32,
+) -> Result<Vec<String>, String> {
+    if topic.trim().is_empty() {
+        return Err("Describe what the graphic should say.".to_string());
+    }
+    let n = slides.clamp(1, 10);
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
+    let voice_line = if brand_voice.trim().is_empty() {
+        String::new()
+    } else {
+        format!("Brand voice / visual style to reflect: {}\n", brand_voice.trim())
+    };
+
+    let prompt = format!(
+        "Design a {n}-slide social media {kind} about:\n{topic}\n\n{voice_line}\n\
+        Return ONLY a JSON array of {n} strings — each string is the HTML for one slide.\n\
+        STRICT requirements for every slide:\n\
+        - Use ONLY inline styles (the `style` attribute). NO <style> blocks, NO class names, NO <script>, NO external images or web fonts.\n\
+        - The outermost element MUST be a single <div> sized exactly `width:{width}px;height:{height}px` with `box-sizing:border-box;overflow:hidden;` a background (a solid color or CSS gradient) and generous padding.\n\
+        - Use only system-safe fonts: -apple-system, 'Helvetica Neue', Helvetica, Arial, Georgia, sans-serif.\n\
+        - Strong visual hierarchy: a big bold headline and supporting text; high contrast; lay out with inline flexbox (style=\"display:flex;flex-direction:column;justify-content:center;...\").\n\
+        - Slide 1 is a striking cover/hook. Keep text on each slide short and punchy.\n\
+        No commentary, no code fences — just the JSON array of HTML strings.",
+        kind = if n > 1 { "carousel" } else { "graphic" }
+    );
+    let system = "You are a world-class social media graphic designer who builds striking, self-contained, inline-styled HTML cards. You never use <style> blocks, classes, scripts, or external resources. You return only a JSON array of HTML strings.";
+
+    let max_tokens = resolve_max_output_tokens(state);
+    let request_body = if is_anthropic {
+        json!({"model": model, "max_tokens": max_tokens, "stream": false, "system": system,
+               "messages": [{"role": "user", "content": prompt}]})
+    } else {
+        json!({"model": model, "max_tokens": max_tokens, "stream": false,
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
+    };
+
+    let resp = if is_anthropic {
+        state.http.post(&endpoint)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body)
+            .send().await.map_err(|e| e.to_string())?
+    } else {
+        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Carousel generation failed ({status}): {body}"));
+    }
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = if is_anthropic {
+        body.get("content").and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
+    } else {
+        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
+            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
+    }
+    .ok_or_else(|| "Carousel generation returned no text".to_string())?;
+
+    let arr = extract_json_array(&text)
+        .ok_or_else(|| format!("Could not parse slides as JSON. Model said:\n{}", text.trim()))?;
+    let slides_html: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    if slides_html.is_empty() {
+        return Err(format!("No usable slides were generated. Model said:\n{}", text.trim()));
+    }
+    Ok(slides_html)
+}
+
+/// Strip a leading/trailing Markdown code fence (```html … ```) the model may wrap output in.
+fn strip_code_fences(text: &str) -> String {
+    let t = text.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        // Drop the optional language tag on the first line, then the trailing fence.
+        let after_lang = rest.splitn(2, '\n').nth(1).unwrap_or("");
+        return after_lang.trim_end().trim_end_matches("```").trim().to_string();
+    }
+    t.to_string()
+}
+
+/// Generate a complete, self-contained HTML document (slide deck or print-ready doc) for the
+/// Studio Docs section. Honors the persisted brand voice. One-shot, non-streaming.
+pub(crate) async fn generate_doc_html(
+    state: &AppState,
+    doc_type: &str,
+    topic: &str,
+    slides: u32,
+) -> Result<String, String> {
+    if topic.trim().is_empty() {
+        return Err("Describe what the document should cover.".to_string());
+    }
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
+    let voice_line = if brand_voice.trim().is_empty() {
+        String::new()
+    } else {
+        format!("Brand voice / style to reflect: {}\n", brand_voice.trim())
+    };
+
+    let prompt = if doc_type == "slides" {
+        let n = slides.clamp(3, 20);
+        format!(
+            "Create a COMPLETE, self-contained HTML slide deck about:\n{topic}\n\n{voice_line}\n\
+            Produce about {n} slides. Requirements:\n\
+            - ONE html document with an embedded <style> block. NO external resources (no CDN links, no web fonts, no <script>).\n\
+            - Each slide is `<section class=\"slide\">…</section>`. First slide is a title slide.\n\
+            - Clean, modern, high-contrast design: large readable type, generous spacing, a consistent color theme, a subtle accent.\n\
+            - Include print CSS so each slide prints on its own landscape page: `@media print {{ .slide {{ page-break-after: always; }} }}` and size slides ~16:9.\n\
+            Return ONLY the HTML, starting with <!DOCTYPE html>. No commentary, no code fences."
+        )
+    } else {
+        format!(
+            "Create a COMPLETE, self-contained, print-ready HTML document about:\n{topic}\n\n{voice_line}\n\
+            Requirements:\n\
+            - ONE html file with an embedded <style> block. NO external resources (no CDN links, no web fonts, no <script>).\n\
+            - Clean typographic design: clear hierarchy of headings, readable body text, sensible margins, a title block.\n\
+            - Include print CSS with good page margins.\n\
+            Return ONLY the HTML, starting with <!DOCTYPE html>. No commentary, no code fences."
+        )
+    };
+    let system = "You are an expert document and presentation designer who writes clean, self-contained, print-ready HTML/CSS. You never use external resources or scripts. You return only the HTML.";
+
+    let max_tokens = resolve_max_output_tokens(state);
+    let request_body = if is_anthropic {
+        json!({"model": model, "max_tokens": max_tokens, "stream": false, "system": system,
+               "messages": [{"role": "user", "content": prompt}]})
+    } else {
+        json!({"model": model, "max_tokens": max_tokens, "stream": false,
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
+    };
+
+    let resp = if is_anthropic {
+        state.http.post(&endpoint)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body)
+            .send().await.map_err(|e| e.to_string())?
+    } else {
+        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Doc generation failed ({status}): {body}"));
+    }
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = if is_anthropic {
+        body.get("content").and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
+    } else {
+        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
+            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
+    }
+    .ok_or_else(|| "Doc generation returned no text".to_string())?;
+
+    let html = strip_code_fences(&text);
+    if !html.to_lowercase().contains("<html") && !html.to_lowercase().contains("<!doctype") {
+        return Err(format!("Model did not return HTML. It said:\n{}", html.chars().take(400).collect::<String>()));
+    }
+    Ok(html)
+}
+
 /// Backfill embeddings for entities that don't have one yet.
 /// Called once on startup to handle entities created before embeddings were added.
 pub(crate) async fn backfill_embeddings(state: &AppState) {
@@ -672,6 +1157,18 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     if enabled.contains("write_file") {
         caps.push("Write/create files (write_file)");
     }
+    if enabled.contains("edit_file") {
+        caps.push("Edit part of a file by exact-string replacement (edit_file)");
+    }
+    if enabled.contains("append_file") {
+        caps.push("Append or prepend content to a file (append_file)");
+    }
+    if enabled.contains("capture_screen") {
+        caps.push("Take a screenshot of the screen or frontmost window to see it (capture_screen)");
+    }
+    if enabled.contains("open_app") {
+        caps.push("Launch/focus a macOS app, optionally opening a URL (open_app)");
+    }
     if enabled.contains("list_files") {
         caps.push("List directory contents (list_files)");
     }
@@ -703,6 +1200,15 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     if enabled.contains("read_mail") {
         caps.push("Read the full body of a specific message by Message-ID (read_mail).");
     }
+    if enabled.contains("compose_draft") {
+        caps.push("Draft a new email (compose_draft) — saved to Drafts unsent for the user to review/send.");
+    }
+    if enabled.contains("reply_draft") {
+        caps.push("Draft a reply to a message (reply_draft) — saved to Drafts unsent.");
+    }
+    if enabled.contains("create_event") {
+        caps.push("Add an event to Apple Calendar (create_event).");
+    }
     if enabled.contains("write_todos") {
         caps.push("Maintain a plan / checklist for this turn (write_todos) — rewrite the full list each call.");
     }
@@ -731,16 +1237,18 @@ rather than stalling.",
 
     // Email tools need a short section too — explain the workflow and the read-only boundary.
     // Keep in sync with build_project_system_prompt.
-    let any_mail_tool = ["list_inbox", "search_mail", "read_mail"]
+    let any_mail_tool = ["list_inbox", "search_mail", "read_mail", "compose_draft", "reply_draft"]
         .iter()
         .any(|t| enabled.contains(*t));
     if any_mail_tool {
         prompt.push_str(
             "\n\n## Email (Apple Mail)\n\
-You can read the user's email through Apple Mail on this Mac. Access is \
-READ-ONLY — you cannot send, reply, delete, mark read, or modify anything. \
-The tools read Mail's local cache across all configured accounts (iCloud, \
-Gmail, work IMAP, etc.).\n\n\
+You can read the user's email through Apple Mail on this Mac, across all \
+configured accounts (iCloud, Gmail, work IMAP, etc.). Writing is DRAFT-ONLY: \
+compose_draft and reply_draft save an unsent message to Drafts for the user \
+to review and send — you can NEVER send, delete, mark read, or otherwise \
+modify mail. After drafting, tell the user a draft is ready in Mail; do not \
+imply it was sent.\n\n\
 Typical flow: use list_inbox for \"what's new\" questions, search_mail when \
 the user names a person or topic, then read_mail on a specific message id \
 to quote or summarize content. The `id` returned by list/search is an \
@@ -1026,6 +1534,10 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     if enabled.contains("run_command") { caps.push("Run shell commands (run_command)"); }
     if enabled.contains("read_file") { caps.push("Read files (read_file)"); }
     if enabled.contains("write_file") { caps.push("Write/create files (write_file)"); }
+    if enabled.contains("edit_file") { caps.push("Edit part of a file by exact-string replacement (edit_file)"); }
+    if enabled.contains("append_file") { caps.push("Append or prepend content to a file (append_file)"); }
+    if enabled.contains("capture_screen") { caps.push("Take a screenshot of the screen or frontmost window (capture_screen)"); }
+    if enabled.contains("open_app") { caps.push("Launch/focus a macOS app, optionally opening a URL (open_app)"); }
     if enabled.contains("list_files") { caps.push("List directory contents (list_files)"); }
     if enabled.contains("search_files") { caps.push("Search for text in files (search_files)"); }
     if enabled.contains("web_search") { caps.push("Search the web (web_search)"); }
@@ -1033,6 +1545,9 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     if enabled.contains("list_inbox") { caps.push("Read the user's Apple Mail inbox (list_inbox)"); }
     if enabled.contains("search_mail") { caps.push("Search mail by subject or sender (search_mail)"); }
     if enabled.contains("read_mail") { caps.push("Read a message by Message-ID (read_mail)"); }
+    if enabled.contains("compose_draft") { caps.push("Draft a new email, unsent (compose_draft)"); }
+    if enabled.contains("reply_draft") { caps.push("Draft a reply, unsent (reply_draft)"); }
+    if enabled.contains("create_event") { caps.push("Add an Apple Calendar event (create_event)"); }
     if enabled.contains("write_todos") { caps.push("Maintain a checklist plan (write_todos)"); }
     if enabled.contains("ask_user") && interactive { caps.push("Ask the user a clarifying question (ask_user)"); }
     if !caps.is_empty() {
@@ -1051,18 +1566,19 @@ in your output.",
     }
 
     // Keep this block in sync with build_system_prompt_with_context.
-    let any_mail_tool = ["list_inbox", "search_mail", "read_mail"]
+    let any_mail_tool = ["list_inbox", "search_mail", "read_mail", "compose_draft", "reply_draft"]
         .iter()
         .any(|t| enabled.contains(*t));
     if any_mail_tool {
         prompt.push_str(
             "\n\n## Email (Apple Mail)\n\
-Read-only access to the user's Apple Mail across all configured accounts. \
-Cannot send, reply, delete, or modify. Workflow: list_inbox for recent mail, \
-search_mail for a person/topic (Subject+From only, not body), read_mail with \
-the opaque handle from list/search. Handles are session-local (Mail restart \
-invalidates them — re-list to refresh). First call may trigger a macOS \
-Automation prompt.",
+Read + draft-only access to the user's Apple Mail across all configured accounts. \
+Reading: list_inbox for recent mail, search_mail for a person/topic (Subject+From \
+only, not body), read_mail with the opaque handle from list/search (handles are \
+session-local — re-list if Mail restarted). Writing is DRAFT-ONLY: compose_draft \
+and reply_draft save unsent messages to Drafts for the user to review and send — \
+you can never send, delete, or modify mail. Don't imply a draft was sent. First \
+call may trigger a macOS Automation prompt.",
         );
     }
 
@@ -1138,10 +1654,14 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("read_file") {
         defs.push((
             "read_file",
-            "Read a file within workspace.",
+            "Read a file within the workspace. Optionally pass start_line and/or end_line (1-based, inclusive) to read only a slice of a large file; when a range is given each line is prefixed with its line number.",
             json!({
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "description": "First line to read (1-based, inclusive). Omit to start at the top."},
+                    "end_line": {"type": "integer", "description": "Last line to read (1-based, inclusive). Omit to read to the end."}
+                },
                 "required": ["path"]
             }),
         ));
@@ -1149,7 +1669,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("write_file") {
         defs.push((
             "write_file",
-            "Write content to a file within workspace.",
+            "Write content to a file within workspace (creates or fully overwrites it). To change part of an existing file, prefer edit_file — it is far more token-efficient than rewriting the whole file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1157,6 +1677,63 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "content": {"type": "string"}
                 },
                 "required": ["path", "content"]
+            }),
+        ));
+    }
+    if enabled.contains("edit_file") {
+        defs.push((
+            "edit_file",
+            "Edit an existing file by replacing an exact substring. `old_string` must match the file content exactly (including whitespace/indentation) and, unless `replace_all` is true, must be unique in the file — include enough surrounding context to disambiguate. Use this instead of write_file for changes to part of a file.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string", "description": "Exact text to find. Must be unique unless replace_all is true."},
+                    "new_string": {"type": "string", "description": "Replacement text. Empty string deletes the matched text."},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring a unique match. Defaults to false."}
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+        ));
+    }
+    if enabled.contains("append_file") {
+        defs.push((
+            "append_file",
+            "Append `content` to the end of a file (creates it if missing). Ideal for building a large file section-by-section without re-sending the whole thing. Set `prepend` true to add to the start instead. Content is inserted verbatim — include any leading/trailing newlines you need.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "prepend": {"type": "boolean", "description": "Insert at the start of the file instead of the end. Defaults to false (append)."}
+                },
+                "required": ["path", "content"]
+            }),
+        ));
+    }
+    if enabled.contains("capture_screen") {
+        defs.push((
+            "capture_screen",
+            "Take a screenshot so you can SEE the user's screen — use this to debug how an app or web page looks. `mode` is \"screen\" (whole display, default) or \"window\" (the frontmost window). To inspect a specific app or URL, call open_app first to bring it to the front, then capture_screen with mode \"window\". The screenshot is returned to you as an image you can read directly.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["screen", "window"], "description": "\"screen\" = whole display (default); \"window\" = the frontmost window."}
+                }
+            }),
+        ));
+    }
+    if enabled.contains("open_app") {
+        defs.push((
+            "open_app",
+            "Launch or focus a macOS app and bring it to the front, optionally opening a URL or file in it. Use the app's exact name (e.g. \"Safari\", \"Google Chrome\", \"Preview\"). Pair with capture_screen mode \"window\" to look at what you opened.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "app": {"type": "string", "description": "Exact app name, e.g. \"Safari\" or \"Google Chrome\"."},
+                    "url": {"type": "string", "description": "Optional URL or file path to open in the app."}
+                },
+                "required": ["app"]
             }),
         ));
     }
@@ -1268,6 +1845,113 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
             }),
         ));
     }
+    if enabled.contains("git_status") {
+        defs.push((
+            "git_status",
+            "Show the git status of the workspace: current branch, the last commit, and the list of changed/staged/untracked files (porcelain XY codes). Use to see what has changed before diffing or committing. Read-only.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ));
+    }
+    if enabled.contains("git_diff") {
+        defs.push((
+            "git_diff",
+            "Show a git diff of the workspace. By default shows unstaged working-tree changes. Set staged=true for the staged diff, or pass commit (a ref or range like 'HEAD~3' or 'abc..def') to diff against/between commits. Restrict to one file with path. Read-only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional file (or directory) to limit the diff to."},
+                    "staged": {"type": "boolean", "description": "Diff staged changes (git diff --staged) instead of the working tree. Default false."},
+                    "commit": {"type": "string", "description": "Optional ref or range, e.g. 'HEAD~3', 'main', or 'abc123..def456'. Validated against a conservative character set."}
+                }
+            }),
+        ));
+    }
+    if enabled.contains("git_log") {
+        defs.push((
+            "git_log",
+            "Show recent commit history (one line per commit, with ref decorations). Read-only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "How many commits to show (default 10, max 100)."},
+                    "path": {"type": "string", "description": "Optional file/directory to show history for."}
+                }
+            }),
+        ));
+    }
+    if enabled.contains("git_commit") {
+        defs.push((
+            "git_commit",
+            "Commit changes in the workspace with the given message. If paths are supplied, only those files are staged and committed; otherwise all tracked modified files are committed (untracked files are never added). Never pushes. Use git_status/git_diff first to review what you're committing.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Commit message."},
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional specific files to stage and commit. Omit to commit all tracked changes."}
+                },
+                "required": ["message"]
+            }),
+        ));
+    }
+    if enabled.contains("code_outline") {
+        defs.push((
+            "code_outline",
+            "List the top-level declarations (functions, classes, structs, enums, traits, types, etc.) with their line numbers for a source file, or for every source file in a directory. Fast way to understand a file's structure or navigate a codebase before reading in detail. Supports Rust, JS/TS, Python, and Go.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "A source file or a directory to scan."}
+                },
+                "required": ["path"]
+            }),
+        ));
+    }
+    if enabled.contains("find_references") {
+        defs.push((
+            "find_references",
+            "Find where a symbol (function, variable, type name) is used across the workspace, as whole-word matches with 2 lines of surrounding context. Use to trace how something is used before changing it. The symbol is matched literally (not a regex).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "The exact identifier to search for."},
+                    "path": {"type": "string", "description": "Optional subdirectory to limit the search to."}
+                },
+                "required": ["symbol"]
+            }),
+        ));
+    }
+    if enabled.contains("http_request") {
+        defs.push((
+            "http_request",
+            "Make an HTTP request to a public URL and return the status, content-type, and response body (truncated). Supports GET/POST/PUT/PATCH/DELETE/HEAD, custom headers, and a request body — use for testing/debugging APIs. Only http(s) to public hosts is allowed (localhost, private, and metadata addresses are blocked).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The http(s) URL to request."},
+                    "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"], "description": "HTTP method (default GET)."},
+                    "headers": {"type": "object", "description": "Optional request headers as a string→string map.", "additionalProperties": {"type": "string"}},
+                    "body": {"type": "string", "description": "Optional request body (sent verbatim)."}
+                },
+                "required": ["url"]
+            }),
+        ));
+    }
+    if enabled.contains("run_tests") {
+        defs.push((
+            "run_tests",
+            "Run the project's test suite and return the output and exit status. Auto-detects the project type in the target directory: Cargo.toml → cargo test, package.json → npm test, pyproject.toml/pytest.ini/setup.py → pytest. Optionally filter to a subset of tests. 5-minute timeout.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "filter": {"type": "string", "description": "Optional test name filter (passed to cargo test <filter>, npm test -- <filter>, or pytest -k <filter>)."},
+                    "path": {"type": "string", "description": "Optional subdirectory containing the project to test. Defaults to the workspace root."}
+                }
+            }),
+        ));
+    }
     if enabled.contains("create_task") {
         defs.push((
             "create_task",
@@ -1278,7 +1962,9 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "name": {"type": "string", "description": "Short label for the UI / feed (not sent to the LLM at run time)."},
                     "description": {"type": "string", "description": "The prompt sent to future-Muninn when this task fires. Imperative voice, specific enough to act on without clarification — e.g. 'Fetch today's weather for Cupertino and post a one-line summary to the feed', not 'weather check'."},
                     "schedule": {"type": "string", "description": "Recurrence string: 'every 30m', 'daily at 09:00', 'every friday at 17:00', 'hourly'. Omit for a one-shot run."},
-                    "next_run": {"type": "string", "description": "ISO timestamp for first run (YYYY-MM-DDTHH:MM:SS). Optional; computed from schedule if omitted."}
+                    "next_run": {"type": "string", "description": "ISO timestamp for first run (YYYY-MM-DDTHH:MM:SS). Optional; computed from schedule if omitted."},
+                    "chain_next": {"type": "array", "items": {"type": "integer"}, "description": "Optional task ids to run after this one finishes successfully. Each downstream task fires on the next scheduler tick with this task's full output prepended to its prompt. Build workflows by creating the downstream tasks first (no schedule), then referencing their ids here."},
+                    "conditions": {"type": "string", "description": "Optional natural-language gate. When this task is fired by an upstream task in a chain, it runs only if this condition holds for the upstream output — e.g. 'only if there are unread emails'. Ignored for the task's own scheduled runs."}
                 },
                 "required": ["name", "description"]
             }),
@@ -1308,6 +1994,8 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "description": {"type": "string"},
                     "schedule": {"type": "string"},
                     "next_run": {"type": "string"},
+                    "chain_next": {"type": "array", "items": {"type": "integer"}, "description": "Task ids to run after this one succeeds (replaces the existing chain). Pass an empty array to clear."},
+                    "conditions": {"type": "string", "description": "Natural-language gate for chain-triggered runs (replaces existing). Pass an empty string to clear."},
                     "status": {"type": "string", "description": "scheduled, running, or completed"}
                 },
                 "required": ["id"]
@@ -1367,6 +2055,54 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "id": {"type": "string", "description": "Opaque handle string as returned by list_inbox or search_mail. Treat as a black box — copy it verbatim. Do NOT construct one yourself or use a raw Message-ID here."}
                 },
                 "required": ["id"]
+            }),
+        ));
+    }
+    if enabled.contains("compose_draft") {
+        defs.push((
+            "compose_draft",
+            "Create an UNSENT draft email in Apple Mail. The draft is saved to Drafts for the user to review and send manually — nothing is sent automatically. Use when the user asks you to write/draft an email or when a task should prepare a message for their approval. Do NOT claim the email was sent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Recipient email address(es), comma- or semicolon-separated."},
+                    "subject": {"type": "string", "description": "Subject line."},
+                    "body": {"type": "string", "description": "Plain-text body. Newlines are preserved."},
+                    "cc": {"type": "string", "description": "Optional CC address(es), comma- or semicolon-separated."}
+                },
+                "required": ["to", "body"]
+            }),
+        ));
+    }
+    if enabled.contains("reply_draft") {
+        defs.push((
+            "reply_draft",
+            "Create an UNSENT draft reply to a specific message, addressed to its original sender with a 'Re:' subject, saved to Drafts. Pass the opaque `id` handle from list_inbox/search_mail. Nothing is sent — the user reviews and sends. Read the original with read_mail first if you need its content to write a relevant reply.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Opaque message handle from list_inbox or search_mail."},
+                    "body": {"type": "string", "description": "Plain-text reply body. Newlines preserved."}
+                },
+                "required": ["id", "body"]
+            }),
+        ));
+    }
+    if enabled.contains("create_event") {
+        defs.push((
+            "create_event",
+            "Add an event to the user's Apple Calendar. `start`/`end` are ISO datetimes in local time (YYYY-MM-DDTHH:MM:SS). Use when the user asks to schedule something, or in a task chain to add a detected meeting. The event is created directly (reversible — the user can delete it).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Event title / summary."},
+                    "start": {"type": "string", "description": "Start datetime, ISO local time (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)."},
+                    "end": {"type": "string", "description": "End datetime, ISO local time. Must be after start."},
+                    "calendar": {"type": "string", "description": "Optional calendar name. Defaults to the first calendar if omitted."},
+                    "location": {"type": "string", "description": "Optional location."},
+                    "notes": {"type": "string", "description": "Optional notes/description."}
+                },
+                "required": ["title", "start", "end"]
             }),
         ));
     }
@@ -1507,6 +2243,20 @@ impl Provider {
         Ok(Self::Anthropic { endpoint, api_key })
     }
 
+    /// Build a Provider for any configured provider name, routing through the shared
+    /// `resolve_provider_wire` table. `minimax`/`anthropic` → Anthropic wire format with
+    /// their respective endpoints; everything else → OpenAI chat-completions format with
+    /// the provider's endpoint + key. This is what makes a non-default `llm/provider`
+    /// setting actually take effect on the streaming chat/agent path.
+    fn from_provider_name(state: &AppState, provider: &str) -> Result<Self, String> {
+        let (is_anthropic, endpoint, api_key) = resolve_provider_wire(state, provider)?;
+        if is_anthropic {
+            Ok(Self::Anthropic { endpoint, api_key })
+        } else {
+            Ok(Self::OpenAi { endpoint, api_key })
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             Self::OpenAi { .. } => "OpenAI",
@@ -1555,18 +2305,19 @@ impl Provider {
         }
     }
 
-    fn build_request(&self, model: &str, system_prompt: &str, messages: &[Value], tools: &[Value]) -> Value {
+    fn build_request(&self, model: &str, system_prompt: &str, messages: &[Value], tools: &[Value], max_tokens: u64) -> Value {
         match self {
             Self::OpenAi { .. } => json!({
                 "model": model,
                 "messages": messages,
                 "tools": tools,
                 "tool_choice": "auto",
+                "max_tokens": max_tokens,
                 "stream": true
             }),
             Self::Anthropic { .. } => json!({
                 "model": model,
-                "max_tokens": 4096,
+                "max_tokens": max_tokens,
                 "system": system_prompt,
                 "messages": messages,
                 "tools": tools,
@@ -1788,6 +2539,34 @@ impl Provider {
         }
     }
 
+    /// Like `push_tool_result`, but also attaches captured images so a vision model can see
+    /// them. For Anthropic the images ride as sibling blocks in the same user turn as the
+    /// tool_result (a well-supported shape); OpenAI tool messages are text-only, so the
+    /// images are dropped there with the text result kept.
+    fn push_tool_result_with_images(
+        &self,
+        messages: &mut Vec<Value>,
+        call_id: &str,
+        output: &str,
+        images: &[(String, String)],
+    ) {
+        match self {
+            Self::OpenAi { .. } => {
+                messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
+            }
+            Self::Anthropic { .. } => {
+                let mut content = vec![json!({"type": "tool_result", "tool_use_id": call_id, "content": output})];
+                for (media_type, data) in images {
+                    content.push(json!({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data}
+                    }));
+                }
+                messages.push(json!({"role": "user", "content": content}));
+            }
+        }
+    }
+
     /// Append a plain assistant-text + user-text round (used by the fenced-code-block
     /// tool fallback, which has no tool_use ids).
     fn push_text_round(&self, messages: &mut Vec<Value>, assistant_text: &str, user_text: &str) {
@@ -1889,6 +2668,42 @@ fn emit_tool_round_progress(app: &AppHandle, session_id: &str, tool_round: u32) 
     }
 }
 
+/// Per-response output-token ceiling for the streaming chat/agent loop. This caps the
+/// *entire* assistant turn — visible text plus any tool-call argument JSON — so a value
+/// that's too small silently truncates large `write_file` / `run_command` payloads
+/// mid-tool-use (the stream stops with `max_tokens` and the accumulated argument JSON is
+/// left unterminated). Defaults to MiniMax 3.0's max output; override per-deployment with
+/// the `llm/max_tokens` app setting.
+fn resolve_max_output_tokens(state: &AppState) -> u64 {
+    get_app_setting_value(state, "llm/max_tokens")
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(40960)
+}
+
+/// Rough token estimate (~4 chars/token) for the exact request being sent: the system
+/// prompt plus the serialized message array, which includes every hidden tool_use /
+/// tool_result round. Used to drive the context bar when the provider's stream doesn't
+/// report `usage` (MiniMax's Anthropic-compatible endpoint often omits it) — far closer
+/// to the truth than the frontend's fallback, which counts only visible chat bubbles.
+fn estimate_request_tokens(system_prompt: &str, messages: &[Value]) -> u64 {
+    let messages_chars: usize = messages.iter().map(|m| m.to_string().len()).sum();
+    ((system_prompt.len() + messages_chars) / 4) as u64
+}
+
+/// Take and clear any images `capture_screen` stashed for this session during the current
+/// tool call (returns (media_type, base64) pairs). See `AppState::captured_images`.
+fn drain_captured_images(state: &AppState, session_id: &str) -> Vec<(String, String)> {
+    state
+        .captured_images
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(session_id))
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_tool_loop(
     app: &AppHandle,
@@ -1908,6 +2723,7 @@ async fn run_tool_loop(
     // resilient — a broken server contributes nothing rather than failing the turn).
     tools.extend(provider.mcp_tools_json(&state.mcp.connected_tools(state).await));
     let mut messages = provider.initial_messages(system_prompt, history);
+    let max_tokens = resolve_max_output_tokens(state);
     let mut tool_round: u32 = 0;
     let mut iteration: i64 = 0;
 
@@ -1928,7 +2744,7 @@ async fn run_tool_loop(
             });
         }
 
-        let request_body = provider.build_request(model, system_prompt, &messages, &tools);
+        let request_body = provider.build_request(model, system_prompt, &messages, &tools, max_tokens);
         let response = provider.send(&state.http, &request_body).await?;
         let outcome = provider
             .parse_stream(response, |t| {
@@ -1938,6 +2754,28 @@ async fn run_tool_loop(
                 });
             })
             .await?;
+
+        // Update the context bar every round so it tracks the live conversation size
+        // (system prompt + full tool history), not just the final turn. Prefer the
+        // provider's reported usage; fall back to an estimate of the exact request we
+        // just sent when the stream omits `usage` (e.g. MiniMax's Anthropic endpoint).
+        {
+            let input_tokens = if outcome.usage_input > 0 {
+                outcome.usage_input
+            } else {
+                estimate_request_tokens(system_prompt, &messages)
+            };
+            let output_tokens = if outcome.usage_output > 0 {
+                outcome.usage_output
+            } else {
+                (outcome.text.len() / 4) as u64
+            };
+            let _ = app.emit("chat-usage", ChatUsageEvent {
+                session_id: session_id.to_string(),
+                input_tokens,
+                output_tokens,
+            });
+        }
 
         if !outcome.tool_calls.is_empty() {
             provider.push_assistant_tool_turn(&mut messages, &outcome.text, &outcome.tool_calls);
@@ -1956,17 +2794,47 @@ async fn run_tool_loop(
 
             let mut tool_result_blocks: Vec<Value> = Vec::new();
             for call in &outcome.tool_calls {
-                let args_json: Value = serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
-                let output = execute_and_log_tool_call(
-                    app, state, session_id, exec_tools, &call.name, &args_json, &call.args, scope, interactive,
-                )
-                .await;
-                provider.push_tool_result(&mut messages, &call.id, &output);
-                tool_result_blocks.push(json!({
-                    "type": "tool_result",
-                    "tool_use_id": call.id,
-                    "content": output,
-                }));
+                let output = match serde_json::from_str::<Value>(&call.args) {
+                    Ok(args_json) => {
+                        execute_and_log_tool_call(
+                            app, state, session_id, exec_tools, &call.name, &args_json, &call.args, scope, interactive,
+                        )
+                        .await
+                    }
+                    // Unparseable argument JSON almost always means the response hit the
+                    // output-token ceiling mid tool_use, leaving the accumulated JSON
+                    // unterminated. Feed back an honest, actionable error instead of
+                    // silently calling the tool with `{}` (which surfaces as a misleading
+                    // "missing path"/"missing command" and sends the model chasing a
+                    // phantom parameter bug).
+                    Err(e) => format!(
+                        "ERROR: tool '{}' arguments were not valid JSON ({}). They were most \
+                         likely truncated because the response reached the {}-token output \
+                         limit. Retry with shorter content — e.g. write the file in smaller \
+                         chunks, or raise the limit via the llm/max_tokens setting.",
+                        call.name, e, max_tokens
+                    ),
+                };
+                // A tool (capture_screen) may have produced images to show the model. Attach
+                // them as sibling image blocks in the tool_result turn so the vision model
+                // sees them this turn; persist only a text placeholder so reloaded history
+                // doesn't carry the (large) base64 forever.
+                let images = drain_captured_images(state, session_id);
+                if images.is_empty() {
+                    provider.push_tool_result(&mut messages, &call.id, &output);
+                    tool_result_blocks.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": output,
+                    }));
+                } else {
+                    provider.push_tool_result_with_images(&mut messages, &call.id, &output, &images);
+                    tool_result_blocks.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": format!("{} [{} screenshot(s) shown to the model]", output, images.len()),
+                    }));
+                }
             }
             let _ = insert_message(
                 state,
@@ -2020,13 +2888,8 @@ async fn run_tool_loop(
             continue;
         }
 
-        if outcome.usage_input > 0 || outcome.usage_output > 0 {
-            let _ = app.emit("chat-usage", ChatUsageEvent {
-                session_id: session_id.to_string(),
-                input_tokens: outcome.usage_input,
-                output_tokens: outcome.usage_output,
-            });
-        }
+        // chat-usage for this final round was already emitted above, right after the
+        // response was parsed — no need to repeat it here.
         let _ = app.emit("chat-done", ChatDoneEvent { session_id: session_id.to_string() });
         let final_blocks = vec![json!({"type": "text", "text": text_content.clone()})];
         return Ok((text_content, final_blocks));
@@ -2062,6 +2925,30 @@ pub(crate) async fn chat_with_minimax_anthropic(
     interactive: bool,
 ) -> Result<(String, Vec<Value>), String> {
     let provider = Provider::minimax_anthropic(state)?;
+    let enabled_tools = enabled_tool_ids(state)?;
+    let system_prompt = resolve_chat_system_prompt(state, history, scope, interactive).await;
+    run_tool_loop(
+        app, state, session_id, &provider, model, &system_prompt,
+        history, &enabled_tools, scope, interactive, None,
+    )
+    .await
+}
+
+/// Chat via whatever provider `provider_name` resolves to (the configured `llm/provider`).
+/// Used for any provider other than the MiniMax/OpenAI fast paths — routes through the
+/// shared `resolve_provider_wire` table so groq/deepseek/anthropic/etc. actually work.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn chat_dynamic(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    provider_name: &str,
+    model: &str,
+    history: &[HistoryMessage],
+    scope: Option<&WorkspaceScope>,
+    interactive: bool,
+) -> Result<(String, Vec<Value>), String> {
+    let provider = Provider::from_provider_name(state, provider_name)?;
     let enabled_tools = enabled_tool_ids(state)?;
     let system_prompt = resolve_chat_system_prompt(state, history, scope, interactive).await;
     run_tool_loop(
@@ -2141,12 +3028,10 @@ pub(crate) async fn run_agent(
             }
         });
 
-    let is_anthropic =
-        provider_name == "minimax" || provider_name == "anthropic" || model.starts_with("MiniMax-");
-    let provider = if is_anthropic {
+    let provider = if provider_name == "minimax" || model.starts_with("MiniMax-") {
         Provider::minimax_anthropic(state)?
     } else {
-        Provider::openai(state)?
+        Provider::from_provider_name(state, &provider_name)?
     };
 
     // Custom agents are user-invoked via slash commands — always interactive, and not
@@ -2209,12 +3094,10 @@ pub(crate) async fn run_project_init(
             }
         });
 
-    let is_anthropic =
-        provider_name == "minimax" || provider_name == "anthropic" || model.starts_with("MiniMax-");
-    let provider = if is_anthropic {
+    let provider = if provider_name == "minimax" || model.starts_with("MiniMax-") {
         Provider::minimax_anthropic(state)?
     } else {
-        Provider::openai(state)?
+        Provider::from_provider_name(state, &provider_name)?
     };
 
     let history = vec![HistoryMessage::text("user", &prompt)];
@@ -2856,6 +3739,22 @@ mod tests {
 
     fn mag(v: &[f32]) -> f32 {
         v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    }
+
+    #[test]
+    fn condition_verdict_is_affirmative_only_and_fails_closed() {
+        assert!(parse_condition_verdict("YES\nThere are 3 unread emails.").0);
+        assert!(parse_condition_verdict("yes").0);
+        assert!(!parse_condition_verdict("NO\nInbox is empty.").0);
+        // Anything non-affirmative or empty must not fire.
+        assert!(!parse_condition_verdict("").0);
+        assert!(!parse_condition_verdict("I'm not sure").0);
+        assert!(!parse_condition_verdict("Maybe, it depends").0);
+        // Reason is the last non-empty line.
+        assert_eq!(parse_condition_verdict("YES\nfound 2 items").1, "found 2 items");
+        // Single-line replies use that line as the reason; blank input uses the fallback.
+        assert_eq!(parse_condition_verdict("NO").1, "NO");
+        assert_eq!(parse_condition_verdict("").1, "condition not met");
     }
 
     #[test]

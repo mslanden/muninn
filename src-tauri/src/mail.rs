@@ -1,9 +1,10 @@
-//! Apple Mail (Mail.app) read-only access via AppleScript / `osascript`.
+//! Apple Mail (Mail.app) access via AppleScript / `osascript`.
 //!
-//! Three entry points — `list_inbox`, `search_mail`, `read_mail` — are called
-//! from `tools::execute_agent_tool`. All output is returned as JSON strings so
-//! the LLM gets structured data. Message IDs are the RFC822 `Message-ID`
-//! header (globally stable), not Mail's internal scriptable id.
+//! Read entry points — `list_inbox`, `search_mail`, `read_mail` — plus draft-only
+//! write entry points — `compose_draft`, `reply_draft` — are called from
+//! `tools::execute_agent_tool`. All output is returned as JSON strings so the LLM
+//! gets structured data. Message IDs are the RFC822 `Message-ID` header (globally
+//! stable), not Mail's internal scriptable id.
 //!
 //! Dates are emitted as locale-independent ISO-8601 local time:
 //! `YYYY-MM-DDTHH:MM:SS` (no timezone suffix — these are in the user's local
@@ -16,9 +17,10 @@
 //! with error code -1743 — we map that to a human-readable message telling
 //! the user where to grant access.
 //!
-//! This module intentionally does nothing that writes to Mail: no compose, no
-//! send, no delete, no flag changes. Adding those later should be guarded by
-//! the dangerous-command approval flow.
+//! Writes are DRAFT-ONLY by design: `compose_draft` / `reply_draft` save unsent
+//! messages to the Drafts mailbox for the user to review and send manually. There
+//! is intentionally no send, delete, or flag-change path — nothing leaves the Mac
+//! without an explicit human action in Mail.app.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
@@ -61,7 +63,7 @@ fn decode_handle(handle: &str) -> Result<(String, String, i64), String> {
 /// The `pad2` handler + ISO-formatting snippet that every script below reuses.
 /// Placed at the top of the script so `my pad2(...)` works from inside
 /// `tell application "Mail"` blocks.
-const APPLESCRIPT_HELPERS: &str = r#"on pad2(n)
+pub(crate) const APPLESCRIPT_HELPERS: &str = r#"on pad2(n)
     set s to (n as integer) as string
     if length of s < 2 then return "0" & s
     return s
@@ -74,7 +76,7 @@ end isoDate
 
 /// Run an AppleScript snippet via `osascript -e` and return stdout on success.
 /// Maps the common Automation-denied error to a user-actionable message.
-fn run_applescript(script: &str) -> Result<String, String> {
+pub(crate) fn run_applescript(script: &str) -> Result<String, String> {
     let output = Command::new("osascript")
         .arg("-e")
         .arg(script)
@@ -89,9 +91,9 @@ fn run_applescript(script: &str) -> Result<String, String> {
             || stderr.contains("doesn't have permission")
         {
             return Err(
-                "Muninn needs Automation permission for Mail. Open \
+                "Muninn needs Automation permission for the target app (Mail/Calendar). Open \
                  System Settings → Privacy & Security → Automation, find Muninn, \
-                 and enable the Mail checkbox, then retry."
+                 and enable the relevant checkbox, then retry."
                     .to_string(),
             );
         }
@@ -102,7 +104,7 @@ fn run_applescript(script: &str) -> Result<String, String> {
 
 /// Escape a user string so it can be safely interpolated into an AppleScript
 /// double-quoted literal. Strips controls that would corrupt our TSV output.
-fn escape_as_string(s: &str) -> String {
+pub(crate) fn escape_as_string(s: &str) -> String {
     s.replace('\\', r"\\")
         .replace('"', "\\\"")
         .replace('\n', " ")
@@ -112,13 +114,13 @@ fn escape_as_string(s: &str) -> String {
 
 /// Parsed ISO date components used to build an AppleScript date literal.
 #[derive(Debug, Clone, Copy)]
-struct DateParts {
-    year: i32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
+pub(crate) struct DateParts {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
 }
 
 /// Parse a user-supplied ISO date. Accepts:
@@ -127,7 +129,7 @@ struct DateParts {
 /// - `YYYY-MM-DDTHH:MM:SS`
 /// `T` may also be a space. Timezone suffixes are ignored — dates are
 /// interpreted in the user's local timezone.
-fn parse_iso(s: &str) -> Result<DateParts, String> {
+pub(crate) fn parse_iso(s: &str) -> Result<DateParts, String> {
     let s = s.trim();
     let (date_part, time_part) = match s
         .find(|c: char| c == 'T' || c == 't' || c == ' ')
@@ -199,7 +201,7 @@ fn parse_iso(s: &str) -> Result<DateParts, String> {
 }
 
 /// Emit AppleScript that binds `varName` to a date built from `parts`.
-fn applescript_date_literal(var_name: &str, parts: DateParts) -> String {
+pub(crate) fn applescript_date_literal(var_name: &str, parts: DateParts) -> String {
     format!(
         r#"set {var} to current date
 set year of {var} to {y}
@@ -496,4 +498,176 @@ end tell"#,
     Ok(format!(
         "{truncated}\n\n... [body truncated — {total} chars total, showing first {MAX_CHARS}]"
     ))
+}
+
+// ---- Write actions (draft-only — nothing is ever sent automatically) ----
+
+/// Build an AppleScript string *expression* from possibly-multiline text, preserving
+/// line breaks via `& linefeed &`. Returns `""` for empty input. The result is NOT
+/// wrapped by the caller — it already includes its own quotes.
+fn applescript_multiline(s: &str) -> String {
+    if s.is_empty() {
+        return "\"\"".to_string();
+    }
+    let escaped = s.replace('\\', r"\\").replace('"', "\\\"");
+    escaped
+        .split('\n')
+        .map(|line| format!("\"{}\"", line.trim_end_matches('\r')))
+        .collect::<Vec<_>>()
+        .join(" & linefeed & ")
+}
+
+/// A single-line AppleScript string literal (quoted, controls stripped).
+fn applescript_quoted(s: &str) -> String {
+    format!("\"{}\"", escape_as_string(s))
+}
+
+/// Split a recipient field on commas/semicolons into individual addresses.
+fn split_recipients(raw: &str) -> Vec<String> {
+    raw.split([',', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Emit the AppleScript that adds `to`/`cc` recipients to the outgoing message bound
+/// to `newMsg`. Each address becomes a `make new ... recipient` line.
+fn recipient_lines(to: &[String], cc: &[String]) -> String {
+    let mut out = String::new();
+    for addr in to {
+        out.push_str(&format!(
+            "        make new to recipient at end of to recipients with properties {{address:{}}}\n",
+            applescript_quoted(addr)
+        ));
+    }
+    for addr in cc {
+        out.push_str(&format!(
+            "        make new cc recipient at end of cc recipients with properties {{address:{}}}\n",
+            applescript_quoted(addr)
+        ));
+    }
+    out
+}
+
+/// Create an unsent draft in Apple Mail. Nothing is sent — the message is saved to the
+/// Drafts mailbox for the user to review and send manually.
+pub(crate) fn compose_draft(
+    to: &str,
+    subject: &str,
+    body: &str,
+    cc: Option<&str>,
+) -> Result<String, String> {
+    let to_list = split_recipients(to);
+    if to_list.is_empty() {
+        return Err("compose_draft needs at least one `to` recipient".to_string());
+    }
+    let cc_list = cc.map(split_recipients).unwrap_or_default();
+
+    let script = format!(
+        r#"tell application "Mail"
+    set newMsg to make new outgoing message with properties {{subject:{subj}, content:{content}, visible:false}}
+    tell newMsg
+{recipients}    end tell
+    save newMsg
+end tell
+return "ok""#,
+        subj = applescript_quoted(subject),
+        content = applescript_multiline(body),
+        recipients = recipient_lines(&to_list, &cc_list),
+    );
+
+    run_applescript(&script)?;
+    Ok(json!({
+        "ok": true,
+        "action": "draft_created",
+        "to": to_list,
+        "cc": cc_list,
+        "subject": subject,
+        "note": "Draft saved to Mail's Drafts. Nothing was sent — the user reviews and sends it.",
+    })
+    .to_string())
+}
+
+/// Create a draft reply to an existing message (identified by its `list_inbox` /
+/// `search_mail` handle). The draft is addressed to the original sender with a
+/// `Re:`-prefixed subject and saved to Drafts — never sent.
+pub(crate) fn reply_draft(handle: &str, body: &str) -> Result<String, String> {
+    if handle.trim().is_empty() {
+        return Err("handle is empty".to_string());
+    }
+    let (account, mailbox, int_id) = decode_handle(handle.trim())?;
+    let account_esc = escape_as_string(&account);
+    let mailbox_esc = escape_as_string(&mailbox);
+
+    let script = format!(
+        r#"tell application "Mail"
+    set found to missing value
+    try
+        set targetAcct to account "{acct}"
+        set targetMb to mailbox "{mbox}" of targetAcct
+        set found to (first message of targetMb whose id is {iid})
+    end try
+    if found is missing value then return "__MUNINN_NOT_FOUND__"
+    set origSender to sender of found
+    set replyAddr to origSender
+    try
+        set replyAddr to extract address from origSender
+    end try
+    set origSubject to subject of found
+    set replySubject to origSubject
+    if replySubject does not start with "Re:" then set replySubject to "Re: " & origSubject
+    set newMsg to make new outgoing message with properties {{subject:replySubject, content:{content}, visible:false}}
+    tell newMsg
+        make new to recipient at end of to recipients with properties {{address:replyAddr}}
+    end tell
+    save newMsg
+end tell
+return "ok""#,
+        acct = account_esc,
+        mbox = mailbox_esc,
+        iid = int_id,
+        content = applescript_multiline(body),
+    );
+
+    let raw = run_applescript(&script)?;
+    if raw.trim() == "__MUNINN_NOT_FOUND__" {
+        return Err(format!(
+            "Message not found at {account}/{mailbox}#{int_id}. Mail.app may have restarted \
+             since the handle was issued. Call list_inbox or search_mail again for a fresh handle."
+        ));
+    }
+    Ok(json!({
+        "ok": true,
+        "action": "reply_draft_created",
+        "note": "Reply draft saved to Mail's Drafts, addressed to the original sender. Nothing was sent.",
+    })
+    .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiline_preserves_newlines_and_escapes_quotes() {
+        assert_eq!(applescript_multiline(""), "\"\"");
+        assert_eq!(applescript_multiline("hi"), "\"hi\"");
+        assert_eq!(applescript_multiline("a\nb"), "\"a\" & linefeed & \"b\"");
+        // Quotes and backslashes must be escaped so they can't break out of the literal.
+        assert_eq!(applescript_multiline("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(applescript_multiline("c:\\x"), "\"c:\\\\x\"");
+        // A CR before LF is stripped (CRLF bodies normalize cleanly).
+        assert_eq!(applescript_multiline("a\r\nb"), "\"a\" & linefeed & \"b\"");
+    }
+
+    #[test]
+    fn split_recipients_handles_commas_and_semicolons() {
+        assert_eq!(split_recipients("a@x.com"), vec!["a@x.com"]);
+        assert_eq!(
+            split_recipients(" a@x.com, b@y.com ; c@z.com"),
+            vec!["a@x.com", "b@y.com", "c@z.com"]
+        );
+        assert!(split_recipients("  ,  ; ").is_empty());
+    }
 }

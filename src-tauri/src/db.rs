@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 4;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -87,9 +87,39 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 1)?;
     }
 
+    if version < 2 {
+        // Task chaining: a chain-triggered run reads `pending_input` (the upstream task's
+        // full output, JSON-encoded) at start, injects it into its prompt, then clears it.
+        let statements = [
+            "ALTER TABLE tasks ADD COLUMN pending_input TEXT NOT NULL DEFAULT ''",
+        ];
+        for sql in statements {
+            exec_migration(conn, sql)?;
+        }
+        set_schema_version(conn, 2)?;
+    }
+
+    if version < 3 {
+        // Per-run task history (one row per scheduler execution) for chain observability.
+        // The base CREATE TABLE in init_db already runs for fresh DBs; this is a no-op there.
+        set_schema_version(conn, 3)?;
+    }
+
+    if version < 4 {
+        // Session pinning + user-set titles for the chat session list.
+        let statements = [
+            "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN title TEXT",
+        ];
+        for sql in statements {
+            exec_migration(conn, sql)?;
+        }
+        set_schema_version(conn, 4)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 1, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 4, "add a migration block for the new version");
 
     Ok(())
 }
@@ -152,7 +182,28 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           schedule TEXT NOT NULL DEFAULT '',
           next_run TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL DEFAULT 'scheduled',
+          pending_input TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS task_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id INTEGER NOT NULL,
+          session_id TEXT NOT NULL DEFAULT '',
+          trigger_kind TEXT NOT NULL DEFAULT 'scheduled',
+          triggered_by INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT '',
+          output TEXT NOT NULL DEFAULT '',
+          note TEXT NOT NULL DEFAULT '',
+          started_at TEXT NOT NULL DEFAULT '',
+          finished_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_runs_task ON task_runs(task_id, id DESC);
+
+        CREATE TABLE IF NOT EXISTS session_todos (
+          session_id TEXT PRIMARY KEY,
+          todos_json TEXT NOT NULL DEFAULT '[]',
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -294,6 +345,10 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
         ),
         ("read_file", "Read File", "Read a file from workspace.", "file"),
         ("write_file", "Write File", "Write content to a workspace file.", "edit"),
+        ("edit_file", "Edit File", "Edit part of a file by exact-string replacement.", "edit"),
+        ("append_file", "Append File", "Append or prepend content to a workspace file.", "edit"),
+        ("capture_screen", "Capture Screen", "Take a screenshot of the screen or frontmost window so the model can see it.", "image"),
+        ("open_app", "Open App", "Launch or focus a macOS app, optionally opening a URL in it.", "terminal"),
         ("list_files", "List Files", "List files in a workspace directory.", "folder"),
         (
             "search_files",
@@ -330,6 +385,54 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             "Get Directions",
             "Get directions between two locations.",
             "map",
+        ),
+        (
+            "git_status",
+            "Git Status",
+            "Show branch, last commit, and changed files in the workspace repo.",
+            "wrench",
+        ),
+        (
+            "git_diff",
+            "Git Diff",
+            "Show working-tree, staged, or commit-range diffs.",
+            "wrench",
+        ),
+        (
+            "git_log",
+            "Git Log",
+            "Show recent commit history for the workspace repo.",
+            "wrench",
+        ),
+        (
+            "git_commit",
+            "Git Commit",
+            "Commit tracked changes (or specific files) in the workspace repo.",
+            "wrench",
+        ),
+        (
+            "code_outline",
+            "Code Outline",
+            "List declarations with line numbers for a file or directory.",
+            "file-text",
+        ),
+        (
+            "find_references",
+            "Find References",
+            "Find whole-word uses of a symbol across the workspace with context.",
+            "search",
+        ),
+        (
+            "http_request",
+            "HTTP Request",
+            "Make an HTTP request to a public URL (GET/POST/etc) for API testing.",
+            "globe",
+        ),
+        (
+            "run_tests",
+            "Run Tests",
+            "Run the project's test suite (cargo/npm/pytest, auto-detected).",
+            "terminal",
         ),
         (
             "create_task",
@@ -372,6 +475,24 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             "Read Mail",
             "Fetch the full body of a specific message by Message-ID.",
             "envelope",
+        ),
+        (
+            "compose_draft",
+            "Compose Draft",
+            "Create an unsent email draft in Apple Mail for the user to review/send.",
+            "envelope",
+        ),
+        (
+            "reply_draft",
+            "Reply Draft",
+            "Create an unsent draft reply to a message, addressed to its sender.",
+            "envelope",
+        ),
+        (
+            "create_event",
+            "Create Calendar Event",
+            "Add an event to the user's Apple Calendar.",
+            "clock",
         ),
         (
             "write_todos",
@@ -472,6 +593,38 @@ pub(crate) fn add_feed_item(
             VALUES (?1, ?2, ?3, ?4, ?5, 0)
             "#,
             params![kind, title, message, icon_name, metadata],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    });
+}
+
+/// Record one task execution and prune to the most recent 50 runs for that task.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_task_run(
+    state: &AppState,
+    task_id: i64,
+    session_id: &str,
+    trigger_kind: &str,
+    triggered_by: i64,
+    status: &str,
+    output: &str,
+    note: &str,
+    started_at: &str,
+) {
+    let _ = with_db(state, |db| {
+        db.execute(
+            r#"
+            INSERT INTO task_runs (task_id, session_id, trigger_kind, triggered_by, status, output, note, started_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![task_id, session_id, trigger_kind, triggered_by, status, output, note, started_at],
+        )
+        .map_err(|e| e.to_string())?;
+        db.execute(
+            "DELETE FROM task_runs WHERE task_id = ?1 AND id NOT IN \
+             (SELECT id FROM task_runs WHERE task_id = ?1 ORDER BY id DESC LIMIT 50)",
+            params![task_id],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -856,5 +1009,26 @@ mod tests {
             .query_row("SELECT agents_md FROM projects WHERE 0=1 UNION SELECT ''", [], |r| r.get(0))
             .unwrap();
         assert_eq!(agents_md, "");
+    }
+
+    #[test]
+    fn v4_adds_session_pinned_and_title_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // pinned defaults to 0 and title defaults to NULL for new rows.
+        conn.execute(
+            "INSERT INTO sessions (id, project_path) VALUES ('s1', '/tmp')",
+            [],
+        )
+        .unwrap();
+        let (pinned, title): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT pinned, title FROM sessions WHERE id = 's1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pinned, 0);
+        assert_eq!(title, None);
     }
 }

@@ -5,6 +5,7 @@ import { openReaderWindow, openArticleReader } from "./reader.js";
 import { openFeedItemInChat, playTts } from "./chat.js";
 import { renderScheduleWidget } from "./schedule.js";
 import { logError, showErrorBanner, setButtonLoading, attachEscClose } from "./uikit.js";
+import { icon } from "./icons.js";
 
 // ========== FEEDS TILE ==========
 export function renderFeedsTile(tileObj, body) {
@@ -13,7 +14,7 @@ export function renderFeedsTile(tileObj, body) {
       <div class="feeds-sidebar">
         <div class="feeds-sidebar-header">
           <span class="feeds-sidebar-title">Feeds</span>
-          <button class="feeds-add-btn tile-btn" data-feeds-new="${tileObj.id}" title="New feed" aria-label="New feed">+</button>
+          <button class="feeds-add-btn tile-btn" data-feeds-new="${tileObj.id}" title="New feed" aria-label="New feed">${icon("plus", 12)}</button>
         </div>
         <div class="feeds-feed-list" data-feeds-list="${tileObj.id}"></div>
       </div>
@@ -31,8 +32,8 @@ export function renderFeedsTile(tileObj, body) {
         </div>
         <div class="feeds-items-panel" data-feeds-items="${tileObj.id}">
           <div class="feeds-empty-state">
-            <div class="feeds-empty-icon">◈</div>
-            <div class="feeds-empty-text">Select a feed or create one with +</div>
+            <div class="feeds-empty-icon">${icon("sparkles", 24)}</div>
+            <div class="feeds-empty-text">Select a feed or create one with the + button</div>
           </div>
         </div>
       </div>
@@ -176,8 +177,8 @@ export function renderFeedsTile(tileObj, body) {
   function showItemsEmpty() {
     itemsPanel.innerHTML = `
       <div class="feeds-empty-state">
-        <div class="feeds-empty-icon">◈</div>
-        <div class="feeds-empty-text">Select a feed or create one with +</div>
+        <div class="feeds-empty-icon">${icon("sparkles", 24)}</div>
+        <div class="feeds-empty-text">Select a feed or create one with the + button</div>
       </div>
     `;
   }
@@ -217,7 +218,7 @@ export function renderFeedsTile(tileObj, body) {
     toolbar.innerHTML = `
       <span class="feeds-items-title">${escapeHtml(feedName)}</span>
       <span class="feeds-spacer"></span>
-      <button class="feeds-btn feeds-refresh-btn" data-refresh-id="${feedId}" aria-label="Refresh feed">&#8635; Refresh</button>
+      <button class="feeds-btn feeds-refresh-btn" data-refresh-id="${feedId}" aria-label="Refresh feed">${icon("refresh", 12)} Refresh</button>
     `;
     toolbar.querySelector(`[data-refresh-id="${feedId}"]`).addEventListener("click", async (e) => {
       const btn = e.currentTarget;
@@ -229,8 +230,8 @@ export function renderFeedsTile(tileObj, body) {
         // Re-get the toolbar button after re-render and show count briefly
         const newBtn = itemsPanel.querySelector(`[data-refresh-id="${feedId}"]`);
         if (newBtn) {
-          newBtn.textContent = `+ ${added} added`;
-          setTimeout(() => { if (newBtn) newBtn.textContent = "↻ Refresh"; }, 2500);
+          newBtn.innerHTML = `${icon("plus", 12)} ${added} added`;
+          setTimeout(() => { if (newBtn) newBtn.innerHTML = `${icon("refresh", 12)} Refresh`; }, 2500);
         }
       } catch (err) {
         logError("feeds/refresh_ai_feed", err);
@@ -246,7 +247,7 @@ export function renderFeedsTile(tileObj, body) {
       const empty = document.createElement("div");
       empty.className = "feeds-empty-state";
       empty.innerHTML = `
-        <div class="feeds-empty-icon">◈</div>
+        <div class="feeds-empty-icon">${icon("sparkles", 24)}</div>
         <div class="feeds-empty-text">No items yet — click Refresh to fetch content</div>
       `;
       itemsPanel.appendChild(empty);
@@ -280,10 +281,10 @@ export function renderFeedsTile(tileObj, body) {
           <div class="feeds-card-title">${escapeHtml(title)}</div>
           ${summary ? `<div class="feeds-card-summary">${escapeHtml(summary)}</div>` : ""}
           <div class="feeds-card-actions">
-            <button class="feeds-card-action feeds-overview-btn">✦ Overview</button>
-            <button class="feeds-card-action feeds-chat-btn">💬 Open in chat</button>
-            <button class="feeds-card-action feeds-card-tts" title="Read aloud">&#9654; Listen</button>
-            ${url ? `<a class="feeds-card-link" href="${escapeHtml(url)}" data-reader-url="${escapeHtml(url)}">Read original ↗</a>` : ""}
+            <button class="feeds-card-action feeds-overview-btn">${icon("sparkles", 12)} Overview</button>
+            <button class="feeds-card-action feeds-chat-btn">${icon("message-square", 12)} Open in chat</button>
+            <button class="feeds-card-action feeds-card-tts" title="Read aloud" aria-label="Read aloud">${icon("play", 11)} Listen</button>
+            ${url ? `<a class="feeds-card-link" href="${escapeHtml(url)}" data-reader-url="${escapeHtml(url)}">Read original ${icon("arrow-up-right", 11)}</a>` : ""}
           </div>
         </div>
       `;

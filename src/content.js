@@ -1,9 +1,18 @@
 import { registerTileRenderer } from "./registry.js";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { escapeHtml, field, formatFileSize, formatModifiedAt } from "./utils.js";
+import { icon } from "./icons.js";
 
 // ========== CONTENT TILE ==========
-export const KIND_ICONS = { image: "🖼", audio: "🎵", video: "🎬", pdf: "📄", text: "📝", file: "📎" };
+// SVG markup for each kind. Built once at module load so render stays cheap.
+export const KIND_ICONS = {
+  image: icon("image", 28),
+  audio: icon("audio", 28),
+  video: icon("video", 28),
+  pdf:   icon("file-text", 28),
+  text:  icon("file-text", 28),
+  file:  icon("file", 28),
+};
 
 export function renderContentTile(tileObj, body) {
   body.innerHTML = `

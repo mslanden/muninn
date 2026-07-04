@@ -81,10 +81,18 @@ pub fn add_task(state: State<AppState>, req: TaskCreateRequest) -> Result<bool, 
     with_db(&state, |db| {
         db.execute(
             r#"
-            INSERT INTO tasks (name, description, schedule, schedule_config, next_run, status, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, 'scheduled', CURRENT_TIMESTAMP)
+            INSERT INTO tasks (name, description, schedule, schedule_config, next_run, chain_next, conditions, status, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'scheduled', CURRENT_TIMESTAMP)
             "#,
-            params![name, req.description.unwrap_or_default(), schedule, schedule_config, next_run],
+            params![
+                name,
+                req.description.unwrap_or_default(),
+                schedule,
+                schedule_config,
+                next_run,
+                req.chain_next.unwrap_or_default(),
+                req.conditions.unwrap_or_default()
+            ],
         )
         .map_err(|e| e.to_string())?;
         Ok(true)
@@ -126,10 +134,21 @@ pub fn update_task(state: State<AppState>, req: TaskUpdateRequest) -> Result<boo
                     schedule = ?4,
                     schedule_config = ?5,
                     next_run = ?6,
+                    chain_next = ?7,
+                    conditions = ?8,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?1
                 "#,
-                params![req.id, name, req.description.unwrap_or_default(), schedule, schedule_config, next_run],
+                params![
+                    req.id,
+                    name,
+                    req.description.unwrap_or_default(),
+                    schedule,
+                    schedule_config,
+                    next_run,
+                    req.chain_next.unwrap_or_default(),
+                    req.conditions.unwrap_or_default()
+                ],
             )
             .map_err(|e| e.to_string())?;
         Ok(changed > 0)
@@ -155,6 +174,45 @@ pub fn set_task_status(state: State<AppState>, req: TaskStatusRequest) -> Result
             )
             .map_err(|e| e.to_string())?;
         Ok(changed > 0)
+    })
+}
+
+#[tauri::command]
+pub fn get_task_runs(state: State<AppState>, task_id: i64) -> Result<Vec<TaskRun>, String> {
+    with_db(&state, |db| {
+        let mut stmt = db
+            .prepare(
+                r#"
+                SELECT id, task_id, session_id, trigger_kind, triggered_by,
+                       status, output, note, started_at, finished_at
+                FROM task_runs
+                WHERE task_id = ?1
+                ORDER BY id DESC
+                LIMIT 50
+                "#,
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![task_id], |row| {
+                Ok(TaskRun {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    trigger_kind: row.get(3)?,
+                    triggered_by: row.get(4)?,
+                    status: row.get(5)?,
+                    output: row.get(6)?,
+                    note: row.get(7)?,
+                    started_at: row.get(8)?,
+                    finished_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
     })
 }
 

@@ -6,6 +6,7 @@
 // previously copy-pasted across feeds/tasks/agents/memory/logs.
 
 import { escapeHtml } from "./utils.js";
+import { icon as renderIcon } from "./icons.js";
 
 /**
  * Log an error with a stable context label. Previously many call sites used
@@ -75,17 +76,32 @@ export function showErrorBanner(
 
 /**
  * Build a consistent empty-state element with an optional call-to-action button.
+ *
+ * `icon` may be either:
+ *  - A registered icon name (string) from icons.js, or
+ *  - An already-rendered HTML string (e.g. an emoji or SVG fragment).
+ * Plain strings are escaped to keep text-only inputs safe; icon names are
+ * resolved through `renderIcon` and inserted as HTML.
  */
 export function emptyState({
-  icon = "◈",
+  icon = "sparkles",
+  iconSize = 24,
   text = "Nothing here yet",
   actionLabel = null,
   onAction = null,
 } = {}) {
   const el = document.createElement("div");
   el.className = "uikit-empty";
+  // If it looks like HTML (<), use as-is; otherwise resolve through the icon
+  // helper, falling back to plain text.
+  const iconHtml = icon.trim().startsWith("<")
+    ? icon
+    : (() => {
+        try { return renderIcon(icon, iconSize); }
+        catch { return escapeHtml(icon); }
+      })();
   el.innerHTML = `
-    <div class="uikit-empty-icon" aria-hidden="true">${escapeHtml(icon)}</div>
+    <div class="uikit-empty-icon" aria-hidden="true">${iconHtml}</div>
     <div class="uikit-empty-text">${escapeHtml(text)}</div>
     ${actionLabel ? `<button type="button" class="uikit-empty-action">${escapeHtml(actionLabel)}</button>` : ""}
   `;

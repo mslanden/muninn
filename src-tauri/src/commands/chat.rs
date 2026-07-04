@@ -21,25 +21,55 @@ pub async fn chat(app: AppHandle, state: State<'_, AppState>, req: ChatRequest) 
         .map_err(|e| e.to_string())?;
         Ok(())
     })?;
-    let user_blocks = vec![serde_json::json!({"type": "text", "text": req.message.clone()})];
-    insert_message(&state, &req.session_id, "user", &req.message, &user_blocks, false)?;
+    // Build the user turn: the text (if any) plus one Anthropic image block per attachment.
+    // Vision-capable models (e.g. MiniMax-M3) read these directly; text-only models ignore
+    // them. Images are stored as base64 source blocks so they persist and re-render.
+    let mut user_blocks: Vec<serde_json::Value> = Vec::new();
+    if !req.message.trim().is_empty() {
+        user_blocks.push(serde_json::json!({"type": "text", "text": req.message.clone()}));
+    }
+    if let Some(attachments) = &req.attachments {
+        for att in attachments {
+            user_blocks.push(serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": att.media_type,
+                    "data": att.data,
+                }
+            }));
+        }
+    }
+    if user_blocks.is_empty() {
+        // Guard: an empty turn with no text and no images — keep a text block so the row is valid.
+        user_blocks.push(serde_json::json!({"type": "text", "text": req.message.clone()}));
+    }
+    let image_count = req.attachments.as_ref().map(|a| a.len()).unwrap_or(0);
+    // Plain-text fallback for the DB `content` / feed when the turn is image-only.
+    let display_text = if req.message.trim().is_empty() && image_count > 0 {
+        format!("[{} image{}]", image_count, if image_count == 1 { "" } else { "s" })
+    } else {
+        req.message.clone()
+    };
+    insert_message(&state, &req.session_id, "user", &display_text, &user_blocks, false)?;
     add_feed_item(
         &state,
         "message",
         "User Message",
-        &truncate_chars(&req.message, 140),
+        &truncate_chars(&display_text, 140),
         "chat",
         &req.session_id,
     );
 
     let mut history = load_history_structured(&state, &req.session_id, 200)?;
 
-    // Trim history to fit within ~80k tokens (leaving ample room for system prompt, tool
-    // definitions, and the response on smaller-context providers like MiniMax-M2.7). Rough
-    // estimate: 1 token ≈ 4 chars. We measure on the structured JSON length so tool_use /
-    // tool_result blocks count toward the budget. After trimming we sanitize so no dangling
-    // tool_use/tool_result pairs survive (the provider API rejects those with a 400).
-    let max_history_chars: usize = 80_000 * 4;
+    // Trim history to fit within ~300k tokens (MiniMax-M3 has a 1M context window; this
+    // leaves ample room for the system prompt, tool definitions, images, and the response).
+    // Rough estimate: 1 token ≈ 4 chars. `char_len` counts tool_use/tool_result blocks toward
+    // the budget and counts image blocks at a fixed cost rather than their base64 length.
+    // After trimming we sanitize so no dangling tool_use/tool_result pairs survive (the
+    // provider API rejects those with a 400).
+    let max_history_chars: usize = 300_000 * 4;
     let mut total_chars: usize = history.iter().map(|h| h.char_len()).sum();
     while total_chars > max_history_chars && history.len() > 2 {
         total_chars -= history[0].char_len();
@@ -61,7 +91,7 @@ pub async fn chat(app: AppHandle, state: State<'_, AppState>, req: ChatRequest) 
             .filter(|m| !m.trim().is_empty())
             .unwrap_or_else(|| {
                 if provider == "minimax" {
-                    "MiniMax-M2.7".to_string()
+                    "MiniMax-M3".to_string()
                 } else {
                     "gpt-4.1-mini".to_string()
                 }
@@ -89,9 +119,13 @@ pub async fn chat(app: AppHandle, state: State<'_, AppState>, req: ChatRequest) 
     let (reply, reply_blocks) = if let Some(agent_id) = req.agent_id.as_ref() {
         run_agent(&app, &state, &req.session_id, agent_id, &history).await?
     } else if provider == "minimax" || model.starts_with("MiniMax-") {
+        // MiniMax fast path — unchanged.
         chat_with_minimax_anthropic(&app, &state, &req.session_id, &model, &history, scope.as_ref(), true).await?
-    } else {
+    } else if provider == "openai" {
         chat_with_openai(&app, &state, &req.session_id, &model, &history, scope.as_ref(), true).await?
+    } else {
+        // Any other configured provider (anthropic/groq/deepseek/xai/…) routes here.
+        chat_dynamic(&app, &state, &req.session_id, &provider, &model, &history, scope.as_ref(), true).await?
     };
 
     insert_message(&state, &req.session_id, "assistant", &reply, &reply_blocks, false)?;

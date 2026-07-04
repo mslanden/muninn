@@ -9,27 +9,6 @@ use crate::models::*;
 use crate::tools::*;
 
 #[tauri::command]
-pub fn get_gallery_paths(app: AppHandle) -> Result<GalleryPathsRecord, String> {
-    let (images_dir, audio_dir) = gallery_dirs(&app)?;
-    Ok(GalleryPathsRecord {
-        images_dir: images_dir.display().to_string(),
-        audio_dir: audio_dir.display().to_string(),
-    })
-}
-
-#[tauri::command]
-pub fn get_gallery_images(app: AppHandle) -> Result<Vec<MediaItemRecord>, String> {
-    let (images_dir, _) = gallery_dirs(&app)?;
-    list_media_in_dir(&images_dir, &["png", "jpg", "jpeg", "webp", "gif"])
-}
-
-#[tauri::command]
-pub fn get_gallery_audio(app: AppHandle) -> Result<Vec<MediaItemRecord>, String> {
-    let (_, audio_dir) = gallery_dirs(&app)?;
-    list_media_in_dir(&audio_dir, &["wav", "mp3", "m4a", "aac", "flac"])
-}
-
-#[tauri::command]
 pub fn open_content_dir(app: AppHandle) -> Result<bool, String> {
     let dir = content_dir(&app)?;
     std::process::Command::new("open")
@@ -128,25 +107,6 @@ pub fn open_content_file(app: AppHandle, req: ContentReadRequest) -> Result<bool
         .arg(&canonical)
         .spawn()
         .map_err(|e| e.to_string())?;
-    Ok(true)
-}
-
-#[tauri::command]
-pub fn delete_gallery_media(app: AppHandle, req: MediaDeleteRequest) -> Result<bool, String> {
-    let (images_dir, audio_dir) = gallery_dirs(&app)?;
-    let base = if req.kind.trim().eq_ignore_ascii_case("audio") {
-        audio_dir
-    } else {
-        images_dir
-    };
-    let candidate = base.join(req.name);
-    if !candidate.starts_with(&base) {
-        return Err("invalid media path".to_string());
-    }
-    if !candidate.exists() {
-        return Ok(false);
-    }
-    fs::remove_file(candidate).map_err(|e| e.to_string())?;
     Ok(true)
 }
 

@@ -1,7 +1,11 @@
 // Shared DOM references and cross-module mutable state.
 
 export const workspace = document.getElementById("workspace");
-export const sidebarNav = document.getElementById("sidebar-nav");
+export const sidebarTabs = document.getElementById("sidebar-tabs");
+export const sidebarNavCreate = document.getElementById("sidebar-nav-create");
+export const sidebarNavData = document.getElementById("sidebar-nav-data");
+export const sessionList = document.getElementById("session-list");
+export const sessionSearchInput = document.getElementById("session-search-input");
 export const sidebarWorkspace = document.getElementById("sidebar-workspace");
 export const sidebarModel = document.getElementById("sidebar-model");
 export const newChatBtn = document.getElementById("new-chat-btn");

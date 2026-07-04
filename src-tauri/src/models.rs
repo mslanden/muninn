@@ -38,11 +38,20 @@ impl HistoryMessage {
         out
     }
 
-    /// Approximate character count, used for history trimming.
+    /// Approximate character count, used for history trimming. Image blocks carry a large
+    /// base64 payload whose char length wildly overstates their real token cost (a few
+    /// hundred to ~15k), so they are counted at a fixed budget instead — otherwise a single
+    /// screenshot would blow the trim budget or be evicted on the very next turn.
     pub fn char_len(&self) -> usize {
-        serde_json::to_string(&self.blocks)
-            .map(|s| s.len())
-            .unwrap_or(0)
+        let mut total = 0;
+        for block in &self.blocks {
+            if block.get("type").and_then(Value::as_str) == Some("image") {
+                total += 6_000; // ≈1.5k tokens — a rough, deliberate over-estimate
+            } else {
+                total += serde_json::to_string(block).map(|s| s.len()).unwrap_or(0);
+            }
+        }
+        total
     }
 }
 
@@ -93,13 +102,26 @@ pub struct SessionListItem {
     pub message_count: i64,
     pub preview: String,
     pub project_path: String,
+    pub pinned: bool,
+    pub title: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct MessageRecord {
     pub role: String,
     pub content: String,
+    /// Structured content blocks (text/image/tool_use/…) so the UI can re-render images
+    /// and other non-text content on reload, not just the plain `content` text.
+    pub blocks: Vec<Value>,
     pub created_at: String,
+}
+
+/// Generated social-media copy for one platform (Studio tile).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformCopy {
+    pub platform: String,
+    pub variants: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -127,7 +149,7 @@ pub struct SafetyCheck {
     pub reasons: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct FsResult {
     pub path: String,
     pub content: String,
@@ -187,6 +209,20 @@ pub struct TaskRecord {
     pub condition_status: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Serialize)]
+pub struct TaskRun {
+    pub id: i64,
+    pub task_id: i64,
+    pub session_id: String,
+    pub trigger_kind: String,
+    pub triggered_by: i64,
+    pub status: String,
+    pub output: String,
+    pub note: String,
+    pub started_at: String,
+    pub finished_at: String,
 }
 
 #[derive(Serialize)]
@@ -255,12 +291,6 @@ pub struct MediaItemRecord {
     pub kind: String,
     pub size: i64,
     pub modified_at: String,
-}
-
-#[derive(Serialize)]
-pub struct GalleryPathsRecord {
-    pub images_dir: String,
-    pub audio_dir: String,
 }
 
 #[derive(Serialize)]
@@ -333,6 +363,18 @@ pub struct ChatRequest {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub agent_id: Option<String>,
+    /// Optional images shared with the turn (screenshots, etc.), sent to vision-capable
+    /// models as Anthropic image content blocks.
+    pub attachments: Option<Vec<ChatAttachment>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatAttachment {
+    /// MIME type, e.g. "image/png" or "image/jpeg".
+    pub media_type: String,
+    /// Base64-encoded image bytes (no `data:` URL prefix).
+    pub data: String,
 }
 
 #[derive(Deserialize)]
@@ -377,6 +419,10 @@ pub struct TaskCreateRequest {
     pub schedule: Option<String>,
     pub schedule_config: Option<String>,
     pub next_run: Option<String>,
+    /// JSON array of task-id strings to fire when this task completes successfully.
+    pub chain_next: Option<String>,
+    /// Natural-language gate: when chain-triggered, only run if this holds for the input.
+    pub conditions: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -388,6 +434,10 @@ pub struct TaskUpdateRequest {
     pub schedule: Option<String>,
     pub schedule_config: Option<String>,
     pub next_run: Option<String>,
+    /// JSON array of task-id strings to fire when this task completes successfully.
+    pub chain_next: Option<String>,
+    /// Natural-language gate: when chain-triggered, only run if this holds for the input.
+    pub conditions: Option<String>,
 }
 
 #[derive(Deserialize)]

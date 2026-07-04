@@ -215,9 +215,19 @@ pub async fn transcribe_wav(
     state: State<'_, AppState>,
     wav_base64: String,
 ) -> Result<TranscribeResponse, String> {
-    let api_key = get_app_setting_value(&state, "llm/openai_api_key")?
-        .or_else(|| get_app_setting_value(&state, "llm/minimax_api_key").ok().flatten())
-        .ok_or_else(|| "OpenAI API key not configured".to_string())?;
+    // Prefer Groq's whisper-large-v3-turbo (cheap, has a free tier). Fall back to
+    // OpenAI's whisper-1 if only an OpenAI key is configured.
+    let (api_key, model, endpoint) =
+        if let Some(key) = first_non_empty_setting(&state, &["llm/groq_api_key"])
+            .map_err(|e| e.to_string())?
+            .or_else(|| std::env::var("GROQ_API_KEY").ok())
+        {
+            (key, "whisper-large-v3-turbo".to_string(), "https://api.groq.com/openai/v1/audio/transcriptions".to_string())
+        } else {
+            let key = get_app_setting_value(&state, "llm/openai_api_key")?
+                .ok_or_else(|| "No transcription API key configured. Set llm/groq_api_key (or llm/openai_api_key) in settings.".to_string())?;
+            (key, "whisper-1".to_string(), "https://api.openai.com/v1/audio/transcriptions".to_string())
+        };
 
     let audio_bytes = B64.decode(&wav_base64).map_err(|e| format!("base64 decode error: {e}"))?;
 
@@ -227,12 +237,12 @@ pub async fn transcribe_wav(
         .map_err(|e| e.to_string())?;
 
     let form = reqwest::multipart::Form::new()
-        .text("model", "whisper-1")
+        .text("model", model)
         .part("file", part);
 
     let resp = state
         .http
-        .post("https://api.openai.com/v1/audio/transcriptions")
+        .post(&endpoint)
         .bearer_auth(&api_key)
         .multipart(form)
         .send()

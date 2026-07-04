@@ -4,6 +4,16 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml, field, projectLabel, renderMarkdown, threadLabel } from "./utils.js";
 import { focusTile, addTile, getChatTileBySessionId, saveLayout } from "./tilesys.js";
+import { icon } from "./icons.js";
+
+// Refresh the sidebar chat-history list after session-mutating actions. Imported
+// lazily-at-call (module-level import is fine — only *invoked* at runtime, so the
+// chat.js<->sidebar.js cycle never bites at init). Guarded so a missing sidebar
+// (pop-out / quick-ask windows) never breaks chat.
+import { refreshSessionList } from "./sidebar.js";
+function bumpSessionList() {
+  try { refreshSessionList(); } catch {}
+}
 
 export async function openFeedItemInChat(item) {
   const title = item.title || "";
@@ -100,6 +110,9 @@ export async function addChatTile(existingSessionId, projectPath) {
 
   // Populate thread select
   await refreshThreadSelect(tileObj);
+
+  // A new/opened session may not yet be reflected in the sidebar list.
+  bumpSessionList();
 }
 
 export async function addProjectChatTile(projectPath) {
@@ -178,7 +191,12 @@ function setMicState(tileObj, micState) {
   if (!btn) return;
   btn.classList.toggle("recording", micState === "recording");
   btn.classList.toggle("transcribing", micState === "transcribing");
-  btn.textContent = micState === "transcribing" ? "⏳" : "🎤";
+  // "transcribing" swaps to a spinning loader; recording/idle use the mic glyph.
+  if (micState === "transcribing") {
+    btn.innerHTML = icon("loader", 16).replace('class="icon"', 'class="icon spin"');
+  } else {
+    btn.innerHTML = icon("mic", 16);
+  }
   btn.title =
     micState === "recording" ? "Stop recording" :
     micState === "transcribing" ? "Transcribing…" : "Voice input";
@@ -267,6 +285,11 @@ export async function refreshThreadSelect(tileObj) {
 export function renderChatTile(tileObj, body) {
   body.classList.add("chat-scroll");
   body.innerHTML = `
+    <div class="chat-search" data-chat-search-bar="${tileObj.id}" hidden>
+      <input type="text" placeholder="Search this conversation…" data-chat-search-input="${tileObj.id}" />
+      <span class="chat-search-count" data-chat-search-count="${tileObj.id}"></span>
+      <button class="chat-search-close" data-chat-search-close="${tileObj.id}" title="Close" aria-label="Close search">${icon("x")}</button>
+    </div>
     <div class="todo-panel" data-todo-panel="${tileObj.id}" hidden></div>
     <div class="chat-stream" data-chat-stream="${tileObj.id}"></div>
   `;
@@ -322,12 +345,17 @@ export function renderChatTile(tileObj, body) {
       <span class="context-label" data-context-label="${tileObj.id}"></span>
     </div>
     <div class="composer-box">
-      <textarea rows="1" placeholder="Message..." data-chat-input="${tileObj.id}"></textarea>
+      <div class="composer-attachments" data-chat-attachments="${tileObj.id}" style="display:none;"></div>
+      <textarea rows="1" placeholder="Message... (paste or drag an image to share a screenshot)" data-chat-input="${tileObj.id}"></textarea>
       <div class="composer-bar">
         <div class="composer-left">
-          <button class="hint-chip" data-chat-folder="${tileObj.id}" title="Set working folder for this chat">📁</button>
-          <button class="hint-chip" data-chat-mic="${tileObj.id}" title="Voice input">🎤</button>
-          <button class="hint-chip" data-hint="slash">/</button>
+          <button class="hint-chip" data-chat-folder="${tileObj.id}" title="Set working folder for this chat" aria-label="Set working folder">${icon("folder")}</button>
+          <button class="hint-chip" data-chat-attach="${tileObj.id}" title="Attach an image / screenshot" aria-label="Attach">${icon("paperclip")}</button>
+          <button class="hint-chip" data-chat-mic="${tileObj.id}" title="Voice input" aria-label="Voice input">${icon("mic")}</button>
+          <button class="hint-chip" data-chat-search-btn="${tileObj.id}" title="Search this conversation" aria-label="Search conversation">${icon("search")}</button>
+          <button class="hint-chip" data-chat-export="${tileObj.id}" title="Copy conversation as Markdown" aria-label="Export conversation">${icon("download")}</button>
+          <button class="hint-chip" data-hint="slash" aria-label="Slash commands">/</button>
+          <input type="file" accept="image/*" multiple data-chat-file="${tileObj.id}" style="display:none;" />
         </div>
         <button class="send-btn" data-chat-send="${tileObj.id}">SEND</button>
       </div>
@@ -354,9 +382,150 @@ export function renderChatTile(tileObj, body) {
   const micBtn = composer.querySelector(`[data-chat-mic="${tileObj.id}"]`);
   micBtn.addEventListener("click", () => toggleVoiceRecording(tileObj));
 
+  // ---- Image attachments (paste / drag-drop / file picker) ----
+  const attachBtn = composer.querySelector(`[data-chat-attach="${tileObj.id}"]`);
+  const fileInput = composer.querySelector(`[data-chat-file="${tileObj.id}"]`);
+  const attachStrip = composer.querySelector(`[data-chat-attachments="${tileObj.id}"]`);
+  const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // MiniMax limit is 10MB per image
+
+  tileObj.pendingAttachments = [];
+
+  function fileToAttachment(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const m = /^data:([^;]+);base64,(.*)$/.exec(reader.result || "");
+        if (!m) { reject(new Error("unreadable image")); return; }
+        resolve({ mediaType: m[1], data: m[2], dataUrl: reader.result });
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function renderAttachmentStrip() {
+    const list = tileObj.pendingAttachments;
+    if (!list.length) { attachStrip.style.display = "none"; attachStrip.innerHTML = ""; return; }
+    attachStrip.style.display = "flex";
+    attachStrip.innerHTML = list.map((a, i) =>
+      `<div class="composer-thumb"><img src="${a.dataUrl}" alt="attachment" /><button class="composer-thumb-x" data-att-remove="${i}" title="Remove">×</button></div>`
+    ).join("");
+    attachStrip.querySelectorAll("[data-att-remove]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        tileObj.pendingAttachments.splice(parseInt(btn.dataset.attRemove, 10), 1);
+        renderAttachmentStrip();
+      });
+    });
+  }
+
+  async function addImageFiles(files) {
+    for (const file of files) {
+      if (!file.type || !file.type.startsWith("image/")) continue;
+      if (file.size > MAX_IMAGE_BYTES) {
+        addTurn(chatLog, "muninn", `That image is too large (${(file.size / 1048576).toFixed(1)}MB). Max is 10MB.`);
+        continue;
+      }
+      try { tileObj.pendingAttachments.push(await fileToAttachment(file)); } catch { /* skip unreadable */ }
+    }
+    renderAttachmentStrip();
+  }
+
+  // Add an image from a base64 data URL (used by the native Tauri drag-drop handler in
+  // events.js, which delivers file paths the OS intercepts before the DOM ever sees them).
+  tileObj.addDroppedImage = (dataUrl) => {
+    const m = /^data:([^;]+);base64,(.*)$/.exec(dataUrl || "");
+    if (!m) return;
+    tileObj.pendingAttachments.push({ mediaType: m[1], data: m[2], dataUrl });
+    renderAttachmentStrip();
+  };
+
+  attachBtn.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    addImageFiles(Array.from(fileInput.files || []));
+    fileInput.value = "";
+  });
+
+  input.addEventListener("paste", (e) => {
+    const imgs = Array.from(e.clipboardData?.items || [])
+      .filter(it => it.type && it.type.startsWith("image/"))
+      .map(it => it.getAsFile())
+      .filter(Boolean);
+    if (imgs.length) { e.preventDefault(); addImageFiles(imgs); }
+  });
+
+  // Drag-and-drop anywhere over the chat tile.
+  [composer, body].forEach(el => {
+    el.addEventListener("dragover", (e) => { e.preventDefault(); composer.classList.add("drag-over"); });
+    el.addEventListener("dragleave", (e) => { if (e.target === el) composer.classList.remove("drag-over"); });
+    el.addEventListener("drop", (e) => {
+      const files = Array.from(e.dataTransfer?.files || []).filter(f => f.type && f.type.startsWith("image/"));
+      if (!files.length) return;
+      e.preventDefault();
+      composer.classList.remove("drag-over");
+      addImageFiles(files);
+    });
+  });
+
+  // ---- In-chat search (client-side over loaded turns) ----
+  const searchBar = body.querySelector(`[data-chat-search-bar="${tileObj.id}"]`);
+  const searchInput = body.querySelector(`[data-chat-search-input="${tileObj.id}"]`);
+  const searchCount = body.querySelector(`[data-chat-search-count="${tileObj.id}"]`);
+  const chatStreamEl = body.querySelector(`[data-chat-stream="${tileObj.id}"]`);
+
+  function clearSearch() {
+    chatStreamEl.querySelectorAll(".turn.search-hit, .turn.search-dim")
+      .forEach(t => t.classList.remove("search-hit", "search-dim"));
+  }
+  function runSearch() {
+    const q = searchInput.value.trim().toLowerCase();
+    clearSearch();
+    if (!q) { searchCount.textContent = ""; return; }
+    const turns = Array.from(chatStreamEl.querySelectorAll(".turn"));
+    let hits = [];
+    for (const t of turns) {
+      if ((t.textContent || "").toLowerCase().includes(q)) {
+        t.classList.add("search-hit"); hits.push(t);
+      } else {
+        t.classList.add("search-dim");
+      }
+    }
+    searchCount.textContent = hits.length ? `${hits.length} match${hits.length === 1 ? "" : "es"}` : "no matches";
+    if (hits.length) hits[0].scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+  composer.querySelector(`[data-chat-search-btn="${tileObj.id}"]`).addEventListener("click", () => {
+    searchBar.hidden = !searchBar.hidden;
+    if (!searchBar.hidden) { searchInput.focus(); }
+    else { searchInput.value = ""; clearSearch(); searchCount.textContent = ""; }
+  });
+  searchInput.addEventListener("input", runSearch);
+  searchInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { searchBar.hidden = true; searchInput.value = ""; clearSearch(); searchCount.textContent = ""; }
+  });
+  body.querySelector(`[data-chat-search-close="${tileObj.id}"]`).addEventListener("click", () => {
+    searchBar.hidden = true; searchInput.value = ""; clearSearch(); searchCount.textContent = "";
+  });
+
+  // ---- Export conversation as Markdown (copy to clipboard) ----
+  const exportBtn = composer.querySelector(`[data-chat-export="${tileObj.id}"]`);
+  exportBtn.addEventListener("click", async () => {
+    const stream = chatStreams[tileObj.id];
+    if (!stream || !stream.sessionId) return;
+    const original = exportBtn.innerHTML;
+    try {
+      const md = await invoke("export_session_markdown", { sessionId: stream.sessionId });
+      await navigator.clipboard.writeText(md);
+      exportBtn.innerHTML = icon("check");
+    } catch (err) {
+      console.error("export error:", err);
+      exportBtn.innerHTML = icon("x");
+    }
+    setTimeout(() => { exportBtn.innerHTML = original; }, 1200);
+  });
+
   const doSend = async () => {
     const text = input.value.trim();
-    if (!text) return;
+    const attachments = (tileObj.pendingAttachments || []).slice();
+    if (!text && !attachments.length) return;
 
     const stream = chatStreams[tileObj.id];
     if (!stream) return;
@@ -428,9 +597,12 @@ export function renderChatTile(tileObj, body) {
       }
     }
 
-    addTurn(chatLog, "you", text);
+    addTurn(chatLog, "you", text, attachments.map(a => a.dataUrl));
     input.value = "";
     autoResize(input);
+    // Clear the pending-attachment strip now that they're sent.
+    tileObj.pendingAttachments = [];
+    renderAttachmentStrip();
     sendBtn.disabled = true;
     stream.bubble = null;
     stream.text = "";
@@ -441,9 +613,10 @@ export function renderChatTile(tileObj, body) {
         sessionId: stream.sessionId,
         message,
         provider: "minimax",
-        model: ui.loadedSettings["llm/model"] || "MiniMax-M2.7"
+        model: ui.loadedSettings["llm/model"] || "MiniMax-M3"
       };
       if (agentId) req.agentId = agentId;
+      if (attachments.length) req.attachments = attachments.map(a => ({ mediaType: a.mediaType, data: a.data }));
       await invoke("chat", { req });
 
       if (stream.bubble) {
@@ -466,6 +639,8 @@ export function renderChatTile(tileObj, body) {
       if (!stream.contextTokens) {
         estimateContextFromMessages(tileObj.id, chatLog);
       }
+      // Reflect the fresh preview / last-message time in the sidebar list.
+      bumpSessionList();
     }
   };
 
@@ -555,7 +730,7 @@ export async function playTts(btn, text) {
   if (btn.classList.contains("playing")) {
     if (currentTtsAudio) { currentTtsAudio.pause(); currentTtsAudio = null; }
     btn.classList.remove("playing");
-    btn.innerHTML = "&#9654;";
+    btn.innerHTML = icon("play", 12);
     return;
   }
 
@@ -573,7 +748,7 @@ export async function playTts(btn, text) {
 
     if (!blobUrl) {
       const resp = await invoke("tts_speak", { req: { text: plain, provider: "minimax" } });
-      if (!resp.audioBase64) { btn.classList.remove("playing"); btn.innerHTML = "&#9654;"; return; }
+      if (!resp.audioBase64) { btn.classList.remove("playing"); btn.innerHTML = icon("play", 12); return; }
 
       const audioBlob = new Blob(
         [Uint8Array.from(atob(resp.audioBase64), c => c.charCodeAt(0))],
@@ -587,29 +762,32 @@ export async function playTts(btn, text) {
     currentTtsAudio = audio;
     audio.onended = () => {
       btn.classList.remove("playing");
-      btn.innerHTML = "&#9654;";
+      btn.innerHTML = icon("play", 12);
       currentTtsAudio = null;
     };
     audio.play();
   } catch (e) {
     console.error("TTS error:", e);
     btn.classList.remove("playing");
-    btn.innerHTML = "&#9654;";
+    btn.innerHTML = icon("play", 12);
   }
 }
 
-export function addTurn(chatLog, role, text) {
+export function addTurn(chatLog, role, text, images = []) {
   const turn = document.createElement("div");
   turn.className = "turn";
   const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  const speakBtn = role === "muninn" ? `<button class="tts-btn" title="Read aloud">&#9654;</button>` : "";
+  const speakBtn = role === "muninn" ? `<button class="tts-btn" title="Read aloud" aria-label="Read aloud">${icon("play", 12)}</button>` : "";
+  const imagesHtml = (images && images.length)
+    ? `<div class="turn-images">${images.map(src => `<img class="turn-image" src="${src}" alt="shared image" />`).join("")}</div>`
+    : "";
   turn.innerHTML = `
     <div class="turn-header">
       <span class="turn-label ${role}">${role === "you" ? "YOU" : "MUNINN"}</span>
       <span class="turn-time">${time}</span>
       ${speakBtn}
     </div>
-    <div class="turn-body">${renderMarkdown(text)}</div>
+    <div class="turn-body">${renderMarkdown(text)}${imagesHtml}</div>
   `;
   if (role === "muninn") {
     const btn = turn.querySelector(".tts-btn");
@@ -761,11 +939,16 @@ export async function loadMessagesForTile(tileObj) {
 
     const timeline = [];
     for (const msg of messages) {
+      // Recover any image blocks so screenshots re-render on reload.
+      const images = (msg.blocks || [])
+        .filter(b => b && b.type === "image" && b.source && b.source.type === "base64")
+        .map(b => `data:${b.source.media_type};base64,${b.source.data}`);
       timeline.push({
         type: "message",
         createdAt: field(msg, "createdAt", "created_at") || "",
         role: msg.role,
-        content: msg.content
+        content: msg.content,
+        images
       });
     }
     for (const log of logs) {
@@ -785,7 +968,7 @@ export async function loadMessagesForTile(tileObj) {
         addToolCard(chatLog, item.kind, "", item.status);
       } else {
         const role = item.role === "user" ? "you" : "muninn";
-        addTurn(chatLog, role, item.content);
+        addTurn(chatLog, role, item.content, item.images || []);
       }
     }
     // Estimate context usage from loaded messages
@@ -807,7 +990,7 @@ export function parseSlashCommand(text) {
   return { agent, query: query || text };
 }
 
-export const CONTEXT_WINDOW = 204800;
+export const CONTEXT_WINDOW = 1000000;
 
 export function updateContextBar(tileId, tokens) {
   const bar = document.querySelector(`[data-context-bar="${tileId}"]`);

@@ -5,7 +5,7 @@ use crate::db::*;
 use crate::AppState;
 
 /// Strip reasoning tags (<think>, <thinking>) from model output.
-fn strip_think_tags(text: &str) -> String {
+pub(crate) fn strip_think_tags(text: &str) -> String {
     let mut result = text.to_string();
     for (open, close) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
         loop {

@@ -4,6 +4,7 @@ import { escapeHtml, normalizeWebUrl, renderMarkdown, looksLikeUrl } from "./uti
 import { popOutTile, saveLayout } from "./tilesys.js";
 import { openReaderWindow } from "./reader.js";
 import { openQueryInChat } from "./chat.js";
+import { icon } from "./icons.js";
 
 export function renderWebTile(tileObj, body) {
   body.classList.add("web-tile-body");
@@ -20,7 +21,7 @@ export function renderWebTile(tileObj, body) {
 
       <div class="web-results" data-web-results="${tileObj.id}">
         <div class="web-results-actions hidden" data-web-results-actions="${tileObj.id}">
-          <button class="form-btn" data-web-chat="${tileObj.id}">💬 Open in chat</button>
+          <button class="form-btn" data-web-chat="${tileObj.id}">${icon("message-square", 12)} Open in chat</button>
         </div>
         <div class="web-answer" data-web-answer="${tileObj.id}"></div>
         <div class="web-sources" data-web-sources="${tileObj.id}"></div>
@@ -33,7 +34,7 @@ export function renderWebTile(tileObj, body) {
 
       <div class="web-browse hidden" data-web-browse="${tileObj.id}">
         <div class="web-browse-bar">
-          <button class="form-btn" data-web-back="${tileObj.id}">← Back to search</button>
+          <button class="form-btn" data-web-back="${tileObj.id}">${icon("arrow-left", 12)} Back to search</button>
         </div>
         <div class="web-frame-wrap">
           <iframe class="web-frame" data-web-frame="${tileObj.id}" title="Web content" referrerpolicy="no-referrer"></iframe>

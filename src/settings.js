@@ -4,6 +4,7 @@ import { enable as enableAutostart, disable as disableAutostart, isEnabled as is
 import { workspace, sidebarWorkspace, sidebarModel, ui } from "./state.js";
 import { applyTheme } from "./theme.js";
 import { field, projectLabel } from "./utils.js";
+import { icon } from "./icons.js";
 
 // ========== SETTINGS TILE ==========
 export function renderSettingsTile(tileObj, body) {
@@ -18,13 +19,34 @@ export function renderSettingsTile(tileObj, body) {
       <div class="settings-group">
         <h3>Model</h3>
         <div class="form-row" style="margin-bottom:6px;">
-          <input type="text" placeholder="Model name (e.g. MiniMax-M2.7)" data-s-model="${tileObj.id}" style="flex:1;" />
+          <select data-s-provider="${tileObj.id}">
+            <option value="minimax">MiniMax (Anthropic-compatible)</option>
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="groq">Groq</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="xai">xAI (Grok)</option>
+            <option value="google">Google (Gemini)</option>
+            <option value="mistral">Mistral</option>
+            <option value="together">Together</option>
+            <option value="fireworks">Fireworks</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="cohere">Cohere</option>
+          </select>
+          <input type="text" placeholder="Model name (e.g. MiniMax-M3)" data-s-model="${tileObj.id}" style="flex:1;" />
         </div>
+        <input type="password" placeholder="API key for the selected provider" data-s-provkey="${tileObj.id}" style="margin-bottom:4px;" />
+        <span class="muted" data-s-prov-hint="${tileObj.id}" style="font-size:10px;"></span>
+        <div class="form-row" style="margin-top:8px;">
+          <input type="number" min="1" step="1024" placeholder="Max response tokens (e.g. 40960)" data-s-maxtokens="${tileObj.id}" style="flex:1;" />
+        </div>
+        <span class="muted" style="font-size:10px;">Output-token ceiling per response. Too low truncates long file writes mid-call. Blank = 40960.</span>
       </div>
       <div class="settings-group">
         <h3>API Keys</h3>
         <input type="password" placeholder="OpenAI API key" data-s-openai="${tileObj.id}" style="margin-bottom:6px;" />
         <input type="password" placeholder="MiniMax API key" data-s-minimax="${tileObj.id}" style="margin-bottom:6px;" />
+        <input type="password" placeholder="Groq API key (voice transcription)" data-s-groq="${tileObj.id}" style="margin-bottom:6px;" />
         <input type="password" placeholder="Web search API key" data-s-search="${tileObj.id}" style="margin-bottom:6px;" />
         <input type="password" placeholder="Together AI key (images)" data-s-together="${tileObj.id}" style="margin-bottom:6px;" />
         <input type="password" placeholder="Mapbox API key (maps)" data-s-mapbox="${tileObj.id}" style="margin-bottom:6px;" />
@@ -50,7 +72,7 @@ export function renderSettingsTile(tileObj, body) {
       </div>
       <div class="settings-group">
         <h3>Default directory</h3>
-        <p class="settings-hint">The folder a chat operates in when no project folder is picked. Use the 📁 button in a chat to scope it to a specific folder.</p>
+        <p class="settings-hint">The folder a chat operates in when no project folder is picked. Use the ${icon("folder", 12)} button in a chat to scope it to a specific folder.</p>
         <div class="form-row" style="margin-bottom:6px;">
           <input type="text" placeholder="Default directory path" data-s-workspace="${tileObj.id}" />
           <button class="form-btn" data-s-setws="${tileObj.id}">Set</button>
@@ -98,8 +120,13 @@ export function renderSettingsTile(tileObj, body) {
   const aboutInput = body.querySelector(`[data-s-about="${tileObj.id}"]`);
   const locationInput = body.querySelector(`[data-s-location="${tileObj.id}"]`);
   const modelSelect = body.querySelector(`[data-s-model="${tileObj.id}"]`);
+  const providerSelect = body.querySelector(`[data-s-provider="${tileObj.id}"]`);
+  const provKeyInput = body.querySelector(`[data-s-provkey="${tileObj.id}"]`);
+  const provHint = body.querySelector(`[data-s-prov-hint="${tileObj.id}"]`);
+  const maxTokensInput = body.querySelector(`[data-s-maxtokens="${tileObj.id}"]`);
   const openaiInput = body.querySelector(`[data-s-openai="${tileObj.id}"]`);
   const minimaxInput = body.querySelector(`[data-s-minimax="${tileObj.id}"]`);
+  const groqInput = body.querySelector(`[data-s-groq="${tileObj.id}"]`);
   const searchInput = body.querySelector(`[data-s-search="${tileObj.id}"]`);
   const togetherInput = body.querySelector(`[data-s-together="${tileObj.id}"]`);
   const mapboxInput = body.querySelector(`[data-s-mapbox="${tileObj.id}"]`);
@@ -150,6 +177,34 @@ export function renderSettingsTile(tileObj, body) {
     select.value = value;
   }
 
+  // The app_config key that holds the API key for a given provider.
+  function providerKeyName(provider) {
+    if (provider === "minimax") return "llm/minimax_api_key";
+    if (provider === "openai") return "llm/openai_api_key";
+    if (provider === "anthropic") return "llm/anthropic_api_key";
+    return `llm/${provider}_api_key`;
+  }
+
+  // Reflect, for the selected provider, whether a key is already saved.
+  function updateProviderHint() {
+    const prov = providerSelect.value;
+    const keyName = providerKeyName(prov);
+    const saved = ui.loadedSettings && ui.loadedSettings[keyName];
+    provKeyInput.placeholder = saved
+      ? `${prov} key (saved — leave blank to keep)`
+      : `API key for ${prov}`;
+    if (prov === "minimax") {
+      provHint.textContent = "Your current setup. Anthropic-compatible MiniMax endpoint.";
+    } else {
+      provHint.textContent = saved ? "" : `No ${prov} key saved yet — enter one to use this provider.`;
+    }
+  }
+
+  providerSelect.addEventListener("change", () => {
+    provKeyInput.value = "";
+    updateProviderHint();
+  });
+
   // Load settings
   async function loadS() {
     const s = await invoke("get_app_settings");
@@ -158,16 +213,22 @@ export function renderSettingsTile(tileObj, body) {
     aboutInput.value = s["user/about"] || "";
     locationInput.value = s["user/location"] || "";
 
-    const currentModel = s["llm/model"] || "MiniMax-M2.7";
+    const currentModel = s["llm/model"] || "MiniMax-M3";
     modelSelect.value = currentModel;
+    providerSelect.value = s["llm/provider"] || "minimax";
+    provKeyInput.value = "";
+    maxTokensInput.value = s["llm/max_tokens"] || "";
+    updateProviderHint();
 
     openaiInput.value = "";
     minimaxInput.value = "";
+    groqInput.value = "";
     searchInput.value = "";
     togetherInput.value = "";
     mapboxInput.value = "";
     openaiInput.placeholder = s["llm/openai_api_key"] ? "OpenAI key (saved)" : "OpenAI API key";
     minimaxInput.placeholder = s["llm/minimax_api_key"] ? "MiniMax key (saved)" : "MiniMax API key";
+    groqInput.placeholder = s["llm/groq_api_key"] ? "Groq key (saved)" : "Groq API key (voice transcription)";
     searchInput.placeholder = s["search/brave_api_key"] ? "Search key (saved)" : "Web search key";
     togetherInput.placeholder = s["imagegen/together_api_key"] ? "Together key (saved)" : "Together AI key";
     mapboxInput.placeholder = s["maps/mapbox_api_key"] ? "Mapbox key (saved)" : "Mapbox API key (maps)";
@@ -201,13 +262,25 @@ export function renderSettingsTile(tileObj, body) {
       "user/name": nameInput.value.trim(),
       "user/about": aboutInput.value.trim(),
       "user/location": locationInput.value.trim(),
-      "llm/provider": "minimax",
+      "llm/provider": providerSelect.value,
       "llm/model": modelSelect.value.trim(),
       "imagegen/provider": imgProvSelect.value.trim(),
       "imagegen/model": imgModelSelect.value.trim()
     };
+    // Max response tokens: store a positive integer, or "" to fall back to the default.
+    const maxTokensRaw = maxTokensInput.value.trim();
+    if (maxTokensRaw === "" || /^\d+$/.test(maxTokensRaw) && parseInt(maxTokensRaw, 10) > 0) {
+      updates["llm/max_tokens"] = maxTokensRaw;
+    } else {
+      statusEl.textContent = "Max response tokens must be a positive whole number — not saved";
+      setTimeout(() => { statusEl.textContent = ""; }, 3000);
+      return;
+    }
+    // Generic provider key → the selected provider's key setting (only when entered).
+    if (provKeyInput.value.trim()) updates[providerKeyName(providerSelect.value)] = provKeyInput.value.trim();
     if (openaiInput.value.trim()) updates["llm/openai_api_key"] = openaiInput.value.trim();
     if (minimaxInput.value.trim()) updates["llm/minimax_api_key"] = minimaxInput.value.trim();
+    if (groqInput.value.trim()) updates["llm/groq_api_key"] = groqInput.value.trim();
     if (searchInput.value.trim()) updates["search/brave_api_key"] = searchInput.value.trim();
     if (togetherInput.value.trim()) updates["imagegen/together_api_key"] = togetherInput.value.trim();
     if (mapboxInput.value.trim()) {

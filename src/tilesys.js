@@ -1,8 +1,13 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getTileRenderer } from "./registry.js";
-import { workspace, sidebarNav, navSettingsBtn, tiles, chatStreams, tileMaps, ui } from "./state.js";
+import { workspace, tiles, chatStreams, tileMaps, ui } from "./state.js";
 import { escapeHtml } from "./utils.js";
 import { addChatTile } from "./chat.js";
+import { updateSidebar } from "./sidebar.js";
+
+// Re-exported so existing importers (main.js) can keep importing updateSidebar
+// from tilesys.js. The implementation lives in sidebar.js.
+export { updateSidebar };
 
 // ==================== TILE MANAGEMENT ====================
 export const TILE_TYPES = [
@@ -15,6 +20,7 @@ export const TILE_TYPES = [
   { type: "agents",     label: "Agents",     dot: "blue"  },
   { type: "memory",     label: "Memory",     dot: "purple" },
   { type: "content",    label: "Content",    dot: "off"   },
+  { type: "studio",     label: "Studio",     dot: "green" },
 ];
 
 export function updateWorkspaceGrid() {
@@ -180,51 +186,8 @@ export function getChatTileBySessionId(sessionId) {
 }
 
 // ==================== SIDEBAR ====================
-export function updateSidebar() {
-  sidebarNav.innerHTML = "";
-
-  for (const def of TILE_TYPES) {
-    const openTiles = getTilesByType(def.type);
-    const isOpen = openTiles.length > 0;
-
-    const btn = document.createElement("button");
-    btn.className = `nav-item${isOpen ? " open" : ""}`;
-    // Title doubles as the tooltip when the sidebar collapses to its icon rail.
-    btn.title = def.label;
-    btn.innerHTML = `
-      <span class="nav-dot ${isOpen ? def.dot : "off"}"></span>
-      ${def.label}
-      ${openTiles.length > 1 ? `<span class="nav-count">${openTiles.length}</span>` : ""}
-      <span class="nav-pip"></span>
-      <button class="nav-add" title="Add ${def.label}">+</button>
-    `;
-
-    // Click label to focus existing or add new
-    btn.addEventListener("click", (e) => {
-      if (e.target.classList.contains("nav-add")) return;
-      if (isOpen) {
-        focusTile(openTiles[0].id);
-      } else {
-        openTileForType(def.type);
-      }
-    });
-
-    // Click + to always add new
-    const addBtn = btn.querySelector(".nav-add");
-    addBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      openTileForType(def.type);
-    });
-
-    sidebarNav.appendChild(btn);
-  }
-
-  // Update static sidebar buttons
-  const settingsOpen = getTilesByType("settings").length > 0;
-  navSettingsBtn.classList.toggle("open", settingsOpen);
-  const settingsDot = navSettingsBtn.querySelector(".nav-dot");
-  if (settingsDot) settingsDot.className = `nav-dot ${settingsOpen ? "purple" : "off"}`;
-}
+// The categorized sidebar (tabs + chat-history browser) lives in sidebar.js.
+// updateSidebar is re-exported from there at the top of this module.
 
 export function openTileForType(type) {
   if (type === "chat") {

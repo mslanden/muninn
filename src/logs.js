@@ -50,7 +50,7 @@ export async function refreshLogsTile(tileId) {
   }
 
   if (!items.length) {
-    list.replaceChildren(emptyState({ icon: "✓", text: "No activity yet" }));
+    list.replaceChildren(emptyState({ icon: "check", text: "No activity yet" }));
     return;
   }
 

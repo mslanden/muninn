@@ -1,16 +1,25 @@
-//! Agent-owned to-do list: ephemeral per-session scratchpad that the agent
-//! rewrites via the `write_todos` tool. Held in `AppState.todos` as a
-//! `HashMap<session_id, Vec<TodoItem>>` — intentionally not persisted.
-//!
-//! The agent's plan is only useful for the lifetime of a chat turn + a little
-//! beyond (so a subsequent follow-up turn can see the checked-off state). If
-//! the app restarts, the plan is gone and the agent rebuilds it.
+//! Agent-owned to-do list: per-session scratchpad the agent rewrites via the
+//! `write_todos` tool. Held in `AppState.todos` as a
+//! `HashMap<session_id, Vec<TodoItem>>` for fast access, and mirrored to the
+//! `session_todos` table so a chat's plan survives an app restart (the UI
+//! rehydrates it via `get_todos`).
 
+use rusqlite::params;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
+use crate::db::with_db;
 use crate::models::TodoItem;
 use crate::AppState;
+
+/// Serialize todos to the canonical JSON array used in both the DB row and the
+/// `todos-changed` event / `get_todos` output.
+fn todos_to_json(items: &[TodoItem]) -> Vec<Value> {
+    items
+        .iter()
+        .map(|i| json!({"content": i.content, "status": i.status, "activeForm": i.active_form}))
+        .collect()
+}
 
 const ALLOWED_STATUSES: &[&str] = &["pending", "in_progress", "completed"];
 
@@ -60,6 +69,18 @@ pub(crate) fn write_todos(
         todos.insert(session_id.to_string(), items.clone());
     }
 
+    // Persist so the plan survives a restart (best-effort — failure here must not
+    // fail the tool call; the in-memory copy is still authoritative this session).
+    let json_items = todos_to_json(&items);
+    let _ = with_db(state, |db| {
+        db.execute(
+            "INSERT INTO session_todos (session_id, todos_json, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP) \
+             ON CONFLICT(session_id) DO UPDATE SET todos_json = excluded.todos_json, updated_at = CURRENT_TIMESTAMP",
+            params![session_id, serde_json::to_string(&json_items).unwrap_or_else(|_| "[]".to_string())],
+        )
+        .map_err(|e| e.to_string())
+    });
+
     let _ = app.emit(
         "todos-changed",
         json!({
@@ -76,25 +97,26 @@ pub(crate) fn write_todos(
 /// Get a read-only snapshot of the current list (used by the UI to rehydrate
 /// after reload, not by the agent).
 pub(crate) fn get_todos(state: &AppState, session_id: &str) -> Vec<Value> {
-    let todos = match state.todos.lock() {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
-    };
-    todos
-        .get(session_id)
-        .map(|items| {
-            items
-                .iter()
-                .map(|i| {
-                    json!({
-                        "content": i.content,
-                        "status": i.status,
-                        "activeForm": i.active_form,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    // In-memory copy wins when present (same-session, freshest).
+    if let Ok(todos) = state.todos.lock() {
+        if let Some(items) = todos.get(session_id) {
+            return todos_to_json(items);
+        }
+    }
+    // Otherwise rehydrate from the DB (e.g. after an app restart).
+    with_db(state, |db| {
+        let stored: Option<String> = db
+            .query_row(
+                "SELECT todos_json FROM session_todos WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        Ok(stored
+            .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
+            .unwrap_or_default())
+    })
+    .unwrap_or_default()
 }
 
 /// Drop todos for a session — called when a session is deleted.
@@ -102,4 +124,8 @@ pub(crate) fn clear_for_session(state: &AppState, session_id: &str) {
     if let Ok(mut todos) = state.todos.lock() {
         todos.remove(session_id);
     }
+    let _ = with_db(state, |db| {
+        db.execute("DELETE FROM session_todos WHERE session_id = ?1", params![session_id])
+            .map_err(|e| e.to_string())
+    });
 }
