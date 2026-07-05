@@ -2,158 +2,291 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="theme-color" content="#0d1117">
+<meta name="theme-color" content="#050507">
 <title>Muninn</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%230d1117'/%3E%3Ctext%20x='16'%20y='23'%20font-size='20'%20text-anchor='middle'%20fill='%2358d36e'%20font-family='monospace'%3EM%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='4'%20fill='%23050507'/%3E%3Ctext%20x='16'%20y='23'%20font-size='20'%20text-anchor='middle'%20fill='%23e0e0e4'%20font-family='monospace'%20font-weight='700'%3EM%3C/text%3E%3C/svg%3E">
 <style>
+  /* Muninn design tokens (dark) — from src/styles.css */
   :root {
-    --bg: #0d1117;
-    --bg2: #161b22;
-    --bg3: #1c2430;
-    --border: #232c38;
-    --border2: #30363d;
-    --fg: #e6edf3;
-    --fg-dim: #8b98a8;
-    --fg-dimmer: #5f6b7a;
-    --green: #58d36e;
-    --blue: #58a6ff;
-    --red: #f85149;
-    --yellow: #e3b341;
-    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-    --sys: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --bg: #050507;
+    --card: #0c0c10;
+    --surface: #0f0f14;
+    --border: #1a1a22;
+    --border-hover: #2a2a36;
+    --text: #e0e0e4;
+    --muted: #8e8ea2;
+    --dim: #6e6e82;
+    --accent: #b0b0c4;
+    --live: #4ade80;
+    --warn: #fbbf24;
+    --blue: #60a5fa;
+    --red: #ef4444;
+    --purple: #a78bfa;
+    --overlay-light: rgba(255,255,255,0.02);
+    --overlay-medium: rgba(255,255,255,0.04);
+    /* aliases kept so any stray reference stays coherent */
+    --fg: var(--text);
+    --fg-dim: var(--muted);
+    --fg-dimmer: var(--dim);
+    --green: var(--live);
+    --yellow: var(--warn);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    --sys: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
     --safe-b: env(safe-area-inset-bottom, 0px);
     --safe-t: env(safe-area-inset-top, 0px);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #F4F1EC;
+      --card: #EBE7E0;
+      --surface: #E3DFD7;
+      --border: #D5D0C8;
+      --border-hover: #C2BCB2;
+      --text: #2C2A26;
+      --muted: #6B6660;
+      --dim: #908A82;
+      --accent: #4A4640;
+      --live: #5A8F5C;
+      --warn: #B8923A;
+      --blue: #4A7FAF;
+      --red: #C0584E;
+      --purple: #7E6DAF;
+      --overlay-light: rgba(0,0,0,0.02);
+      --overlay-medium: rgba(0,0,0,0.04);
+    }
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
     margin: 0; padding: 0; height: 100%;
-    background: var(--bg); color: var(--fg);
+    background:
+      radial-gradient(ellipse at 20% 20%, rgba(90,90,110,0.05) 0%, transparent 50%),
+      radial-gradient(ellipse at 80% 80%, rgba(70,70,90,0.04) 0%, transparent 50%),
+      var(--bg);
+    background-attachment: fixed;
+    color: var(--text);
     font-family: var(--sys); font-size: 16px;
     overflow: hidden;
     -webkit-text-size-adjust: 100%;
   }
+  ::-webkit-scrollbar { width: 0; height: 0; }
   #app { height: 100%; display: flex; flex-direction: column; }
   .view { display: none; height: 100%; flex-direction: column; min-height: 0; }
   .view.active { display: flex; }
+
   button {
-    font-family: inherit; font-size: 16px; color: var(--fg);
-    background: var(--bg3); border: 1px solid var(--border2);
-    border-radius: 10px; padding: 10px 14px; cursor: pointer;
-    min-height: 44px;
+    font-family: inherit; font-size: 16px; color: var(--text);
+    background: var(--overlay-medium); border: 1px solid var(--border);
+    border-radius: 4px; padding: 10px 14px; cursor: pointer;
+    min-height: 44px; letter-spacing: .02em;
   }
-  button:active { opacity: .7; }
+  button:active { border-color: var(--border-hover); background: var(--surface); }
   button:disabled { opacity: .4; }
-  .btn-primary { background: #17361f; border-color: #2ea043; color: var(--green); }
-  .btn-danger { background: #35171a; border-color: #6e2b2f; color: var(--red); }
-  .btn-ghost { background: transparent; border-color: transparent; }
+  .btn-primary { background: var(--overlay-medium); border-color: var(--border); color: var(--live); }
+  .btn-primary:active { border-color: var(--live); }
+  .btn-danger { background: var(--overlay-medium); border-color: var(--border); color: var(--red); }
+  .btn-danger:active { border-color: var(--red); }
+  .btn-ghost { background: transparent; border-color: transparent; color: var(--muted); }
   a { color: var(--blue); }
   code, pre { font-family: var(--mono); }
+
+  /* brand wordmark */
+  .brand-mark {
+    display: flex; align-items: baseline; gap: 6px; flex: 1; min-width: 0;
+  }
+  .brand-mark .word {
+    font-family: var(--mono); font-weight: 700; font-size: 13px;
+    letter-spacing: 4px; color: var(--text); text-transform: uppercase;
+  }
+  .brand-mark .tag {
+    font-family: var(--mono); font-size: 9px; letter-spacing: 1px;
+    color: var(--dim); text-transform: uppercase;
+  }
+
+  /* status dot — driven by #recon.show (reconnecting) */
+  .status-dot {
+    width: 6px; height: 6px; border-radius: 50%; flex: none;
+    background: var(--live); box-shadow: 0 0 6px rgba(74,222,128,.5);
+  }
+  #recon.show ~ #app .status-dot,
+  body:has(#recon.show) .status-dot {
+    background: var(--warn); box-shadow: 0 0 6px rgba(251,191,36,.5);
+  }
 
   /* reconnect bar */
   #recon {
     display: none; position: fixed; top: 0; left: 0; right: 0;
-    padding: calc(4px + var(--safe-t)) 8px 4px; text-align: center;
-    background: #3a2f10; color: var(--yellow); font-size: 12px; z-index: 100;
+    padding: calc(5px + var(--safe-t)) 8px 5px; text-align: center;
+    background: var(--card); border-bottom: 1px solid var(--border);
+    color: var(--warn); font-size: 9px; letter-spacing: 3px;
+    text-transform: uppercase; z-index: 100;
   }
   #recon.show { display: block; }
 
-  /* ===== Sessions view ===== */
-  .topbar {
+  /* ===== headers (tile-header look) ===== */
+  .topbar, .chat-header {
     display: flex; align-items: center; gap: 8px;
-    padding: calc(10px + var(--safe-t)) 12px 10px;
-    background: var(--bg); border-bottom: 1px solid var(--border);
+    min-height: 40px;
+    padding-left: 12px; padding-right: 6px;
+    padding-top: var(--safe-t);
+    background: var(--card); border-bottom: 1px solid var(--border);
   }
-  .topbar h1 { font-size: 18px; margin: 0; flex: 1; font-weight: 600; }
-  .topbar .brand { color: var(--green); font-family: var(--mono); }
-  .icon-btn { min-width: 44px; padding: 8px; }
+  .chat-header { padding-left: 6px; }
+  .chat-header .label {
+    flex: 1; font-size: 9px; text-transform: uppercase; letter-spacing: 3px;
+    color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .icon-btn { min-width: 44px; min-height: 40px; padding: 8px; font-size: 18px; }
+
+  /* ===== Sessions view ===== */
   #sessList { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding-bottom: calc(20px + var(--safe-b)); }
   .sect-label {
-    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
-    color: var(--fg-dimmer); padding: 14px 16px 6px;
+    font-size: 9px; text-transform: uppercase; letter-spacing: 3px;
+    color: var(--muted); padding: 16px 16px 8px;
   }
   .srow {
     padding: 12px 16px; border-bottom: 1px solid var(--border);
-    cursor: pointer; display: flex; flex-direction: column; gap: 3px;
+    cursor: pointer; display: flex; flex-direction: column; gap: 4px;
   }
-  .srow:active { background: var(--bg2); }
-  .srow .title { font-size: 15px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .srow .meta { font-size: 12px; color: var(--fg-dim); display: flex; gap: 8px; }
-  .srow .pin { color: var(--yellow); }
+  .srow:active { background: var(--overlay-medium); }
+  .srow .title { font-size: 13px; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .srow .meta { font-size: 10px; color: var(--dim); display: flex; gap: 8px; letter-spacing: .04em; }
+  .srow .pin { color: var(--warn); }
   .newchat-wrap { padding: 14px 16px calc(14px + var(--safe-b)); }
-  #newChatBtn { width: 100%; }
-  .empty { padding: 40px 20px; text-align: center; color: var(--fg-dim); }
+  #newChatBtn { width: 100%; text-transform: uppercase; letter-spacing: 2px; font-size: 11px; }
+  .empty { padding: 40px 20px; text-align: center; color: var(--muted); font-size: 13px; line-height: 1.6; }
 
   /* ===== Chat view ===== */
-  .chat-header {
-    display: flex; align-items: center; gap: 8px;
-    padding: calc(8px + var(--safe-t)) 10px 8px;
-    background: var(--bg); border-bottom: 1px solid var(--border);
-  }
-  .chat-header .label { flex: 1; font-size: 14px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #goalBanner {
-    display: none; padding: 8px 12px; background: #1a2a1e;
-    border-bottom: 1px solid #24422b; color: var(--green); font-size: 13px;
+    display: none; align-items: center; gap: 8px;
+    padding: 8px 14px; background: var(--surface);
+    border-bottom: 1px solid var(--border); color: var(--text); font-size: 12px;
   }
-  #goalBanner.show { display: block; }
+  #goalBanner.show { display: flex; }
   #transcript {
     flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
-    padding: 12px 12px 8px; display: flex; flex-direction: column; gap: 10px;
+    padding: 14px 14px 10px; display: flex; flex-direction: column; gap: 18px;
     min-height: 0;
   }
-  .bubble { max-width: 85%; padding: 9px 12px; border-radius: 14px; font-size: 15px; line-height: 1.45; word-wrap: break-word; overflow-wrap: anywhere; }
-  .bubble.user { align-self: flex-end; background: #143d2a; border: 1px solid #1f5a3d; border-bottom-right-radius: 4px; }
-  .bubble.assistant { align-self: flex-start; background: var(--bg2); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+
+  /* chat turns — open terminal-log aesthetic, no bubbles */
+  .bubble {
+    max-width: 100%; align-self: stretch;
+    font-size: 13.5px; line-height: 1.7; color: var(--text);
+    word-wrap: break-word; overflow-wrap: anywhere;
+    padding-left: 10px; border-left: 1px solid var(--border);
+  }
+  .bubble::before {
+    display: block; margin-bottom: 5px;
+    font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 3px;
+  }
+  .bubble.user { border-left-color: var(--accent); }
+  .bubble.user::before { content: "YOU"; color: var(--accent); }
+  .bubble.assistant::before { content: "MUNINN"; color: var(--text); }
   .bubble p { margin: 0 0 8px; } .bubble p:last-child { margin-bottom: 0; }
-  .bubble pre { background: #0a0e14; border: 1px solid var(--border2); border-radius: 8px; padding: 10px; overflow-x: auto; font-size: 13px; margin: 6px 0; }
-  .bubble code { background: #0a0e14; padding: 1px 5px; border-radius: 5px; font-size: 13px; }
-  .bubble pre code { background: none; padding: 0; }
-  .bubble .cursor { display: inline-block; width: 7px; height: 14px; background: var(--green); animation: blink 1s steps(2) infinite; vertical-align: text-bottom; }
+  .bubble pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 2px;
+    padding: 12px; overflow-x: auto; font-size: 11px; line-height: 1.6;
+    color: var(--accent); margin: 8px 0;
+  }
+  .bubble code {
+    background: var(--overlay-medium); border: 1px solid var(--border);
+    border-radius: 2px; padding: 1px 5px; font-size: 0.9em;
+  }
+  .bubble pre code { background: none; border: none; padding: 0; }
+  .bubble .cursor { display: inline-block; width: 7px; height: 14px; background: var(--live); animation: blink 1s steps(2) infinite; vertical-align: text-bottom; }
   @keyframes blink { 50% { opacity: 0; } }
 
   .chip {
-    align-self: flex-start; font-family: var(--mono); font-size: 12px;
-    color: var(--fg-dim); background: var(--bg2); border: 1px solid var(--border);
-    border-radius: 8px; padding: 5px 10px; max-width: 90%;
+    align-self: flex-start; font-family: var(--mono); font-size: 11px;
+    color: var(--muted); background: var(--overlay-medium); border: 1px solid var(--border);
+    border-radius: 3px; padding: 5px 10px; max-width: 100%;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .chip.done { color: var(--green); }
-  .sysline { align-self: center; font-size: 12px; color: var(--fg-dimmer); text-align: center; padding: 2px 8px; max-width: 90%; }
-  .sysline.goal { color: var(--green); }
+  .chip.done { color: var(--live); border-color: var(--border-hover); }
+  .sysline { align-self: center; font-size: 11px; color: var(--dim); text-align: center; padding: 2px 8px; max-width: 100%; letter-spacing: .03em; }
+  .sysline.goal { color: var(--live); }
   .sysline.err { color: var(--red); }
 
   .card {
-    align-self: stretch; background: var(--bg2); border: 1px solid var(--border2);
-    border-radius: 12px; padding: 12px; font-size: 14px; display: flex; flex-direction: column; gap: 10px;
+    align-self: stretch; background: var(--card); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px; font-size: 13px; display: flex; flex-direction: column; gap: 10px;
   }
-  .card .q { color: var(--fg); }
-  .card .cmd { font-family: var(--mono); font-size: 13px; background: #0a0e14; border: 1px solid var(--border2); border-radius: 8px; padding: 8px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
-  .card .note { font-size: 12px; color: var(--fg-dim); }
+  .card .q { color: var(--text); font-size: 13px; line-height: 1.5; }
+  .card .cmd {
+    font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--accent);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 2px;
+    padding: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  .card .note { font-size: 10px; text-transform: uppercase; letter-spacing: 2px; color: var(--muted); }
   .card .btns { display: flex; gap: 8px; flex-wrap: wrap; }
   .card .btns button { flex: 1; min-width: 100px; }
-  .card .out { font-family: var(--mono); font-size: 12px; background: #0a0e14; border: 1px solid var(--border2); border-radius: 8px; padding: 8px; overflow-x: auto; white-space: pre-wrap; max-height: 200px; overflow-y: auto; }
-  .card input[type=text] {
-    width: 100%; font-size: 16px; padding: 10px; border-radius: 8px;
-    background: var(--bg); border: 1px solid var(--border2); color: var(--fg);
+  .card .out {
+    font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--accent);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 2px;
+    padding: 12px; overflow-x: auto; white-space: pre-wrap; max-height: 200px; overflow-y: auto;
   }
+  .card input[type=text] {
+    width: 100%; font-size: 16px; padding: 10px; border-radius: 4px;
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    font-family: var(--mono);
+  }
+  .card input[type=text]:focus { outline: none; border-color: var(--border-hover); }
 
   .composer {
     display: flex; align-items: flex-end; gap: 8px;
     padding: 8px 10px calc(8px + var(--safe-b));
-    background: var(--bg); border-top: 1px solid var(--border);
+    background: var(--card); border-top: 1px solid var(--border);
   }
   .composer textarea {
     flex: 1; resize: none; font-family: inherit; font-size: 16px;
-    line-height: 1.4; padding: 11px 12px; border-radius: 12px;
-    background: var(--bg2); border: 1px solid var(--border2); color: var(--fg);
+    line-height: 1.4; padding: 11px 12px; border-radius: 4px;
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
     max-height: 120px; overflow-y: auto;
   }
+  .composer textarea:focus { outline: none; border-color: var(--border-hover); }
   .composer button { min-width: 44px; padding: 11px 14px; }
+  .composer .attach-btn { font-size: 18px; }
+
+  /* attachment preview strip (above composer) */
+  .attach-strip {
+    display: none; gap: 8px; padding: 8px 10px 0; overflow-x: auto;
+    background: var(--card); border-top: 1px solid var(--border);
+  }
+  .attach-strip.show { display: flex; }
+  .attach-thumb {
+    position: relative; flex: none; width: 56px; height: 56px;
+    border-radius: 4px; overflow: hidden; border: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .attach-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .attach-thumb .rm {
+    position: absolute; top: 1px; right: 1px; width: 18px; height: 18px;
+    min-height: 0; padding: 0; border-radius: 50%; font-size: 11px; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.6); border: 1px solid var(--border); color: var(--text);
+  }
+
+  /* images inside a chat turn */
+  .bubble img.chat-img {
+    display: block; max-width: 100%; border-radius: 6px;
+    margin: 8px 0; border: 1px solid var(--border); cursor: zoom-in;
+  }
+  .sysline.shot { color: var(--muted); }
+
+  /* fullscreen image overlay (tap to dismiss) */
+  #imgOverlay {
+    display: none; position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,.92); align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  #imgOverlay.show { display: flex; }
+  #imgOverlay img { max-width: 100%; max-height: 100%; border-radius: 4px; }
 
   /* ===== No-token screen ===== */
   #noToken { align-items: center; justify-content: center; text-align: center; padding: 30px; gap: 16px; }
   #noToken .big { font-size: 44px; }
-  #noToken h2 { margin: 0; font-weight: 600; }
-  #noToken p { color: var(--fg-dim); max-width: 320px; line-height: 1.5; }
+  #noToken h2 { margin: 0; font-weight: 700; text-transform: uppercase; letter-spacing: 4px; font-size: 18px; }
+  #noToken p { color: var(--muted); max-width: 320px; line-height: 1.6; font-size: 13px; }
 </style>
 
 <div id="recon">reconnecting…</div>
@@ -162,14 +295,15 @@
   <!-- No token -->
   <div id="noToken" class="view">
     <div class="big">🔗</div>
-    <h2>Connect to Muninn</h2>
-    <p>Open <span style="color:var(--green)">Muninn → Settings</span> on your Mac and scan the QR code to pair this phone.</p>
+    <h2>Muninn</h2>
+    <p>Open <span style="color:var(--live)">Muninn → Settings</span> on your Mac and scan the QR code to pair this phone.</p>
   </div>
 
   <!-- Sessions -->
   <div id="sessionsView" class="view">
     <div class="topbar">
-      <h1><span class="brand">Muninn</span></h1>
+      <span class="brand-mark"><span class="word">MUNINN</span><span class="tag">MOBILE</span></span>
+      <span class="status-dot" title="Connection"></span>
       <button class="icon-btn btn-ghost" id="refreshBtn" title="Refresh">⟳</button>
     </div>
     <div id="sessList"><div class="empty">Loading…</div></div>
@@ -183,11 +317,15 @@
     <div class="chat-header">
       <button class="icon-btn btn-ghost" id="backBtn">‹</button>
       <span class="label" id="chatLabel">Chat</span>
+      <span class="status-dot" title="Connection"></span>
       <button class="icon-btn btn-ghost" id="chatRefreshBtn" title="Refresh">⟳</button>
     </div>
     <div id="goalBanner"></div>
     <div id="transcript"></div>
+    <div class="attach-strip" id="attachStrip"></div>
     <div class="composer">
+      <button class="btn-ghost attach-btn" id="attachBtn" title="Attach photo">📷</button>
+      <input type="file" id="fileInput" accept="image/*" multiple style="display:none">
       <textarea id="composerInput" rows="1" placeholder="Message… (/goal to set a goal)"></textarea>
       <button class="btn-danger" id="stopBtn" style="display:none">■</button>
       <button class="btn-primary" id="sendBtn">↑</button>
@@ -195,6 +333,8 @@
   </div>
 
 </div>
+
+<div id="imgOverlay"><img alt=""></div>
 
 <script>
 "use strict";
@@ -301,6 +441,149 @@
   var inFlight = false;        // is a turn running for currentSession
   var liveBubble = null;       // { el, text } for streaming
   var chipEls = {};            // tool_name -> chip element (best effort)
+  var pendingAttachments = []; // [{ media_type, data (base64 no prefix) }]
+
+  // ---------- image attachments ----------
+  var MAX_ATTACHMENTS = 4;
+
+  // Downscale/re-encode a File to a { media_type, data } attachment. Keeps small PNGs (likely
+  // with transparency) as-is; everything else is re-encoded as JPEG at max dimension 1600px.
+  function fileToAttachment(file) {
+    return new Promise(function (resolve, reject) {
+      var isPng = file.type === "image/png";
+      if (isPng && file.size < 500 * 1024) {
+        var r = new FileReader();
+        r.onload = function () {
+          var s = String(r.result || "");
+          var comma = s.indexOf(",");
+          resolve({ media_type: "image/png", data: comma >= 0 ? s.slice(comma + 1) : s });
+        };
+        r.onerror = function () { reject(new Error("read failed")); };
+        r.readAsDataURL(file);
+        return;
+      }
+      var url = URL.createObjectURL(file);
+      var img = new Image();
+      img.onload = function () {
+        try {
+          var max = 1600;
+          var w = img.naturalWidth || img.width;
+          var h = img.naturalHeight || img.height;
+          var scale = Math.min(1, max / Math.max(w, h));
+          var cw = Math.max(1, Math.round(w * scale));
+          var ch = Math.max(1, Math.round(h * scale));
+          var canvas = document.createElement("canvas");
+          canvas.width = cw; canvas.height = ch;
+          var ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, cw, ch);
+          var dataUrl = canvas.toDataURL("image/jpeg", 0.8);
+          URL.revokeObjectURL(url);
+          var comma = dataUrl.indexOf(",");
+          resolve({ media_type: "image/jpeg", data: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl });
+        } catch (e) {
+          URL.revokeObjectURL(url);
+          reject(e);
+        }
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); reject(new Error("decode failed")); };
+      img.src = url;
+    });
+  }
+
+  function renderAttachStrip() {
+    var strip = $("attachStrip");
+    if (!pendingAttachments.length) {
+      strip.classList.remove("show");
+      strip.innerHTML = "";
+      return;
+    }
+    strip.innerHTML = "";
+    pendingAttachments.forEach(function (att, i) {
+      var thumb = document.createElement("div");
+      thumb.className = "attach-thumb";
+      var im = document.createElement("img");
+      im.src = "data:" + att.media_type + ";base64," + att.data;
+      thumb.appendChild(im);
+      var rm = document.createElement("button");
+      rm.className = "rm";
+      rm.textContent = "✕";
+      rm.addEventListener("click", function () {
+        pendingAttachments.splice(i, 1);
+        renderAttachStrip();
+      });
+      thumb.appendChild(rm);
+      strip.appendChild(thumb);
+    });
+    strip.classList.add("show");
+  }
+
+  function onFilesPicked(files) {
+    var list = Array.prototype.slice.call(files || []);
+    if (!list.length) return;
+    var room = MAX_ATTACHMENTS - pendingAttachments.length;
+    if (room <= 0) { alert("Up to " + MAX_ATTACHMENTS + " images per message."); return; }
+    list = list.slice(0, room);
+    Promise.all(list.map(function (f) {
+      return fileToAttachment(f).catch(function () { return null; });
+    })).then(function (atts) {
+      atts.forEach(function (a) { if (a) pendingAttachments.push(a); });
+      renderAttachStrip();
+    });
+  }
+
+  // ---------- fullscreen image overlay ----------
+  function openImageOverlay(src) {
+    var ov = $("imgOverlay");
+    ov.querySelector("img").src = src;
+    ov.classList.add("show");
+  }
+  function closeImageOverlay() {
+    var ov = $("imgOverlay");
+    ov.classList.remove("show");
+    ov.querySelector("img").src = "";
+  }
+
+  // Append an <img> (tap-to-zoom) into a bubble element.
+  function appendImageToBubble(el, mediaType, data) {
+    var src = "data:" + (mediaType || "image/png") + ";base64," + (data || "");
+    var im = document.createElement("img");
+    im.className = "chat-img";
+    im.src = src;
+    im.addEventListener("click", function () { openImageOverlay(src); });
+    el.appendChild(im);
+  }
+
+  // Fetch a generated image (by content-dir path) via the authed /api/image endpoint and render
+  // it as an assistant turn with the prompt as caption.
+  function renderGeneratedImage(path, prompt) {
+    if (!path) return;
+    var t = $("transcript");
+    var stick = nearBottom();
+    var el = document.createElement("div");
+    el.className = "bubble assistant";
+    if (prompt) {
+      var cap = document.createElement("div");
+      cap.className = "sysline shot";
+      cap.textContent = "🎨 " + prompt;
+      el.appendChild(cap);
+    }
+    fetch("/api/image?path=" + encodeURIComponent(path), {
+      headers: { "Authorization": "Bearer " + TOKEN }
+    }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.blob();
+    }).then(function (blob) {
+      var src = URL.createObjectURL(blob);
+      var im = document.createElement("img");
+      im.className = "chat-img";
+      im.src = src;
+      im.addEventListener("click", function () { openImageOverlay(src); });
+      el.appendChild(im);
+      if (stick) scrollBottom();
+    }).catch(function () {});
+    t.appendChild(el);
+    if (stick) scrollBottom();
+  }
 
   // ============================================================
   // Sessions view
@@ -370,6 +653,8 @@
     inFlight = false;
     liveBubble = null;
     chipEls = {};
+    pendingAttachments = [];
+    renderAttachStrip();
     $("chatLabel").textContent = label || "Chat";
     $("transcript").innerHTML = "";
     $("goalBanner").classList.remove("show");
@@ -389,7 +674,7 @@
       $("transcript").innerHTML = "";
       liveBubble = null;
       (msgs || []).forEach(function (m) {
-        addMessageBubble(m.role, m.content);
+        addMessageBubble(m.role, m.content, imageBlocksOf(m));
       });
       scrollBottom();
     }).catch(function (e) {
@@ -432,14 +717,32 @@
     return (t.scrollHeight - t.scrollTop - t.clientHeight) < 120;
   }
 
-  function addMessageBubble(role, content) {
+  // Extract base64 image blocks from a message record's `blocks` array (Anthropic shape).
+  function imageBlocksOf(m) {
+    var out = [];
+    var blocks = m && m.blocks;
+    if (!Array.isArray(blocks)) return out;
+    blocks.forEach(function (b) {
+      if (b && b.type === "image" && b.source && b.source.type === "base64") {
+        out.push({ media_type: b.source.media_type || "image/png", data: b.source.data || "" });
+      }
+    });
+    return out;
+  }
+
+  function addMessageBubble(role, content, images) {
     var t = $("transcript");
     var el = document.createElement("div");
     el.className = "bubble " + (role === "user" ? "user" : "assistant");
+    var textEl = document.createElement("div");
     if (role === "user") {
-      el.innerHTML = esc(content).replace(/\n/g, "<br>");
+      textEl.innerHTML = esc(content).replace(/\n/g, "<br>");
     } else {
-      el.innerHTML = renderMarkdown(content || "");
+      textEl.innerHTML = renderMarkdown(content || "");
+    }
+    if (content != null && String(content).length) el.appendChild(textEl);
+    if (images && images.length) {
+      images.forEach(function (im) { appendImageToBubble(el, im.media_type, im.data); });
     }
     t.appendChild(el);
     return el;
@@ -629,9 +932,10 @@
   function sendMessage() {
     var ta = $("composerInput");
     var text = ta.value.trim();
-    if (!text || !currentSession) return;
+    if (!currentSession) return;
+    if (!text && !pendingAttachments.length) return;
 
-    // /goal handling
+    // /goal handling (text-only; images are ignored for these commands)
     if (text === "/goal") {
       api("GET", "/api/goal?session_id=" + encodeURIComponent(currentSession)).then(function (r) {
         addSysLine(r && r.goal ? "Current goal: " + r.goal : "No goal set.");
@@ -658,16 +962,22 @@
       return;
     }
 
+    var atts = pendingAttachments.slice();
+    pendingAttachments = [];
+    renderAttachStrip();
     ta.value = ""; autogrow();
-    dispatchChat(text);
+    dispatchChat(text, atts);
   }
 
-  function dispatchChat(message) {
-    addMessageBubble("user", message);
+  function dispatchChat(message, attachments) {
+    var atts = attachments || [];
+    addMessageBubble("user", message, atts);
     scrollBottom();
     setInFlight(true);
     var sid = currentSession;
-    api("POST", "/api/chat", { session_id: sid, message: message }).then(function (r) {
+    var body = { session_id: sid, message: message };
+    if (atts.length) body.attachments = atts;
+    api("POST", "/api/chat", body).then(function (r) {
       if (sid !== currentSession) return;
       // Final confirmation. If streaming produced a live bubble it is finalized
       // by chat-done; otherwise render the reply now.
@@ -827,6 +1137,27 @@
       case "command-deferred":
         addDeferredCard(p.id, p.command, p.verifier_note);
         break;
+      case "screen-captured": {
+        // Finalize any streaming bubble, then show the screenshot as an assistant turn.
+        if (liveBubble) { liveBubble.el.innerHTML = renderMarkdown(liveBubble.text); liveBubble = null; }
+        var stick = nearBottom();
+        var shot = document.createElement("div");
+        shot.className = "bubble assistant";
+        var lbl = document.createElement("div");
+        lbl.className = "sysline shot";
+        lbl.textContent = "📸 " + (p.note || "screenshot");
+        shot.appendChild(lbl);
+        appendImageToBubble(shot, p.media_type, p.data);
+        $("transcript").appendChild(shot);
+        if (stick) scrollBottom();
+        break;
+      }
+      case "image-generated": {
+        // Payload carries only a filesystem path into the content dir; fetch + render it.
+        if (liveBubble) { liveBubble.el.innerHTML = renderMarkdown(liveBubble.text); liveBubble = null; }
+        renderGeneratedImage(p.path, p.prompt);
+        break;
+      }
       case "todos-changed":
         // low priority — ignore
         break;
@@ -855,6 +1186,13 @@
     $("chatRefreshBtn").addEventListener("click", refreshChatData);
     $("sendBtn").addEventListener("click", sendMessage);
     $("stopBtn").addEventListener("click", stopChat);
+    // attachments
+    $("attachBtn").addEventListener("click", function () { $("fileInput").click(); });
+    $("fileInput").addEventListener("change", function () {
+      onFilesPicked(this.files);
+      this.value = ""; // allow re-picking the same file
+    });
+    $("imgOverlay").addEventListener("click", closeImageOverlay);
     var ta = $("composerInput");
     ta.addEventListener("input", autogrow);
     ta.addEventListener("keydown", function (e) {

@@ -35,6 +35,10 @@
   "bundle": {
     "active": true,
     "targets": "app",
-    "icon": ["icons/icon.icns", "icons/icon.png"]
+    "icon": ["icons/icon.icns", "icons/icon.png"],
+    "macOS": {
+      "signingIdentity": "Apple Development: Marcelino Landen (3T593VUA4L)",
+      "entitlements": "Entitlements.plist"
+    }
   }
 }

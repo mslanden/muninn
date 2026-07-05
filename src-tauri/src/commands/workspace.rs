@@ -49,6 +49,17 @@ pub fn set_workspace_root(state: State<AppState>, req: WorkspaceRootRequest) -> 
         *c = canon;
     }
 
+    // Persist so the default directory survives restarts (restored in lib.rs setup).
+    crate::db::with_db(&state, |db| {
+        db.execute(
+            "INSERT INTO app_config (key, value, updated_at) VALUES ('workspace/default_root', ?1, CURRENT_TIMESTAMP) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+            rusqlite::params![root.display().to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })?;
+
     Ok(PathResult {
         workspace_root: root.display().to_string(),
     })

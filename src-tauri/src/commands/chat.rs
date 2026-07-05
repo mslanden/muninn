@@ -293,6 +293,47 @@ pub(crate) async fn chat_core(app: &AppHandle, state: &AppState, req: ChatReques
         });
     }
 
+    // Auto-title: if the session has no title yet, name it from this exchange in the
+    // background (best-effort; never blocks the turn). The guarded UPDATE means a manual
+    // rename that lands in the meantime always wins.
+    let untitled: bool = with_db(&state, |db| {
+        db.query_row(
+            "SELECT COALESCE(title, '') = '' FROM sessions WHERE id = ?1",
+            params![req.session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .unwrap_or(false);
+    if untitled && !req.message.trim().is_empty() && latest_reply != STOPPED_BY_USER_SENTINEL {
+        let title_app = app.clone();
+        let title_session = req.session_id.clone();
+        let title_user_msg = req.message.clone();
+        let title_reply = latest_reply.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = title_app.state::<AppState>();
+            let title = match generate_session_title(&state, &title_user_msg, &title_reply).await {
+                Ok(t) => t,
+                Err(_) => return, // best-effort: leave untitled, retry next turn
+            };
+            let updated = with_db(&state, |db| {
+                db.execute(
+                    "UPDATE sessions SET title = ?1 WHERE id = ?2 AND COALESCE(title, '') = ''",
+                    params![title, title_session],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap_or(0);
+            if updated > 0 {
+                use tauri::Emitter;
+                let _ = title_app.emit(
+                    "session-titled",
+                    serde_json::json!({ "session_id": title_session, "title": title }),
+                );
+            }
+        });
+    }
+
     // Return the last iteration's reply (equals the first reply when no goal loop ran).
     Ok(ChatResponse { reply: latest_reply })
 }

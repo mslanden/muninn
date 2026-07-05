@@ -45,7 +45,16 @@ const FORWARDED_EVENTS: &[&str] = &[
     "user-question-timeout",
     "command-deferred",
     "todos-changed",
+    "session-titled",
+    "screen-captured",
+    "image-generated",
 ];
+
+/// Per-attachment base64 size cap (~14MB of base64 ≈ ~10MB of binary, mirroring the desktop
+/// binary limit once base64's ~33% overhead is accounted for).
+const MAX_ATTACHMENT_B64_BYTES: usize = 14 * 1024 * 1024;
+/// Max number of attachments accepted on a single chat turn.
+const MAX_ATTACHMENTS: usize = 4;
 
 /// Live server handle. `None` when stopped.
 struct MobileServer {
@@ -286,6 +295,7 @@ fn build_router(ctx: AppCtx) -> Router {
         .route("/api/deferred/approve", post(api_deferred_approve))
         .route("/api/deferred/dismiss", post(api_deferred_dismiss))
         .route("/api/answer", post(api_answer))
+        .route("/api/image", get(api_get_image))
         .with_state(ctx)
 }
 
@@ -396,6 +406,49 @@ fn err_response(e: String) -> Response {
         .into_response()
 }
 
+fn bad_request(e: String) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response()
+}
+
+/// Parse an optional `attachments` array from a chat body into `ChatAttachment`s. Accepts
+/// objects with either `media_type`/`mediaType` and a base64 `data` string (no `data:` prefix).
+/// Enforces the per-attachment size cap and the max-count limit; on violation returns the
+/// error message the caller should surface as a 400.
+fn parse_attachments(body: &Value) -> Result<Option<Vec<crate::models::ChatAttachment>>, String> {
+    let arr = match body.get("attachments") {
+        Some(Value::Array(a)) => a,
+        Some(Value::Null) | None => return Ok(None),
+        Some(_) => return Err("attachments must be an array".to_string()),
+    };
+    if arr.is_empty() {
+        return Ok(None);
+    }
+    if arr.len() > MAX_ATTACHMENTS {
+        return Err(format!("too many attachments (max {})", MAX_ATTACHMENTS));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let media_type = item
+            .get("media_type")
+            .or_else(|| item.get("mediaType"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("image/png")
+            .to_string();
+        let data = item
+            .get("data")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "attachment missing data".to_string())?;
+        if data.len() > MAX_ATTACHMENT_B64_BYTES {
+            return Err("attachment too large".to_string());
+        }
+        out.push(crate::models::ChatAttachment {
+            media_type,
+            data: data.to_string(),
+        });
+    }
+    Ok(Some(out))
+}
+
 // ---- Guarded handler macro helper -------------------------------------------------------
 
 macro_rules! guard {
@@ -466,13 +519,17 @@ async fn api_chat(
     if session_id.is_empty() {
         return err_response("session_id is required".to_string());
     }
+    let attachments = match parse_attachments(&body) {
+        Ok(a) => a,
+        Err(e) => return bad_request(e),
+    };
     let req = crate::models::ChatRequest {
         session_id,
         message,
         provider: None,
         model: None,
         agent_id: None,
-        attachments: None,
+        attachments,
     };
     // Long-running; the phone streams tokens over WS. HTTP returns the final reply.
     let app = ctx.app.clone();
@@ -617,6 +674,79 @@ async fn api_answer(
     }
 }
 
+/// Resolve a client-requested image path against the content directory, rejecting anything
+/// that escapes it. Canonicalizes both the content root and the requested path (following any
+/// symlinks) and requires the resolved path to sit inside the root. Returns the canonical path
+/// on success. Kept free of `AppHandle` so it is unit-testable.
+fn resolve_content_image(
+    content_root: &std::path::Path,
+    requested: &str,
+) -> Result<std::path::PathBuf, String> {
+    let root_canon = content_root
+        .canonicalize()
+        .map_err(|e| format!("content dir unavailable: {}", e))?;
+    let req_canon = std::path::Path::new(requested)
+        .canonicalize()
+        .map_err(|_| "not found".to_string())?;
+    if !req_canon.starts_with(&root_canon) {
+        return Err("forbidden".to_string());
+    }
+    if !req_canon.is_file() {
+        return Err("not found".to_string());
+    }
+    Ok(req_canon)
+}
+
+fn image_content_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        _ => "image/png",
+    }
+}
+
+/// Serve an image file from the app content directory. SECURITY: the requested path is
+/// canonicalized and required to be inside the content dir; anything else yields 403 and no
+/// arbitrary filesystem path is ever served.
+async fn api_get_image(
+    State(ctx): State<AppCtx>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    guard!(ctx, headers, q);
+    let requested = match q.get("path") {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => return bad_request("path is required".to_string()),
+    };
+    let content_root = match crate::tools::content_dir(&ctx.app) {
+        Ok(d) => d,
+        Err(e) => return err_response(e),
+    };
+    let path = match resolve_content_image(&content_root, &requested) {
+        Ok(p) => p,
+        Err(e) if e == "forbidden" => {
+            return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response()
+        }
+        Err(e) => return (StatusCode::NOT_FOUND, Json(json!({ "error": e }))).into_response(),
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, image_content_type(&path))],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => err_response(e.to_string()),
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // LAN address discovery (for the desktop status command)
 // ------------------------------------------------------------------------------------------
@@ -730,6 +860,39 @@ mod tests {
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
         // Two consecutive tokens should differ.
         assert_ne!(t, generate_token());
+    }
+
+    #[test]
+    fn resolve_content_image_scoping() {
+        use std::io::Write;
+        // Build a temp content dir with one image and a sibling secret file outside it.
+        let base = std::env::temp_dir().join(format!("muninn_img_test_{}", uuid::Uuid::new_v4()));
+        let content = base.join("content");
+        std::fs::create_dir_all(&content).unwrap();
+        let inside = content.join("ok.png");
+        std::fs::File::create(&inside).unwrap().write_all(b"png").unwrap();
+        let outside = base.join("secret.txt");
+        std::fs::File::create(&outside).unwrap().write_all(b"secret").unwrap();
+
+        // A file inside the content dir resolves.
+        let ok = resolve_content_image(&content, inside.to_str().unwrap());
+        assert!(ok.is_ok(), "expected in-dir image to resolve, got {:?}", ok);
+
+        // A file outside the content dir is forbidden.
+        let esc = resolve_content_image(&content, outside.to_str().unwrap());
+        assert_eq!(esc, Err("forbidden".to_string()));
+
+        // Traversal that escapes the root is forbidden (canonicalization collapses ..).
+        let traversal = content.join("../secret.txt");
+        let esc2 = resolve_content_image(&content, traversal.to_str().unwrap());
+        assert_eq!(esc2, Err("forbidden".to_string()));
+
+        // A non-existent path is not found.
+        let missing = content.join("nope.png");
+        let nf = resolve_content_image(&content, missing.to_str().unwrap());
+        assert_eq!(nf, Err("not found".to_string()));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

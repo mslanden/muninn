@@ -112,7 +112,27 @@ pub fn run() {
             // A quit/crash mid-run leaves tasks stuck in 'running'; reschedule them.
             scheduler::recover_stuck_tasks(&conn);
 
-            let (workspace_root, workspace_root_canon) = tools::default_workspace_root()?;
+            // Restore the persisted default directory (Settings → "Default directory") if it
+            // still exists on disk; otherwise fall back to the built-in default. Without this
+            // the root silently reset to $HOME on every launch.
+            let (workspace_root, workspace_root_canon) = {
+                let saved: Option<String> = conn
+                    .query_row(
+                        "SELECT value FROM app_config WHERE key = 'workspace/default_root'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                match saved
+                    .filter(|s| !s.trim().is_empty())
+                    .map(std::path::PathBuf::from)
+                    .and_then(|p| p.canonicalize().ok().map(|c| (p, c)))
+                    .filter(|(_, c)| c.is_dir())
+                {
+                    Some((root, canon)) => (root, canon),
+                    None => tools::default_workspace_root()?,
+                }
+            };
             drop(conn);
             let http = Client::builder()
                 .timeout(std::time::Duration::from_secs(90))

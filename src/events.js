@@ -319,6 +319,14 @@ export async function setupEventListeners() {
     }
   });
 
+  await listen("session-titled", async () => {
+    // A background LLM call named a session — refresh the sidebar's chat list.
+    try {
+      const { refreshSessionList } = await import("./sidebar.js");
+      refreshSessionList();
+    } catch { /* sidebar not present (pop-out window) */ }
+  });
+
   await listen("todos-changed", (event) => {
     const payload = event.payload || {};
     const sid = payload.session_id;
@@ -452,6 +460,40 @@ export async function setupEventListeners() {
       <div class="turn-body">
         <img src="${src}" alt="${prompt.replace(/"/g, '&quot;')}" style="max-width:100%; border-radius:8px; margin:8px 0;" />
         <p class="image-caption">${escapeHtml(prompt)}</p>
+      </div>
+    `;
+    chatLog.appendChild(el);
+    chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
+  });
+
+  await listen("screen-captured", (event) => {
+    const { session_id, media_type, data, note } = event.payload;
+    const tile = getChatTileBySessionId(session_id);
+    if (!tile) return;
+    const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
+    if (!chatLog) return;
+    const stream = chatStreams[tile.id];
+
+    // Finalize any open text bubble before inserting the screenshot
+    if (stream && stream.bubble) {
+      stream.bubble.innerHTML = renderMarkdown(stream.text);
+      stream.bubble = null;
+      stream.text = "";
+    }
+
+    const mt = escapeHtml(media_type || "image/png");
+    const src = `data:${mt};base64,${data || ""}`;
+    const caption = note ? escapeHtml(note) : "screenshot";
+    const el = document.createElement("div");
+    el.className = "turn image-turn";
+    el.innerHTML = `
+      <div class="turn-header">
+        <span class="turn-label muninn">MUNINN</span>
+        <span class="turn-time">${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+      </div>
+      <div class="turn-body">
+        <img src="${src}" alt="screenshot" style="max-width:100%; border-radius:8px; margin:8px 0;" />
+        <p class="image-caption">📸 ${caption}</p>
       </div>
     `;
     chatLog.appendChild(el);

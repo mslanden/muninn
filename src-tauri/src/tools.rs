@@ -2296,8 +2296,21 @@ pub(crate) async fn execute_agent_tool(
             // Stash the image on the per-session side channel; the chat loop attaches it to
             // this tool_result so the vision model can see it (tool dispatch returns text only).
             if let Ok(mut map) = state.captured_images.lock() {
-                map.entry(session_id.to_string()).or_default().push((media_type, data));
+                map.entry(session_id.to_string())
+                    .or_default()
+                    .push((media_type.clone(), data.clone()));
             }
+            // Surface the screenshot to any open UI (desktop chat tile + paired phones) so the
+            // user can see what the model was shown. The base64 may be a few MB — acceptable.
+            let _ = app.emit(
+                "screen-captured",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "media_type": media_type,
+                    "data": data,
+                    "note": note,
+                }),
+            );
             Ok(note)
         }
         "open_app" => {

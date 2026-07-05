@@ -644,6 +644,85 @@ pub(crate) async fn evaluate_goal_met(
     Ok(parse_condition_verdict(&crate::feeds::strip_think_tags(text)))
 }
 
+/// Generate a short human title for a chat session from its first exchange. One-shot,
+/// non-streaming, deliberately cheap. Errors are returned (the caller treats titling as
+/// best-effort and just leaves the session untitled).
+pub(crate) async fn generate_session_title(
+    state: &AppState,
+    user_msg: &str,
+    assistant_reply: &str,
+) -> Result<String, String> {
+    let cfg = resolve_llm_config(state).map_err(|e| format!("no LLM configured: {e}"))?;
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
+
+    let user_part = crate::tools::truncate_chars(user_msg, 1500);
+    let reply_part = crate::tools::truncate_chars(assistant_reply, 1500);
+    let prompt = format!(
+        "Name this chat conversation.\n\nUSER'S FIRST MESSAGE:\n{user_part}\n\n\
+        ASSISTANT'S REPLY (excerpt):\n{reply_part}\n\n\
+        Reply with ONLY the title — 2 to 6 words, no quotes, no trailing punctuation."
+    );
+    let system = "You name chat conversations. Reply with only a concise 2-6 word title \
+        describing the topic — no quotes, no punctuation at the end, no explanations.";
+
+    let request_body = if is_anthropic {
+        json!({
+            "model": model, "max_tokens": 40, "stream": false,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    } else {
+        json!({
+            "model": model, "max_tokens": 40, "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ]
+        })
+    };
+
+    let resp = if is_anthropic {
+        state.http.post(&endpoint)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body).send().await
+    } else {
+        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
+    };
+    let resp = match resp {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => return Err(format!("title call failed: HTTP {}", r.status())),
+        Err(e) => return Err(format!("title call error: {e}")),
+    };
+    let body: Value = resp.json().await.map_err(|e| format!("title parse error: {e}"))?;
+    let text = if is_anthropic {
+        body.get("content").and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
+    } else {
+        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
+            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
+            .and_then(Value::as_str).unwrap_or("")
+    };
+    let title = sanitize_session_title(&crate::feeds::strip_think_tags(text));
+    if title.is_empty() {
+        return Err("title model returned nothing usable".to_string());
+    }
+    Ok(title)
+}
+
+/// Normalize a model-proposed session title: first non-empty line, quotes/backticks and
+/// trailing punctuation stripped, whitespace collapsed, capped at 60 chars on a char boundary.
+fn sanitize_session_title(text: &str) -> String {
+    let first_line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let stripped = first_line
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '“' | '”'))
+        .trim_end_matches(['.', '!', ':', ';', ','])
+        .trim();
+    let collapsed: String = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(60).collect::<String>().trim_end().to_string()
+}
+
 /// Interpret a gate model's reply: met only on an explicit affirmative first token, so blank
 /// or garbled output fails closed (no downstream action). Returns `(met, reason)`.
 fn parse_condition_verdict(text: &str) -> (bool, String) {
@@ -4011,6 +4090,16 @@ mod tests {
         assert!(matches!(parse_command_verdict("maybe, it depends"), CommandVerdict::Escalate(_)));
         assert!(matches!(parse_command_verdict(""), CommandVerdict::Escalate(_)));
         assert!(matches!(parse_command_verdict("I think this is fine"), CommandVerdict::Escalate(_)));
+    }
+
+    #[test]
+    fn session_title_sanitizer_strips_quotes_punctuation_and_caps_length() {
+        assert_eq!(sanitize_session_title("\"Confession Times Lookup.\""), "Confession Times Lookup");
+        assert_eq!(sanitize_session_title("  Fix   login   bug!  "), "Fix login bug");
+        assert_eq!(sanitize_session_title("Title: here\nsecond line ignored"), "Title: here");
+        assert_eq!(sanitize_session_title("\n\n  \n"), "");
+        let long = "word ".repeat(30);
+        assert!(sanitize_session_title(&long).chars().count() <= 60);
     }
 
     #[test]
