@@ -577,6 +577,7 @@ function renderVideoSection(el, id) {
       segments: [], filter: "none", texts: [], aspect: "", speed: 1, mute: false,
       captions: false, captionStyle: "boxed",
       normalizeAudio: false, denoise: false, fade: null, output_name: null,
+      smartReframe: false,
     };
   }
   // The single source of truth for what Render produces. "Plan with AI" fills it;
@@ -598,6 +599,7 @@ function renderVideoSection(el, id) {
       plan.normalizeAudio === d.normalizeAudio &&
       plan.denoise === d.denoise &&
       plan.fade === d.fade &&
+      plan.smartReframe === d.smartReframe &&
       !plan.output_name;
   }
   // Copy a plan-shaped object (an AI result or a saved plan — both use EditPlan's snake_case
@@ -616,6 +618,7 @@ function renderVideoSection(el, id) {
     plan.normalizeAudio = !!src.normalize_audio;
     plan.denoise = !!src.denoise;
     plan.fade = src.fade || d.fade;
+    plan.smartReframe = !!src.smart_reframe;
     plan.output_name = src.output_name || d.output_name;
   }
   // UI-only toggle for the "Cut filler words" checkbox — not part of the render payload.
@@ -830,6 +833,9 @@ function renderVideoSection(el, id) {
         <select data-vd-aspect style="width:auto;">
           ${VIDEO_ASPECTS.map(([v, l]) => `<option value="${v}" ${v === plan.aspect ? "selected" : ""}>${l}</option>`).join("")}
         </select>
+        <label class="studio-chip" title="${plan.aspect ? "Track faces so speakers stay in frame instead of a static center-crop (only when cropping to a narrower aspect)" : "Choose an aspect ratio first"}">
+          <input type="checkbox" data-vd-reframe ${plan.smartReframe ? "checked" : ""} ${plan.aspect ? "" : "disabled"} /> Keep subject in frame
+        </label>
         <label class="muted" style="font-size:11px;">Speed
           <input type="number" min="0.25" max="4" step="0.25" value="${plan.speed}" data-vd-speed style="width:64px; margin-left:4px;" />
         </label>
@@ -915,7 +921,18 @@ function renderVideoSection(el, id) {
     // These edit `plan` in place without a full drawPlan() rebuild, so refresh the preview
     // directly (filter/aspect are visible in the player; mute/caption-style feed it too).
     planBox.querySelector("[data-vd-filter]").addEventListener("change", (e) => { plan.filter = e.target.value; refreshPreview(); });
-    planBox.querySelector("[data-vd-aspect]").addEventListener("change", (e) => { plan.aspect = e.target.value; refreshPreview(); });
+    planBox.querySelector("[data-vd-aspect]").addEventListener("change", (e) => {
+      plan.aspect = e.target.value;
+      // "Keep subject in frame" only makes sense with an aspect chosen — toggle its enabled
+      // state without a full rebuild, and clear it when the aspect is removed.
+      const rf = planBox.querySelector("[data-vd-reframe]");
+      if (rf) {
+        rf.disabled = !plan.aspect;
+        if (!plan.aspect) { rf.checked = false; plan.smartReframe = false; }
+      }
+      refreshPreview();
+    });
+    planBox.querySelector("[data-vd-reframe]").addEventListener("change", (e) => { plan.smartReframe = e.target.checked; scheduleAutosave(); });
     planBox.querySelector("[data-vd-speed]").addEventListener("change", (e) => { plan.speed = parseFloat(e.target.value) || 1; drawPlan(); });
     planBox.querySelector("[data-vd-mute]").addEventListener("change", (e) => { plan.mute = e.target.checked; refreshPreview(); });
     planBox.querySelector("[data-vd-captions]").addEventListener("change", (e) => { plan.captions = e.target.checked; drawPlan(); });
@@ -1004,6 +1021,7 @@ function renderVideoSection(el, id) {
       normalize_audio: plan.normalizeAudio,
       denoise: plan.denoise,
       fade: plan.fade || null,
+      smart_reframe: plan.smartReframe,
       output_name: plan.output_name || null,
     };
   }

@@ -448,6 +448,13 @@ pub struct EditPlan {
     /// at the very start/end of the OUTPUT timeline. None = no fade.
     #[serde(default)]
     pub fade: Option<f64>,
+    /// Subject-aware crop: when `aspect` makes the output NARROWER than the source (e.g.
+    /// 16:9 → 9:16), detect faces on-device and drive a dynamic horizontal crop so speakers
+    /// stay in frame instead of being decapitated by a static center-crop. A harmless no-op
+    /// when the aspect doesn't narrow, when no faces are detected, or when the framescan
+    /// sidecar is unavailable (all fall back silently to the center crop).
+    #[serde(default)]
+    pub smart_reframe: bool,
 }
 
 /// Available burned-in caption styles: "boxed" (white on a semi-transparent black box —
@@ -892,6 +899,7 @@ pub(crate) fn build_render_args(
     font: &str,
     text_files: &[PathBuf],
     ass_file: Option<&Path>,
+    reframe: Option<&ReframeTrack>,
     encoder: VideoEncoder,
     out: &Path,
 ) -> Result<Vec<String>, String> {
@@ -1021,7 +1029,21 @@ pub(crate) fn build_render_args(
     }
     if let Some(a) = plan.aspect.as_deref() {
         let (aw, ah) = parse_aspect(a)?;
-        post.push(format!("crop=min(iw\\,ih*{aw}/{ah}):min(ih\\,iw*{ah}/{aw})"));
+        // Subject-aware crop replaces the static center-crop when a reframe track was computed
+        // (smart_reframe + a narrowing aspect + detected faces). The x expression is on the
+        // OUTPUT timeline, matching where this crop sits in the graph (after concat+setpts).
+        // Single-quote the x/y values so the nested if()'s commas aren't parsed as filter
+        // separators. Everything falls back to the static center-crop otherwise.
+        match reframe {
+            Some(rf) => post.push(format!(
+                "crop={cw}:{ch}:x='{expr}':y='{y}'",
+                cw = rf.crop_w,
+                ch = rf.crop_h,
+                expr = rf.x_expr,
+                y = rf.crop_y
+            )),
+            None => post.push(format!("crop=min(iw\\,ih*{aw}/{ah}):min(ih\\,iw*{ah}/{aw})")),
+        }
         post.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string());
     }
     // Burn-in captions AFTER speed (setpts) and crop so the ASS output-timeline timestamps
@@ -1150,6 +1172,365 @@ pub(crate) fn build_render_args(
         out.to_string_lossy().to_string(),
     ]);
     Ok(args)
+}
+
+// ---------- smart reframe (subject-aware crop) ----------
+//
+// When `EditPlan.aspect` makes the output narrower than the source, a static center-crop
+// decapitates off-center speakers. Smart reframe detects faces on-device (the
+// `muninn-framescan` Swift sidecar), computes a piecewise-constant HORIZONTAL crop track
+// that keeps the subject in frame, and emits it as a compact ffmpeg crop-x expression. Y
+// stays centered (vertical crops for wide targets are rare and unsupported here). Any
+// failure — missing sidecar, decode error, or simply no faces — falls back silently to the
+// static center-crop, so a render is never blocked by reframing.
+
+/// A detected face in one sampled frame. Normalized [0,1], TOP-LEFT origin, `c` = confidence.
+#[derive(Deserialize, Clone, Debug)]
+pub(crate) struct Face {
+    pub x: f64,
+    /// Parsed from the sidecar but unused: only horizontal (x) reframing is supported today
+    /// (vertical crops for wide targets are rare). Kept so the JSON schema stays complete.
+    #[allow(dead_code)]
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    #[serde(default)]
+    pub c: f64,
+}
+
+/// Faces detected in one sampled frame at source time `t` (seconds).
+#[derive(Deserialize, Clone, Debug)]
+pub(crate) struct FrameFaces {
+    pub t: f64,
+    #[serde(default)]
+    pub faces: Vec<Face>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct FrameScanResult {
+    #[serde(default)]
+    frames: Vec<FrameFaces>,
+}
+
+/// The computed dynamic crop for a render: fixed crop box `crop_w`×`crop_h` at a fixed
+/// vertical offset `crop_y`, with a horizontal `x_expr` (an ffmpeg expression over OUTPUT
+/// time `t`) that re-frames onto the subject. Consumed by `build_render_args`.
+#[derive(Clone, Debug)]
+pub(crate) struct ReframeTrack {
+    pub crop_w: u32,
+    pub crop_h: u32,
+    pub crop_y: u32,
+    pub x_expr: String,
+}
+
+// --- tuning constants ---
+/// Subject must leave the middle 40% of the current window to trigger a move — this is the
+/// half-band as a fraction of the window width (0.2 → 40% total).
+const REFRAME_EXIT_FRAC: f64 = 0.2;
+/// Subject must stay outside the band this long (source seconds) before the crop jumps.
+const REFRAME_DWELL_S: f64 = 0.5;
+/// Output-timeline windows shorter than this are merged into a neighbor.
+const REFRAME_MIN_WINDOW_S: f64 = 1.0;
+/// Hard cap on distinct crop windows (keeps the ffmpeg expression bounded).
+const REFRAME_MAX_WINDOWS: usize = 60;
+/// Frames-per-second sampled by the face-detection sidecar.
+const REFRAME_SCAN_FPS: f64 = 2.0;
+
+fn floor_even(v: f64) -> u32 {
+    let n = v.max(2.0) as u32;
+    n - (n % 2)
+}
+
+/// Crop box dimensions (even pixels) for `aspect` applied to the source — mirrors
+/// `output_resolution`'s crop math.
+fn crop_dims(probe: &VideoProbe, aw: u32, ah: u32) -> (u32, u32) {
+    let (iw, ih) = (probe.width as f64, probe.height as f64);
+    let cw = iw.min(ih * aw as f64 / ah as f64);
+    let ch = ih.min(iw * ah as f64 / aw as f64);
+    (floor_even(cw), floor_even(ch))
+}
+
+/// Locate the compiled `muninn-framescan` sidecar (see speech/framescan.swift). Same
+/// lookup as `transcriber_helper_path`: next to the app binary in bundled builds, else the
+/// build.rs output in src-tauri/binaries/ for dev and `cargo test`.
+fn framescan_helper_path() -> Option<PathBuf> {
+    let names = [
+        "muninn-framescan".to_string(),
+        format!("muninn-framescan-{}", env!("MUNINN_TARGET_TRIPLE")),
+    ];
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        for name in &names {
+            let p = exe_dir.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries").join(&names[1]);
+    dev.is_file().then_some(dev)
+}
+
+/// Run the face-detection sidecar over `src`, sampling at `fps`. Blocking. Errors (missing
+/// binary, decode failure, bad JSON) propagate so the caller can fall back to center crop.
+fn scan_faces(src: &Path, fps: f64) -> Result<Vec<FrameFaces>, String> {
+    let helper = framescan_helper_path()
+        .ok_or_else(|| "framescan helper not found (compiled by build.rs — needs Xcode)".to_string())?;
+    let out = Command::new(&helper)
+        .arg(src)
+        .arg("--fps")
+        .arg(format!("{fps}"))
+        .output()
+        .map_err(|e| format!("failed to start {}: {e}", helper.display()))?;
+    if !out.status.success() {
+        return Err(format!("framescan failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let r: FrameScanResult =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("framescan returned invalid JSON: {e}"))?;
+    Ok(r.frames)
+}
+
+/// Confidence-and-area-weighted horizontal subject center per frame (normalized). The
+/// largest face dominates (weight = confidence × area). `None` when a frame has no faces.
+fn subject_centers(frames: &[FrameFaces]) -> Vec<(f64, Option<f64>)> {
+    frames
+        .iter()
+        .map(|fr| {
+            let mut wsum = 0.0;
+            let mut xsum = 0.0;
+            for f in &fr.faces {
+                let weight = f.c.max(0.0) * (f.w * f.h).max(0.0);
+                if weight > 0.0 {
+                    wsum += weight;
+                    xsum += weight * (f.x + f.w / 2.0);
+                }
+            }
+            (fr.t, if wsum > 0.0 { Some(xsum / wsum) } else { None })
+        })
+        .collect()
+}
+
+/// A source-timeline window holding a constant subject center `cx` (normalized).
+#[derive(Clone, Debug, PartialEq)]
+struct SrcWin {
+    start: f64,
+    end: f64,
+    cx: f64,
+}
+
+/// Hysteresis: walk the per-frame subject centers and only commit a new crop position when
+/// the subject leaves the middle band of the current window (`win_norm` wide) for at least
+/// `REFRAME_DWELL_S`. Frames with no face hold the previous center. Returns contiguous
+/// source-time windows covering `[0, duration]`, or empty when no face was ever detected.
+fn hysteresis_windows(centers: &[(f64, Option<f64>)], win_norm: f64, duration: f64) -> Vec<SrcWin> {
+    let Some(first) = centers.iter().find_map(|(_, c)| *c) else {
+        return Vec::new();
+    };
+    let band = REFRAME_EXIT_FRAC * win_norm;
+    let mut wins: Vec<SrcWin> = Vec::new();
+    let mut cur = first;
+    let mut start = 0.0_f64;
+    let mut last_cx = first;
+    let mut outside_since: Option<f64> = None;
+
+    for (t, c) in centers {
+        let cx = c.unwrap_or(last_cx);
+        last_cx = cx;
+        if (cx - cur).abs() > band {
+            let os = *outside_since.get_or_insert(*t);
+            if *t - os >= REFRAME_DWELL_S {
+                // Commit: the crop held `cur` until the subject left (os); jump to the subject.
+                wins.push(SrcWin { start, end: os, cx: cur });
+                start = os;
+                cur = cx;
+                outside_since = None;
+            }
+        } else {
+            outside_since = None;
+        }
+    }
+    wins.push(SrcWin { start, end: duration.max(start), cx: cur });
+    wins
+}
+
+/// One piece of the OUTPUT-timeline crop track: from `out_start` (output seconds) the crop
+/// x is `x` pixels, until the next piece's `out_start`.
+#[derive(Clone, Debug, PartialEq)]
+struct OutPiece {
+    out_start: f64,
+    x: f64,
+}
+
+/// Convert a normalized subject center to a clamped pixel crop-x that centers the crop box
+/// (`cw` wide) on the subject within a `in_w`-wide frame.
+fn crop_x_for(cx_norm: f64, in_w: f64, cw: u32, max_x: f64) -> f64 {
+    ((cx_norm * in_w) - cw as f64 / 2.0).round().clamp(0.0, max_x)
+}
+
+/// Map source-time subject windows onto the OUTPUT timeline, walking the effective segments
+/// in playback order. Insert segments (source set) carry no detections, so their whole
+/// output slot is centered. This is where the "detection times are SOURCE, crop is OUTPUT"
+/// mapping happens — the same offset/speed logic as `map_interval_to_output`.
+fn build_output_pieces(
+    src_wins: &[SrcWin],
+    segments: &[Segment],
+    speed: f64,
+    in_w: f64,
+    cw: u32,
+    max_x: f64,
+    center_x: f64,
+) -> Vec<OutPiece> {
+    let speed = if speed > 0.0 { speed } else { 1.0 };
+    let mut pieces: Vec<OutPiece> = Vec::new();
+    let mut out_off = 0.0_f64;
+    for s in segments {
+        let dur = (s.end - s.start).max(0.0);
+        if s.source.is_some() {
+            // Insert (b-roll/image): no face data — hold centered for the whole slot.
+            pieces.push(OutPiece { out_start: out_off, x: center_x });
+        } else {
+            let mut emitted = false;
+            for w in src_wins {
+                let os = w.start.max(s.start);
+                let oe = w.end.min(s.end);
+                if oe - os > 1e-6 {
+                    let out_t = out_off + (os - s.start) / speed;
+                    pieces.push(OutPiece { out_start: out_t, x: crop_x_for(w.cx, in_w, cw, max_x) });
+                    emitted = true;
+                }
+            }
+            if !emitted {
+                pieces.push(OutPiece { out_start: out_off, x: center_x });
+            }
+        }
+        out_off += dur / speed;
+    }
+    pieces.sort_by(|a, b| a.out_start.partial_cmp(&b.out_start).unwrap_or(std::cmp::Ordering::Equal));
+    // Drop consecutive pieces that don't change the crop.
+    let mut merged: Vec<OutPiece> = Vec::with_capacity(pieces.len());
+    for p in pieces {
+        if merged.last().map_or(false, |l: &OutPiece| (l.x - p.x).abs() < 0.5) {
+            continue;
+        }
+        merged.push(p);
+    }
+    if let Some(f) = merged.first_mut() {
+        f.out_start = 0.0;
+    }
+    merged
+}
+
+/// Merge output pieces shorter than `min_len`, and cap the total at `max_n` by repeatedly
+/// absorbing the shortest window into its closest-x (smallest visual jump) neighbor. Clamps
+/// every x into `[0, max_x]`.
+fn post_process_pieces(mut pieces: Vec<OutPiece>, out_dur: f64, min_len: f64, max_n: usize, max_x: f64) -> Vec<OutPiece> {
+    for p in &mut pieces {
+        p.x = p.x.clamp(0.0, max_x);
+    }
+    if pieces.is_empty() {
+        return vec![OutPiece { out_start: 0.0, x: 0.0 }];
+    }
+    loop {
+        if pieces.len() <= 1 {
+            break;
+        }
+        // Find the shortest window (duration to the next boundary, or out_dur for the last).
+        let mut worst: Option<(usize, f64)> = None;
+        for i in 0..pieces.len() {
+            let end = if i + 1 < pieces.len() { pieces[i + 1].out_start } else { out_dur };
+            let d = end - pieces[i].out_start;
+            if worst.map_or(true, |(_, wd)| d < wd) {
+                worst = Some((i, d));
+            }
+        }
+        let (i, d) = worst.unwrap();
+        if d >= min_len && pieces.len() <= max_n {
+            break;
+        }
+        // Absorb piece i into whichever neighbor is the smaller crop jump.
+        let into_prev = if i == 0 {
+            false
+        } else if i + 1 >= pieces.len() {
+            true
+        } else {
+            (pieces[i - 1].x - pieces[i].x).abs() <= (pieces[i + 1].x - pieces[i].x).abs()
+        };
+        if into_prev {
+            pieces.remove(i); // previous window extends over the removed one
+        } else {
+            let start_i = pieces[i].out_start;
+            pieces[i + 1].out_start = start_i; // next window extends back over the removed one
+            pieces.remove(i);
+        }
+    }
+    if let Some(f) = pieces.first_mut() {
+        f.out_start = 0.0;
+    }
+    pieces
+}
+
+/// Emit the crop-x pieces as a nested ffmpeg `if(lt(t,T),X,...)` expression over OUTPUT time.
+fn pieces_to_expr(pieces: &[OutPiece]) -> String {
+    if pieces.is_empty() {
+        return "0".to_string();
+    }
+    let mut expr = format!("{}", pieces.last().unwrap().x.round() as i64);
+    for i in (1..pieces.len()).rev() {
+        let t = pieces[i].out_start;
+        let x = pieces[i - 1].x.round() as i64;
+        expr = format!("if(lt(t\\,{t:.3})\\,{x}\\,{expr})");
+    }
+    expr
+}
+
+/// Compute a reframe crop track from detected faces. Pure/unit-testable. Returns `None` (→
+/// static center crop) when the aspect doesn't narrow horizontally or no face was detected.
+pub(crate) fn compute_reframe_track(frames: &[FrameFaces], probe: &VideoProbe, plan: &EditPlan) -> Option<ReframeTrack> {
+    let (aw, ah) = plan.aspect.as_deref().and_then(|a| parse_aspect(a).ok())?;
+    let (cw, ch) = crop_dims(probe, aw, ah);
+    if cw >= probe.width {
+        return None; // not narrowing horizontally — nothing to reframe
+    }
+    let in_w = probe.width as f64;
+    let win_norm = cw as f64 / in_w;
+    let max_x = (probe.width - cw) as f64;
+    let center_x = (max_x / 2.0).round();
+    let crop_y = floor_even((probe.height.saturating_sub(ch)) as f64 / 2.0).min(probe.height.saturating_sub(ch));
+
+    let centers = subject_centers(frames);
+    let src_wins = hysteresis_windows(&centers, win_norm, probe.duration_s.max(0.0));
+    if src_wins.is_empty() {
+        return None; // no faces detected anywhere
+    }
+
+    let segments = effective_segments(plan, probe);
+    let speed = plan.speed.unwrap_or(1.0);
+    let pieces = build_output_pieces(&src_wins, &segments, speed, in_w, cw, max_x, center_x);
+    let out_dur = plan.output_duration(probe).max(0.01);
+    let pieces = post_process_pieces(pieces, out_dur, REFRAME_MIN_WINDOW_S, REFRAME_MAX_WINDOWS, max_x);
+
+    Some(ReframeTrack { crop_w: cw, crop_h: ch, crop_y, x_expr: pieces_to_expr(&pieces) })
+}
+
+/// Run the face scan and compute a reframe track for a render, or `None` to keep the static
+/// center-crop. Only fires when `smart_reframe` is set AND the aspect narrows the frame; any
+/// scan failure logs to stderr and falls back to center crop rather than failing the render.
+pub(crate) fn compute_reframe_for_render(src: &Path, probe: &VideoProbe, plan: &EditPlan) -> Option<ReframeTrack> {
+    if !plan.smart_reframe {
+        return None;
+    }
+    let (aw, ah) = plan.aspect.as_deref().and_then(|a| parse_aspect(a).ok())?;
+    let (cw, _ch) = crop_dims(probe, aw, ah);
+    if cw >= probe.width {
+        return None; // aspect doesn't narrow → smart_reframe is a harmless no-op
+    }
+    let frames = match scan_faces(src, REFRAME_SCAN_FPS) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[reframe] face scan failed, falling back to center crop: {e}");
+            return None;
+        }
+    };
+    compute_reframe_track(&frames, probe, plan)
 }
 
 // ---------- render (blocking; call from spawn_blocking) ----------
@@ -1340,9 +1721,16 @@ pub(crate) fn render_edit(
     }));
     let out_path = out_dir.join(format!("{stem}-{stamp}.mp4"));
 
+    // Smart reframe (subject-aware crop): scan the MAIN source for faces and compute a crop
+    // track. Returns None (→ static center crop) unless smart_reframe is on and the aspect
+    // narrows the frame; any scan failure falls back silently. Insert sources are never
+    // face-tracked (their output slots stay centered — see build_output_pieces).
+    let reframe = compute_reframe_for_render(src, &probe, &plan);
+
     let encoder = pick_encoder(prefer_hw_encode);
     let mut used_encoder = encoder;
-    let args = build_render_args(&inputs, &plan, font, &text_files, ass_file.as_deref(), encoder, &out_path)?;
+    let args =
+        build_render_args(&inputs, &plan, font, &text_files, ass_file.as_deref(), reframe.as_ref(), encoder, &out_path)?;
     let mut attempt = run_ffmpeg_attempt(app, job_id, &args, total_s)?;
     let mut fallback_note = String::new();
 
@@ -1363,6 +1751,7 @@ pub(crate) fn render_edit(
             font,
             &text_files,
             ass_file.as_deref(),
+            reframe.as_ref(),
             VideoEncoder::Libx264,
             &out_path,
         )?;
@@ -1644,7 +2033,7 @@ mod tests {
         out: &Path,
     ) -> Result<Vec<String>, String> {
         let inputs = vec![SourceInput { path: src.to_path_buf(), probe: probe.clone(), is_image: false }];
-        build_render_args(&inputs, plan, font, text_files, ass_file, encoder, out)
+        build_render_args(&inputs, plan, font, text_files, ass_file, None, encoder, out)
     }
 
     /// A minimal image-insert probe (dims only; no duration/audio, like ffprobe on a PNG).
@@ -1799,6 +2188,7 @@ mod tests {
             normalize_audio: true,
             denoise: true,
             fade: Some(0.5),
+            smart_reframe: false,
         };
         plan.validate(&probe).unwrap();
         let out = dir.join("out.mp4");
@@ -1874,6 +2264,7 @@ mod tests {
             &multi_plan,
             font_path().unwrap(),
             &[],
+            None,
             None,
             VideoEncoder::Libx264,
             &multi_out,
@@ -2454,6 +2845,7 @@ mod tests {
             "/tmp/f.ttc",
             &[],
             None,
+            None,
             VideoEncoder::Libx264,
             Path::new("/tmp/out.mp4"),
         )
@@ -2529,7 +2921,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let args = build_render_args(&inputs, &plan, "/tmp/f.ttc", &[], None, VideoEncoder::Libx264, Path::new("/tmp/out.mp4")).unwrap();
+        let args = build_render_args(&inputs, &plan, "/tmp/f.ttc", &[], None, None, VideoEncoder::Libx264, Path::new("/tmp/out.mp4")).unwrap();
         let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
         assert!(graph.contains("concat=n=2:v=1:a=0"), "graph: {graph}");
         assert!(!graph.contains("anullsrc"), "muted → no audio work at all: {graph}");
@@ -2633,6 +3025,253 @@ mod tests {
         );
         let out_probe = probe_video(&out).unwrap();
         assert!((out_probe.duration_s - probe.duration_s).abs() < 0.5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- smart reframe tests ----------
+
+    /// Build synthetic detection frames at `fps`: for each (start,end,cx) span, a face of
+    /// width `fw` centered at normalized x=`cx`, confidence 0.95.
+    fn frames_from_spans(spans: &[(f64, f64, f64)], fw: f64, duration: f64, fps: f64) -> Vec<FrameFaces> {
+        let step = 1.0 / fps;
+        let mut out = Vec::new();
+        let mut t = 0.0;
+        while t < duration - 1e-9 {
+            let cx = spans.iter().find(|(s, e, _)| t >= *s && t < *e).map(|(_, _, c)| *c);
+            let faces = match cx {
+                Some(c) => vec![Face { x: (c - fw / 2.0).max(0.0), y: 0.3, w: fw, h: 0.25, c: 0.95 }],
+                None => vec![],
+            };
+            out.push(FrameFaces { t, faces });
+            t += step;
+        }
+        out
+    }
+
+    #[test]
+    fn subject_center_is_confidence_and_area_weighted() {
+        // A big confident face at 0.7 should dominate a tiny low-confidence one at 0.2.
+        let fr = FrameFaces {
+            t: 0.0,
+            faces: vec![
+                Face { x: 0.65, y: 0.3, w: 0.10, h: 0.20, c: 0.99 }, // center 0.70, area 0.02
+                Face { x: 0.18, y: 0.3, w: 0.04, h: 0.05, c: 0.30 }, // center 0.20, tiny
+            ],
+        };
+        let centers = subject_centers(&[fr]);
+        let cx = centers[0].1.unwrap();
+        assert!(cx > 0.66 && cx < 0.71, "large confident face should dominate, got {cx}");
+        // A face-less frame yields None (caller holds the previous center).
+        assert_eq!(subject_centers(&[FrameFaces { t: 1.0, faces: vec![] }])[0].1, None);
+    }
+
+    #[test]
+    fn hysteresis_ignores_small_wobble() {
+        // Window ~0.32 wide → band ±0.064. A ±0.03 wobble around 0.5 must NOT move the crop.
+        let win_norm = 0.32;
+        let centers = vec![
+            (0.0, Some(0.50)),
+            (0.5, Some(0.53)),
+            (1.0, Some(0.47)),
+            (1.5, Some(0.52)),
+            (2.0, Some(0.49)),
+        ];
+        let wins = hysteresis_windows(&centers, win_norm, 3.0);
+        assert_eq!(wins.len(), 1, "small wobble should stay one window: {wins:?}");
+        assert!((wins[0].cx - 0.50).abs() < 1e-9);
+        assert!((wins[0].end - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hysteresis_one_clean_jump_on_sustained_move() {
+        // Subject at 0.3 for 5s then 0.7 for 5s — one jump, committed after the 0.5s dwell.
+        let win_norm = 0.32;
+        let frames = frames_from_spans(&[(0.0, 5.0, 0.3), (5.0, 10.0, 0.7)], 0.12, 10.0, 2.0);
+        let centers = subject_centers(&frames);
+        let wins = hysteresis_windows(&centers, win_norm, 10.0);
+        assert_eq!(wins.len(), 2, "expected exactly one reframe jump: {wins:?}");
+        assert!((wins[0].cx - 0.3).abs() < 1e-6);
+        assert!((wins[1].cx - 0.7).abs() < 1e-6);
+        // The boundary sits at the moment the subject left the band (~5.0s), not 0.5s later.
+        assert!((wins[0].end - 5.0).abs() < 0.6, "jump near 5.0s, got {}", wins[0].end);
+    }
+
+    #[test]
+    fn hysteresis_no_faces_yields_no_windows() {
+        let centers = vec![(0.0, None), (0.5, None), (1.0, None)];
+        assert!(hysteresis_windows(&centers, 0.32, 1.5).is_empty());
+    }
+
+    #[test]
+    fn build_output_pieces_centers_insert_slots() {
+        // main[0,5], image insert (2s), main[5,10]; one steady subject window at 0.3.
+        let src_wins = vec![SrcWin { start: 0.0, end: 10.0, cx: 0.3 }];
+        let segs = vec![
+            Segment::keep(0.0, 5.0),
+            Segment { start: 0.0, end: 2.0, source: Some("/x/card.png".into()) },
+            Segment::keep(5.0, 10.0),
+        ];
+        let in_w = 1920.0;
+        let cw = 606u32;
+        let max_x = 1920.0 - cw as f64; // 1314
+        let center_x = (max_x / 2.0).round(); // 657
+        let subject_x = crop_x_for(0.3, in_w, cw, max_x); // 0.3*1920-303 = 273
+        let pieces = build_output_pieces(&src_wins, &segs, 1.0, in_w, cw, max_x, center_x);
+        // subject(273) for the first main slot, centered(657) across the insert [5,7), then
+        // back to subject(273) for the last main slot.
+        assert_eq!(pieces.len(), 3, "pieces: {pieces:?}");
+        assert!((pieces[0].out_start - 0.0).abs() < 1e-9 && (pieces[0].x - subject_x).abs() < 1e-9);
+        assert!((pieces[1].out_start - 5.0).abs() < 1e-9 && (pieces[1].x - center_x).abs() < 1e-9);
+        assert!((pieces[2].out_start - 7.0).abs() < 1e-9 && (pieces[2].x - subject_x).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_output_pieces_maps_through_cuts_and_speed() {
+        // Cut removes source 5..20; speed 2x. A subject window changes across the cut.
+        let src_wins = vec![SrcWin { start: 0.0, end: 10.0, cx: 0.3 }, SrcWin { start: 10.0, end: 25.0, cx: 0.7 }];
+        let segs = vec![Segment::keep(0.0, 5.0), Segment::keep(20.0, 25.0)];
+        let in_w = 1920.0;
+        let cw = 606u32;
+        let max_x = 1920.0 - cw as f64;
+        let center_x = (max_x / 2.0).round();
+        let pieces = build_output_pieces(&src_wins, &segs, 2.0, in_w, cw, max_x, center_x);
+        // seg0 (src 0..5) → output 0..2.5 at x for cx 0.3; seg1 (src 20..25) starts at output
+        // 2.5 (5s of source / 2x) at x for cx 0.7.
+        assert_eq!(pieces.len(), 2, "pieces: {pieces:?}");
+        assert!((pieces[0].out_start - 0.0).abs() < 1e-9);
+        assert!((pieces[0].x - crop_x_for(0.3, in_w, cw, max_x)).abs() < 1e-9);
+        assert!((pieces[1].out_start - 2.5).abs() < 1e-9, "output-time boundary, got {}", pieces[1].out_start);
+        assert!((pieces[1].x - crop_x_for(0.7, in_w, cw, max_x)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn post_process_merges_short_windows() {
+        // A 0.4s sliver between two long windows must be absorbed into its closest-x neighbor.
+        let pieces = vec![
+            OutPiece { out_start: 0.0, x: 200.0 },
+            OutPiece { out_start: 4.0, x: 210.0 }, // 0.4s sliver, closer to the 200 window
+            OutPiece { out_start: 4.4, x: 900.0 },
+        ];
+        let out = post_process_pieces(pieces, 10.0, 1.0, 60, 1314.0);
+        assert_eq!(out.len(), 2, "sliver should merge away: {out:?}");
+        assert!((out[0].x - 200.0).abs() < 1e-9);
+        assert!((out[1].x - 900.0).abs() < 1e-9);
+        // The sliver was absorbed into the previous (200) window, which now runs up to where
+        // the sliver ended (4.4s) — that's where the 900 window begins.
+        assert!((out[1].out_start - 4.4).abs() < 1e-9, "got {}", out[1].out_start);
+    }
+
+    #[test]
+    fn post_process_caps_window_count() {
+        let mut pieces = Vec::new();
+        for i in 0..100 {
+            pieces.push(OutPiece { out_start: i as f64 * 2.0, x: (i % 2) as f64 * 500.0 });
+        }
+        let out = post_process_pieces(pieces, 200.0, 1.0, 60, 1314.0);
+        assert!(out.len() <= 60, "must cap at 60, got {}", out.len());
+    }
+
+    #[test]
+    fn post_process_clamps_x() {
+        let pieces = vec![OutPiece { out_start: 0.0, x: -50.0 }, OutPiece { out_start: 5.0, x: 99999.0 }];
+        let out = post_process_pieces(pieces, 10.0, 1.0, 60, 1314.0);
+        assert!(out.iter().all(|p| p.x >= 0.0 && p.x <= 1314.0), "clamped: {out:?}");
+        assert!((out[0].x - 0.0).abs() < 1e-9);
+        assert!((out[1].x - 1314.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pieces_to_expr_single_and_nested() {
+        assert_eq!(pieces_to_expr(&[OutPiece { out_start: 0.0, x: 657.0 }]), "657");
+        let expr = pieces_to_expr(&[
+            OutPiece { out_start: 0.0, x: 273.0 },
+            OutPiece { out_start: 5.0, x: 1041.0 },
+        ]);
+        assert_eq!(expr, "if(lt(t\\,5.000)\\,273\\,1041)");
+    }
+
+    #[test]
+    fn compute_reframe_track_no_faces_is_none() {
+        let probe = probe_16x9();
+        let plan = EditPlan { aspect: Some("9:16".into()), smart_reframe: true, ..Default::default() };
+        let frames = frames_from_spans(&[], 0.12, 10.0, 2.0); // all face-less
+        assert!(compute_reframe_track(&frames, &probe, &plan).is_none());
+    }
+
+    #[test]
+    fn compute_reframe_track_non_narrowing_aspect_is_none() {
+        let probe = probe_16x9(); // 1920x1080
+        // 16:9 target on a 16:9 source does not narrow horizontally → no reframe.
+        let plan = EditPlan { aspect: Some("16:9".into()), smart_reframe: true, ..Default::default() };
+        let frames = frames_from_spans(&[(0.0, 10.0, 0.5)], 0.12, 10.0, 2.0);
+        assert!(compute_reframe_track(&frames, &probe, &plan).is_none());
+    }
+
+    #[test]
+    fn compute_reframe_track_steady_subject_static_expr() {
+        let probe = probe_16x9();
+        let plan = EditPlan { aspect: Some("9:16".into()), smart_reframe: true, ..Default::default() };
+        // Subject steadily off-center at 0.3 → one window, no if(), x = 0.3*1920 - 303 = 273.
+        let frames = frames_from_spans(&[(0.0, 10.0, 0.3)], 0.12, 10.0, 2.0);
+        let rf = compute_reframe_track(&frames, &probe, &plan).unwrap();
+        assert_eq!(rf.crop_w, 606);
+        assert_eq!(rf.crop_h, 1080);
+        assert_eq!(rf.crop_y, 0); // full-height crop → no vertical offset
+        assert!(!rf.x_expr.contains("if("), "steady subject → static x: {}", rf.x_expr);
+        assert_eq!(rf.x_expr, "273");
+    }
+
+    #[test]
+    fn compute_reframe_track_moving_subject_has_one_jump_and_clamps() {
+        let probe = probe_16x9();
+        let plan = EditPlan { aspect: Some("9:16".into()), smart_reframe: true, ..Default::default() };
+        // Subject far-left (0.05) then far-right (0.95): both crop-x values clamp to the frame.
+        let frames = frames_from_spans(&[(0.0, 5.0, 0.05), (5.0, 10.0, 0.95)], 0.12, 10.0, 2.0);
+        let rf = compute_reframe_track(&frames, &probe, &plan).unwrap();
+        assert!(rf.x_expr.contains("if(lt(t"), "expected one jump: {}", rf.x_expr);
+        // 0.05*1920-303 = -207 → clamps to 0; 0.95*1920-303 = 1521 → clamps to 1314 (in_w-cw).
+        assert!(rf.x_expr.contains("\\,0\\,"), "left edge clamps to 0: {}", rf.x_expr);
+        assert!(rf.x_expr.ends_with("\\,1314)"), "right edge clamps to 1314: {}", rf.x_expr);
+    }
+
+    /// End-to-end smart-reframe render against real ffmpeg. testsrc2 has no faces (and the
+    /// framescan sidecar may not be built at all), so the reframe MUST fall back to a static
+    /// center crop and the render MUST still succeed. Ignored in CI. Run with:
+    /// cargo test --lib video -- --ignored
+    #[test]
+    #[ignore]
+    fn smart_reframe_falls_back_to_center_crop_e2e() {
+        let dir = std::env::temp_dir().join("muninn-reframe-e2e");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        let status = Command::new(ffmpeg_path().unwrap())
+            .args([
+                "-y", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=6",
+                "-c:v", "libx264", "-preset", "ultrafast",
+            ])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let probe = probe_video(&src).unwrap();
+        let plan = EditPlan { aspect: Some("9:16".into()), smart_reframe: true, ..Default::default() };
+
+        // The scan finds no faces (or the sidecar is missing) → None → static center crop.
+        let reframe = compute_reframe_for_render(&src, &probe, &plan);
+        assert!(reframe.is_none(), "testsrc2 has no faces — reframe must fall back");
+
+        let out = dir.join("out.mp4");
+        let args = build_args_single(
+            &src, &plan, &probe, font_path().unwrap(), &[], None, VideoEncoder::Libx264, &out,
+        )
+        .unwrap();
+        let result = Command::new(ffmpeg_path().unwrap()).args(&args).output().unwrap();
+        assert!(result.status.success(), "fallback render failed:\n{}", String::from_utf8_lossy(&result.stderr));
+        let out_probe = probe_video(&out).unwrap();
+        let ratio = out_probe.width as f64 / out_probe.height as f64;
+        assert!((ratio - 9.0 / 16.0).abs() < 0.02, "expected ~9:16, got {}x{}", out_probe.width, out_probe.height);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

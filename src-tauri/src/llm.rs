@@ -1450,8 +1450,8 @@ pub(crate) async fn generate_video_edit_plan(
         context.push_str(&format!(
             "\nThe user already has an edit plan in progress (JSON below). This is a REFINEMENT \
             request: apply ONLY what the new instruction below asks for, and copy every other \
-            field from this existing plan UNCHANGED (segments, filter, texts, aspect, speed, \
-            mute, captions/caption_style, normalize_audio, denoise, fade, output_name). Do not \
+            field from this existing plan UNCHANGED (segments, filter, texts, aspect, smart_reframe, \
+            speed, mute, captions/caption_style, normalize_audio, denoise, fade, output_name). Do not \
             reset or drop fields the instruction doesn't mention.\n\
             Current plan JSON:\n{existing_json}\n"
         ));
@@ -1469,6 +1469,7 @@ pub(crate) async fn generate_video_edit_plan(
         - \"filter\": one of {presets}\n\
         - \"texts\": array of {{\"text\", \"start\", \"end\", \"position\" (\"top\"|\"center\"|\"bottom\"), \"size\"}} — overlay times are on the OUTPUT timeline (after cuts and speed), so compute them from the kept segments' cumulative durations.\n\
         - \"aspect\": \"9:16\", \"1:1\", \"4:5\", or \"16:9\" (center-crop) — only if the user asks for a platform/orientation.\n\
+        - \"smart_reframe\": true to keep faces in frame when converting to a narrower/vertical aspect (subject-aware crop instead of a static center-crop). Only meaningful with an \"aspect\" that narrows the video (e.g. 16:9 → 9:16); harmless otherwise. Prefer it when the user wants a vertical/TikTok/Reels/Shorts cut of talking-head footage.\n\
         - \"speed\": playback speed 0.25–4.0.\n\
         - \"mute\": true to drop audio.\n\
         - \"captions\": true to burn in word-timed subtitles from the transcript. Use when the user mentions captions/subtitles, or wants a social/silent-viewing cut (TikTok, Reels, Shorts).\n\
@@ -2284,7 +2285,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("edit_video") {
         defs.push((
             "edit_video",
-            "Edit a video with ffmpeg — non-destructive, renders a new .mp4 into the Content library. Keep only chosen segments (cuts), splice in b-roll clips or still-image title/intro cards from other files (segments[].source), apply a color filter preset, overlay timed text, center-crop to an aspect ratio, change speed, mute, or burn in word-timed captions/subtitles. Also supports audio polish: normalize_audio for publishable loudness, denoise for noisy recordings, and fade for a smooth fade-in/out. Cuts always get an automatic de-click micro-fade so concatenated segments never pop. Run analyze_video first to choose cut points. Set captions=true for social/silent-viewing cuts or when the user asks for subtitles (the video is auto-transcribed). To build a title/intro card image, render HTML→PNG first (the Studio 'renderSlideToPng' helper) and reference the PNG as an image insert.",
+            "Edit a video with ffmpeg — non-destructive, renders a new .mp4 into the Content library. Keep only chosen segments (cuts), splice in b-roll clips or still-image title/intro cards from other files (segments[].source), apply a color filter preset, overlay timed text, center-crop to an aspect ratio (with optional smart_reframe to keep faces in frame when going vertical), change speed, mute, or burn in word-timed captions/subtitles. Also supports audio polish: normalize_audio for publishable loudness, denoise for noisy recordings, and fade for a smooth fade-in/out. Cuts always get an automatic de-click micro-fade so concatenated segments never pop. Run analyze_video first to choose cut points. Set captions=true for social/silent-viewing cuts or when the user asks for subtitles (the video is auto-transcribed). To build a title/intro card image, render HTML→PNG first (the Studio 'renderSlideToPng' helper) and reference the PNG as an image insert.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2301,6 +2302,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                         "description": "Text overlays. Times are on the OUTPUT timeline (after cuts and speed change)."
                     },
                     "aspect": {"type": "string", "description": "Center-crop to an aspect like \"9:16\", \"1:1\", \"4:5\""},
+                    "smart_reframe": {"type": "boolean", "description": "Keep faces in frame when converting to a narrower/vertical aspect (subject-aware crop instead of static center-crop). Only meaningful with an aspect that narrows the video (e.g. 16:9 → 9:16). Use for vertical/TikTok/Reels/Shorts cuts of talking-head footage."},
                     "speed": {"type": "number", "description": "Playback speed multiplier, 0.25–4.0"},
                     "mute": {"type": "boolean", "description": "Drop the audio track"},
                     "captions": {"type": "boolean", "description": "Burn in word-timed subtitles from the transcript (auto-transcribes). Use for social/silent-viewing cuts or when subtitles are requested."},
