@@ -1,6 +1,5 @@
-// Categorized sidebar: a tab rail (Chat / Create / Data) plus a chat-history
-// browser (pinned + recent sessions with pin/rename/delete). Split out of
-// tilesys.js to keep that module focused on tile lifecycle.
+// Sidebar: icon rail + expandable panel with Chat / Apps tabs, session browser,
+// agents shortcuts, and footer workspace/model switchers.
 //
 // Import discipline: this module imports runtime helpers from tilesys.js and
 // chat.js. Those functions are only *called* at event time (never at module
@@ -8,13 +7,18 @@
 // existing tilesys<->chat cycle.
 
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   sidebarTabs,
-  sidebarNavCreate,
-  sidebarNavData,
+  sidebarNavApps,
   sessionList,
   sessionSearchInput,
+  sidebarAgentsList,
+  sidebarWorkspace,
+  sidebarModel,
   navSettingsBtn,
+  sidebarCollapseBtn,
+  railBrandBtn,
   tiles,
   chatStreams,
   ui,
@@ -32,19 +36,20 @@ import { addChatTile } from "./chat.js";
 
 // ==================== TABS ====================
 const TABS = [
-  { id: "chat",   label: "Chat",   ic: "message-square" },
-  { id: "create", label: "Create", ic: "sparkles" },
-  { id: "data",   label: "Data",   ic: "database" },
+  { id: "chat", label: "Chat", ic: "message-square" },
+  { id: "apps", label: "Apps", ic: "grid" },
 ];
 
-// Which TILE_TYPES belong under each category panel (order matters).
-const CREATE_TYPES = ["studio", "content", "web"];
-const DATA_TYPES = ["feeds", "tasks", "agents", "memory", "logs", "tools"];
+// Apps panel tile types (Logs & Tools live under Settings now).
+const APPS_TYPES = ["studio", "content", "web", "feeds", "tasks", "memory"];
 
 const TAB_KEY = "muninn.sidebar-tab";
+const COLLAPSE_KEY = "muninn.sidebar-collapsed";
 
 function getActiveTab() {
   const saved = localStorage.getItem(TAB_KEY);
+  // Migrate old Create/Data tab ids.
+  if (saved === "create" || saved === "data") return "apps";
   return TABS.some((t) => t.id === saved) ? saved : "chat";
 }
 
@@ -52,6 +57,10 @@ function setActiveTab(id) {
   localStorage.setItem(TAB_KEY, id);
   renderTabs();
   showPanel(id);
+  // Expanding to a tab should un-collapse the panel.
+  if (document.body.classList.contains("sidebar-collapsed")) {
+    setCollapsed(false);
+  }
 }
 
 function showPanel(id) {
@@ -60,8 +69,9 @@ function showPanel(id) {
   });
   if (id === "chat") {
     refreshSessionList();
+    refreshAgentsList();
   } else {
-    renderNavPanel(id);
+    renderAppsPanel();
   }
 }
 
@@ -71,15 +81,43 @@ function renderTabs() {
   sidebarTabs.innerHTML = "";
   for (const tab of TABS) {
     const btn = document.createElement("button");
-    btn.className = `sidebar-tab${tab.id === active ? " active" : ""}`;
+    btn.className = `rail-btn sidebar-tab${tab.id === active ? " active" : ""}`;
     btn.title = tab.label;
-    btn.innerHTML = `${icon(tab.ic, 15)}<span>${escapeHtml(tab.label)}</span>`;
+    btn.setAttribute("aria-label", tab.label);
+    btn.innerHTML = icon(tab.ic, 16);
     btn.addEventListener("click", () => setActiveTab(tab.id));
     sidebarTabs.appendChild(btn);
   }
 }
 
-// ==================== NAV-ITEM PANELS (Create / Data) ====================
+// ==================== COLLAPSE ====================
+function isCollapsed() {
+  return localStorage.getItem(COLLAPSE_KEY) === "1";
+}
+
+function setCollapsed(collapsed) {
+  localStorage.setItem(COLLAPSE_KEY, collapsed ? "1" : "0");
+  document.body.classList.toggle("sidebar-collapsed", collapsed);
+  if (sidebarCollapseBtn) {
+    sidebarCollapseBtn.title = collapsed ? "Expand sidebar" : "Collapse sidebar";
+    sidebarCollapseBtn.setAttribute("aria-label", sidebarCollapseBtn.title);
+    sidebarCollapseBtn.innerHTML = icon(collapsed ? "chevron-right" : "chevron-left", 15);
+  }
+}
+
+function wireCollapse() {
+  if (sidebarCollapseBtn) {
+    sidebarCollapseBtn.addEventListener("click", () => setCollapsed(!isCollapsed()));
+  }
+  if (railBrandBtn) {
+    railBrandBtn.addEventListener("click", () => {
+      if (isCollapsed()) setCollapsed(false);
+      setActiveTab("chat");
+    });
+  }
+}
+
+// ==================== APPS PANEL ====================
 function makeNavItem(def) {
   const openTiles = getTilesByType(def.type);
   const isOpen = openTiles.length > 0;
@@ -92,11 +130,9 @@ function makeNavItem(def) {
     ${escapeHtml(def.label)}
     ${openTiles.length > 1 ? `<span class="nav-count">${openTiles.length}</span>` : ""}
     <span class="nav-pip"></span>
-    <button class="nav-add" title="Add ${escapeHtml(def.label)}">+</button>
   `;
 
-  btn.addEventListener("click", (e) => {
-    if (e.target.classList.contains("nav-add")) return;
+  btn.addEventListener("click", () => {
     if (isOpen) {
       focusTile(openTiles[0].id);
     } else {
@@ -104,34 +140,94 @@ function makeNavItem(def) {
     }
   });
 
-  const addBtn = btn.querySelector(".nav-add");
-  addBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    openTileForType(def.type);
-  });
-
   return btn;
 }
 
-function renderNavPanel(id) {
-  const container = id === "create" ? sidebarNavCreate : id === "data" ? sidebarNavData : null;
-  if (!container) return;
-  const typeList = id === "create" ? CREATE_TYPES : DATA_TYPES;
-  container.innerHTML = "";
-  for (const type of typeList) {
+function renderAppsPanel() {
+  if (!sidebarNavApps) return;
+  sidebarNavApps.innerHTML = "";
+  for (const type of APPS_TYPES) {
     const def = TILE_TYPES.find((t) => t.type === type);
     if (!def) continue;
-    container.appendChild(makeNavItem(def));
+    sidebarNavApps.appendChild(makeNavItem(def));
   }
 }
 
+// ==================== AGENTS (under Chat) ====================
+export async function refreshAgentsList() {
+  if (!sidebarAgentsList) return;
+  let agents = ui.cachedAgents;
+  if (!Array.isArray(agents) || !agents.length) {
+    try {
+      agents = await invoke("get_agents");
+      ui.cachedAgents = agents;
+    } catch {
+      agents = [];
+    }
+  }
+  if (!Array.isArray(agents)) agents = [];
+
+  const enabled = agents.filter((a) => field(a, "enabled", "enabled"));
+  sidebarAgentsList.innerHTML = "";
+
+  // Manage link always present.
+  const manage = document.createElement("button");
+  manage.className = "nav-item agents-manage";
+  manage.title = "Manage agents";
+  manage.innerHTML = `
+    <span class="nav-dot ${getTilesByType("agents").length ? "blue" : "off"}"></span>
+    Manage agents
+  `;
+  manage.addEventListener("click", () => openTileForType("agents"));
+  sidebarAgentsList.appendChild(manage);
+
+  for (const a of enabled.slice(0, 8)) {
+    const name = field(a, "name", "name") || "Agent";
+    const slash = field(a, "slashCommand", "slash_command") || "";
+    const btn = document.createElement("button");
+    btn.className = "agent-shortcut";
+    btn.title = slash ? `Run /${slash}` : `Open ${name}`;
+    btn.innerHTML = `
+      <span class="agent-shortcut-name">${escapeHtml(name)}</span>
+      ${slash ? `<span class="agent-shortcut-slash">/${escapeHtml(slash)}</span>` : ""}
+    `;
+    btn.addEventListener("click", () => {
+      if (slash) {
+        insertAgentSlash(slash);
+      } else {
+        openTileForType("agents");
+      }
+    });
+    sidebarAgentsList.appendChild(btn);
+  }
+}
+
+/** Prefill the focused (or newest) chat composer with `/slash ` and focus it. */
+function insertAgentSlash(slash) {
+  const chatTiles = getTilesByType("chat");
+  let tile = chatTiles.find((t) => t.id === ui.focusedTileId);
+  if (!tile) tile = chatTiles[chatTiles.length - 1];
+  if (!tile) {
+    openTileForType("agents");
+    return;
+  }
+  focusTile(tile.id);
+  const input = tile.el.querySelector(`[data-chat-input="${tile.id}"]`);
+  if (!input) return;
+  const prefix = `/${slash} `;
+  if (!input.value.startsWith(prefix)) {
+    input.value = prefix + input.value.replace(/^\/\S*\s*/, "");
+  }
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
 // ==================== CHAT HISTORY BROWSER ====================
-// Debounced search over get_sessions.
 let searchTimer = null;
 let searchQuery = "";
 let renaming = null; // sessionId currently in inline-rename mode
 
-// Which sessions currently have an open chat tile (highlight + click routing).
 function tileForSession(sessionId) {
   return tiles.find(
     (t) => t.type === "chat" && (t.chatId === sessionId || chatStreams[t.id]?.sessionId === sessionId)
@@ -149,7 +245,6 @@ function timeOf(s) {
   try { return feedTimeAgo(raw); } catch { return ""; }
 }
 
-// Build one session row. All user-derived strings escaped (innerHTML sink).
 function sessionRow(s, index) {
   const sid = field(s, "id", "id");
   const title = field(s, "title", "title");
@@ -183,12 +278,10 @@ function sessionRow(s, index) {
     </div>
   `;
 
-  // Open / focus on row click (ignore clicks on action buttons or the rename input).
   const main = row.querySelector(".session-main");
   main.addEventListener("click", () => openSession(sid, pp));
 
-  const pinBtn = row.querySelector('[data-act="pin"]');
-  pinBtn.addEventListener("click", async (e) => {
+  row.querySelector('[data-act="pin"]').addEventListener("click", async (e) => {
     e.stopPropagation();
     try {
       await invoke("set_session_pinned", { sessionId: sid, pinned: !pinned });
@@ -207,13 +300,11 @@ function sessionRow(s, index) {
     try {
       await invoke("delete_session", { sessionId: sid });
     } catch (err) { console.error("delete_session failed:", err); }
-    // Close any open tile bound to this session.
     const t = tileForSession(sid);
     if (t) removeTile(t.id);
     refreshSessionList();
   });
 
-  // If this row is the one being renamed, immediately enter edit mode after render.
   if (renaming === sid) startRename(row, sid, label);
 
   return row;
@@ -229,7 +320,6 @@ async function openSession(sessionId, projectPath) {
   refreshSessionList();
 }
 
-// Swap the label for an inline input. Enter commits via rename_session; Escape cancels.
 function startRename(row, sid, currentLabel) {
   renaming = sid;
   const main = row.querySelector(".session-main");
@@ -270,7 +360,6 @@ function sectionHeader(text) {
 let sessionListSeq = 0;
 export async function refreshSessionList() {
   if (!sessionList) return;
-  // Don't clobber an in-progress inline rename.
   if (renaming) return;
   const seq = ++sessionListSeq;
   let sessions = [];
@@ -282,7 +371,6 @@ export async function refreshSessionList() {
     console.error("get_sessions failed:", err);
     sessions = [];
   }
-  // A newer refresh started while we awaited — drop this stale result.
   if (seq !== sessionListSeq) return;
   if (!Array.isArray(sessions)) sessions = [];
 
@@ -318,17 +406,202 @@ function wireSearch() {
   });
 }
 
+// ==================== FOOTER SWITCHERS ====================
+let openPopover = null;
+
+function closePopover() {
+  if (openPopover) {
+    openPopover.remove();
+    openPopover = null;
+  }
+}
+
+function placePopover(anchor, el) {
+  closePopover();
+  document.body.appendChild(el);
+  openPopover = el;
+  const rect = anchor.getBoundingClientRect();
+  const pad = 8;
+  el.style.left = `${Math.max(pad, rect.left)}px`;
+  el.style.bottom = `${window.innerHeight - rect.top + 6}px`;
+  // Clamp width to viewport.
+  requestAnimationFrame(() => {
+    const w = el.offsetWidth;
+    const maxLeft = window.innerWidth - w - pad;
+    el.style.left = `${Math.min(Math.max(pad, rect.left), maxLeft)}px`;
+  });
+}
+
+async function showWorkspacePopover(anchor) {
+  const pop = document.createElement("div");
+  pop.className = "footer-popover";
+  pop.innerHTML = `<div class="footer-popover-title">Workspace</div><div class="footer-popover-list"></div>`;
+  const list = pop.querySelector(".footer-popover-list");
+
+  // Current default directory
+  let currentRoot = "~/";
+  try {
+    const pathInfo = await invoke("get_workspace_root");
+    currentRoot = field(pathInfo, "workspaceRoot", "workspace_root") || "~/";
+  } catch {}
+
+  const addRow = (label, path, isCurrent) => {
+    const btn = document.createElement("button");
+    btn.className = `footer-popover-item${isCurrent ? " current" : ""}`;
+    btn.innerHTML = `
+      <span class="footer-popover-label">${escapeHtml(label)}</span>
+      ${path ? `<span class="footer-popover-path">${escapeHtml(path)}</span>` : ""}
+    `;
+    btn.addEventListener("click", async () => {
+      closePopover();
+      if (!path) return;
+      try {
+        await invoke("set_workspace_root", { req: { workspaceRoot: path } });
+        if (sidebarWorkspace) {
+          sidebarWorkspace.textContent = projectLabel(path);
+          sidebarWorkspace.title = path;
+        }
+      } catch (e) {
+        console.error("set_workspace_root failed:", e);
+      }
+    });
+    list.appendChild(btn);
+  };
+
+  addRow(projectLabel(currentRoot) || "Default", currentRoot, true);
+
+  try {
+    const projects = await invoke("get_projects");
+    for (const p of projects || []) {
+      const path = field(p, "path", "path");
+      const name = field(p, "name", "name") || projectLabel(path);
+      if (path === currentRoot) continue;
+      addRow(name, path, false);
+    }
+  } catch {}
+
+  const browse = document.createElement("button");
+  browse.className = "footer-popover-item footer-popover-action";
+  browse.innerHTML = `${icon("folder", 13)} Choose folder…`;
+  browse.addEventListener("click", async () => {
+    closePopover();
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Set default workspace folder",
+      });
+      if (!selected) return;
+      const path = typeof selected === "string" ? selected : selected;
+      await invoke("set_workspace_root", { req: { workspaceRoot: path } });
+      if (sidebarWorkspace) {
+        sidebarWorkspace.textContent = projectLabel(path);
+        sidebarWorkspace.title = path;
+      }
+    } catch (e) {
+      console.error("workspace pick failed:", e);
+    }
+  });
+  list.appendChild(browse);
+
+  placePopover(anchor, pop);
+}
+
+const MODEL_PRESETS = [
+  { provider: "minimax", model: "MiniMax-M2.7", label: "MiniMax M2.7" },
+  { provider: "minimax", model: "MiniMax-M3", label: "MiniMax M3" },
+  { provider: "openai", model: "gpt-4.1", label: "GPT-4.1" },
+  { provider: "openai", model: "gpt-4o", label: "GPT-4o" },
+  { provider: "anthropic", model: "claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
+  { provider: "groq", model: "llama-3.3-70b-versatile", label: "Llama 3.3 70B" },
+  { provider: "google", model: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+  { provider: "xai", model: "grok-3", label: "Grok 3" },
+  { provider: "openrouter", model: "openrouter/auto", label: "OpenRouter Auto" },
+];
+
+async function showModelPopover(anchor) {
+  const pop = document.createElement("div");
+  pop.className = "footer-popover";
+  pop.innerHTML = `<div class="footer-popover-title">Model</div><div class="footer-popover-list"></div>`;
+  const list = pop.querySelector(".footer-popover-list");
+
+  const currentModel = (ui.loadedSettings && ui.loadedSettings["llm/model"]) || "";
+  const currentProv = (ui.loadedSettings && ui.loadedSettings["llm/provider"]) || "minimax";
+
+  for (const preset of MODEL_PRESETS) {
+    const isCurrent = preset.model === currentModel && preset.provider === currentProv;
+    const btn = document.createElement("button");
+    btn.className = `footer-popover-item${isCurrent ? " current" : ""}`;
+    btn.innerHTML = `
+      <span class="footer-popover-label">${escapeHtml(preset.label)}</span>
+      <span class="footer-popover-path">${escapeHtml(preset.provider)}</span>
+    `;
+    btn.addEventListener("click", async () => {
+      closePopover();
+      try {
+        await invoke("set_app_settings", {
+          req: { settings: { "llm/provider": preset.provider, "llm/model": preset.model } },
+        });
+        ui.loadedSettings = {
+          ...ui.loadedSettings,
+          "llm/provider": preset.provider,
+          "llm/model": preset.model,
+        };
+        if (sidebarModel) {
+          sidebarModel.textContent = preset.model;
+          sidebarModel.title = `${preset.provider} · ${preset.model}`;
+        }
+      } catch (e) {
+        console.error("set model failed:", e);
+      }
+    });
+    list.appendChild(btn);
+  }
+
+  const custom = document.createElement("button");
+  custom.className = "footer-popover-item footer-popover-action";
+  custom.innerHTML = `${icon("settings", 13)} Open Settings…`;
+  custom.addEventListener("click", () => {
+    closePopover();
+    openTileForType("settings");
+  });
+  list.appendChild(custom);
+
+  placePopover(anchor, pop);
+}
+
+function wireFooterSwitchers() {
+  if (sidebarWorkspace) {
+    sidebarWorkspace.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (openPopover) { closePopover(); return; }
+      showWorkspacePopover(sidebarWorkspace);
+    });
+  }
+  if (sidebarModel) {
+    sidebarModel.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (openPopover) { closePopover(); return; }
+      showModelPopover(sidebarModel);
+    });
+  }
+  document.addEventListener("click", (e) => {
+    if (!openPopover) return;
+    if (openPopover.contains(e.target)) return;
+    if (e.target === sidebarWorkspace || e.target === sidebarModel) return;
+    closePopover();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closePopover();
+  });
+}
+
 // ==================== PUBLIC ENTRY ====================
-// Called by tilesys.js on every tile add/remove/focus. Re-renders the tab rail,
-// the active nav panel, and (cheaply) the session list highlight — without
-// clobbering the search input's value/focus (it lives outside the re-rendered
-// #session-list) or an in-progress rename (guarded in refreshSessionList).
 export function updateSidebar() {
   renderTabs();
   const active = getActiveTab();
   showPanel(active);
 
-  // Settings button (lives outside the panels).
   const settingsOpen = getTilesByType("settings").length > 0;
   if (navSettingsBtn) {
     navSettingsBtn.classList.toggle("open", settingsOpen);
@@ -337,8 +610,10 @@ export function updateSidebar() {
   }
 }
 
-// One-time wiring at boot (search input). Safe to call once.
 export function initSidebar() {
   wireSearch();
+  wireCollapse();
+  wireFooterSwitchers();
+  setCollapsed(isCollapsed());
   updateSidebar();
 }

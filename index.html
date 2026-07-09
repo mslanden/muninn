@@ -16,51 +16,55 @@
       <div class="titlebar" data-tauri-drag-region></div>
 
       <aside class="sidebar">
-        <div class="sidebar-brand">
-          <span class="sidebar-logo">MUNINN</span>
-          <span class="sidebar-version">v0.1</span>
-        </div>
-
-        <div id="sidebar-tabs" class="sidebar-tabs"></div>
-
-        <div id="sidebar-panels" class="sidebar-panels">
-          <!-- Chat panel -->
-          <div class="sidebar-panel" data-panel="chat">
-            <div class="sidebar-nav" style="padding-top: 8px;">
-              <button class="nav-item" id="new-chat-btn" title="New Chat">
-                <span class="nav-dot off"></span>
-                + New Chat
-              </button>
-            </div>
-            <div class="session-search">
-              <input type="text" id="session-search-input" placeholder="Search chats…" autocomplete="off" spellcheck="false" />
-            </div>
-            <div id="session-list" class="session-list"></div>
-          </div>
-
-          <!-- Create panel -->
-          <div class="sidebar-panel" data-panel="create" hidden>
-            <nav id="sidebar-nav-create" class="sidebar-nav" style="padding-top: 8px;"></nav>
-          </div>
-
-          <!-- Data panel -->
-          <div class="sidebar-panel" data-panel="data" hidden>
-            <nav id="sidebar-nav-data" class="sidebar-nav" style="padding-top: 8px;"></nav>
-          </div>
-        </div>
-
-        <div class="sidebar-spacer"></div>
-
-        <nav class="sidebar-nav" style="margin-bottom: 8px;">
-          <button class="nav-item" id="nav-settings" title="Settings">
-            <span class="nav-dot off"></span>
-            Settings
+        <!-- Persistent icon rail: tabs + settings + collapse -->
+        <div class="sidebar-rail">
+          <button class="rail-btn rail-brand" id="rail-brand" title="Muninn" aria-label="Muninn">
+            <span class="rail-mark">M</span>
           </button>
-        </nav>
+          <div id="sidebar-tabs" class="sidebar-tabs"></div>
+          <div class="rail-spacer"></div>
+          <button class="rail-btn" id="nav-settings" title="Settings" aria-label="Settings">
+            <span class="nav-dot off"></span>
+          </button>
+          <button class="rail-btn" id="sidebar-collapse-btn" title="Collapse sidebar" aria-label="Collapse sidebar"></button>
+        </div>
 
-        <div class="sidebar-footer">
-          <span id="sidebar-workspace">~/</span>
-          <span id="sidebar-model">connecting...</span>
+        <!-- Expandable panel (sessions / apps) -->
+        <div class="sidebar-panel-wrap">
+          <div class="sidebar-brand">
+            <span class="sidebar-logo">MUNINN</span>
+            <span class="sidebar-version">v0.1</span>
+          </div>
+
+          <div id="sidebar-panels" class="sidebar-panels">
+            <!-- Chat panel -->
+            <div class="sidebar-panel" data-panel="chat">
+              <div class="sidebar-nav" style="padding-top: 4px;">
+                <button class="nav-item" id="new-chat-btn" title="New Chat">
+                  <span class="nav-dot off"></span>
+                  + New Chat
+                </button>
+              </div>
+              <div class="session-search">
+                <input type="text" id="session-search-input" placeholder="Search chats…" autocomplete="off" spellcheck="false" />
+              </div>
+              <div id="session-list" class="session-list"></div>
+              <div class="sidebar-agents">
+                <div class="sidebar-section-label">Agents</div>
+                <div id="sidebar-agents-list" class="sidebar-agents-list"></div>
+              </div>
+            </div>
+
+            <!-- Apps panel -->
+            <div class="sidebar-panel" data-panel="apps" hidden>
+              <nav id="sidebar-nav-apps" class="sidebar-nav" style="padding-top: 8px;"></nav>
+            </div>
+          </div>
+
+          <div class="sidebar-footer">
+            <button type="button" class="footer-switch" id="sidebar-workspace" title="Switch workspace">~/</button>
+            <button type="button" class="footer-switch" id="sidebar-model" title="Switch model">connecting...</button>
+          </div>
         </div>
       </aside>
 

@@ -2,14 +2,24 @@ import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import { workspace, sidebarWorkspace, sidebarModel, ui } from "./state.js";
-import { applyTheme } from "./theme.js";
+import { applyTheme, THEMES } from "./theme.js";
 import { field, projectLabel, escapeHtml } from "./utils.js";
 import { icon } from "./icons.js";
 import qrcode from "qrcode-generator";
+import { renderLogsTile } from "./logs.js";
+import { renderToolsTile } from "./toolspanel.js";
 
 // ========== SETTINGS TILE ==========
 export function renderSettingsTile(tileObj, body) {
   body.innerHTML = `
+    <div class="settings-layout">
+      <div class="settings-tabs" data-s-tabs="${tileObj.id}">
+        <button type="button" class="settings-tab active" data-s-tab="general">General</button>
+        <button type="button" class="settings-tab" data-s-tab="activity">Activity</button>
+        <button type="button" class="settings-tab" data-s-tab="tools">Tools</button>
+      </div>
+      <div class="settings-pages">
+        <div class="settings-page active" data-s-page="general">
     <div class="settings-section">
       <div class="settings-group">
         <h3>Profile</h3>
@@ -72,6 +82,17 @@ export function renderSettingsTile(tileObj, body) {
         <span class="muted" data-s-img-status="${tileObj.id}" style="font-size:10px;"></span>
       </div>
       <div class="settings-group">
+        <h3>Video</h3>
+        <label class="checkbox-inline">
+          <input type="checkbox" data-s-localtranscribe="${tileObj.id}" /> On-device transcription (Apple Speech)
+        </label>
+        <span class="muted" style="font-size:10px;">Studio video analysis transcribes on your Mac — no API key, audio never leaves the device. Falls back to cloud whisper (Groq/OpenAI) if it fails. First use downloads a speech model.</span>
+        <label class="checkbox-inline" style="margin-top:6px;">
+          <input type="checkbox" data-s-hwencode="${tileObj.id}" /> Hardware video encoding (VideoToolbox)
+        </label>
+        <span class="muted" style="font-size:10px;">Uses your Mac's hardware encoder for faster renders when available. Falls back to software encoding automatically if it's unsupported or fails.</span>
+      </div>
+      <div class="settings-group">
         <h3>Default directory</h3>
         <p class="settings-hint">The folder a chat operates in when no project folder is picked. Use the ${icon("folder", 12)} button in a chat to scope it to a specific folder.</p>
         <div class="form-row" style="margin-bottom:6px;">
@@ -83,9 +104,7 @@ export function renderSettingsTile(tileObj, body) {
         <h3>Appearance</h3>
         <div class="form-row" style="margin-bottom:6px;">
           <select data-s-theme="${tileObj.id}">
-            <option value="dark">Dark</option>
-            <option value="light">Light</option>
-            <option value="system">System</option>
+            ${THEMES.map((t) => `<option value="${t.id}">${t.label}</option>`).join("")}
           </select>
         </div>
       </div>
@@ -147,7 +166,52 @@ export function renderSettingsTile(tileObj, body) {
         <span class="muted" data-s-status="${tileObj.id}"></span>
       </div>
     </div>
+        </div>
+        <div class="settings-page" data-s-page="activity">
+          <div class="settings-section">
+            <div class="settings-group">
+              <h3>Activity log</h3>
+              <p class="settings-hint">Tool runs, messages, and background events from this session and others.</p>
+              <div class="settings-embed" data-s-activity-host="${tileObj.id}"></div>
+            </div>
+          </div>
+        </div>
+        <div class="settings-page" data-s-page="tools">
+          <div class="settings-section">
+            <div class="settings-group">
+              <h3>Tool access</h3>
+              <p class="settings-hint">Enable or disable tools the assistant can call during chat and agent runs.</p>
+              <div class="settings-embed" data-s-tools-host="${tileObj.id}"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   `;
+
+  // Tab switching — Activity / Tools hosts are filled lazily on first visit.
+  const tabsEl = body.querySelector(`[data-s-tabs="${tileObj.id}"]`);
+  let activityMounted = false;
+  let toolsMounted = false;
+  tabsEl.querySelectorAll(".settings-tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      const id = tab.dataset.sTab;
+      tabsEl.querySelectorAll(".settings-tab").forEach((t) => t.classList.toggle("active", t === tab));
+      body.querySelectorAll(".settings-page").forEach((p) => {
+        p.classList.toggle("active", p.dataset.sPage === id);
+      });
+      if (id === "activity" && !activityMounted) {
+        const host = body.querySelector(`[data-s-activity-host="${tileObj.id}"]`);
+        renderLogsTile({ id: `settings-logs-${tileObj.id}`, el: tileObj.el }, host);
+        activityMounted = true;
+      }
+      if (id === "tools" && !toolsMounted) {
+        const host = body.querySelector(`[data-s-tools-host="${tileObj.id}"]`);
+        renderToolsTile({ id: `settings-tools-${tileObj.id}`, el: tileObj.el }, host);
+        toolsMounted = true;
+      }
+    });
+  });
 
   const nameInput = body.querySelector(`[data-s-name="${tileObj.id}"]`);
   const aboutInput = body.querySelector(`[data-s-about="${tileObj.id}"]`);
@@ -171,6 +235,8 @@ export function renderSettingsTile(tileObj, body) {
   const notifyInput = body.querySelector(`[data-s-notify="${tileObj.id}"]`);
   const qaShortcutInput = body.querySelector(`[data-s-qashortcut="${tileObj.id}"]`);
   const autoVerifyInput = body.querySelector(`[data-s-autoverify="${tileObj.id}"]`);
+  const localTranscribeInput = body.querySelector(`[data-s-localtranscribe="${tileObj.id}"]`);
+  const hwEncodeInput = body.querySelector(`[data-s-hwencode="${tileObj.id}"]`);
   const approvalTimeoutInput = body.querySelector(`[data-s-approvaltimeout="${tileObj.id}"]`);
   const mobileToggleBtn = body.querySelector(`[data-s-mobile-toggle="${tileObj.id}"]`);
   const mobileStateEl = body.querySelector(`[data-s-mobile-state="${tileObj.id}"]`);
@@ -388,12 +454,15 @@ export function renderSettingsTile(tileObj, body) {
     ensureOption(imgModelSelect, currentImgModel);
 
     sidebarModel.textContent = currentModel;
+    sidebarModel.title = currentModel;
 
     try { autostartInput.checked = await isAutostartEnabled(); } catch {}
 
     notifyInput.checked = s["notifications/enabled"] !== "false";
     qaShortcutInput.value = s["quickask/shortcut"] || "cmd+shift+space";
     autoVerifyInput.checked = s["safety/auto_verify"] === "1";
+    localTranscribeInput.checked = s["video/local_transcription"] === "1";
+    hwEncodeInput.checked = s["video/hw_encode"] !== "0"; // default ON when unset
     approvalTimeoutInput.value = s["safety/approval_timeout_secs"] || "";
     mobilePortInput.value = s["mobile/server_port"] || "";
     refreshMobileStatus();
@@ -407,6 +476,7 @@ export function renderSettingsTile(tileObj, body) {
     const workspaceRoot = field(pathInfo, "workspaceRoot", "workspace_root");
     wsInput.value = workspaceRoot;
     sidebarWorkspace.textContent = projectLabel(workspaceRoot);
+    sidebarWorkspace.title = workspaceRoot || "~/";
   }
 
   // Save
@@ -444,6 +514,8 @@ export function renderSettingsTile(tileObj, body) {
     updates["notifications/enabled"] = notifyInput.checked ? "true" : "false";
     updates["quickask/shortcut"] = qaShortcutInput.value.trim();
     updates["safety/auto_verify"] = autoVerifyInput.checked ? "1" : "0";
+    updates["video/local_transcription"] = localTranscribeInput.checked ? "1" : "0";
+    updates["video/hw_encode"] = hwEncodeInput.checked ? "1" : "0";
     // Approval timeout: blank falls back to the Rust default (120); otherwise clamp to [15, 3600].
     const approvalRaw = approvalTimeoutInput.value.trim();
     if (approvalRaw === "") {
@@ -492,6 +564,7 @@ export function renderSettingsTile(tileObj, body) {
     }
     ui.loadedSettings = { ...ui.loadedSettings, ...updates };
     sidebarModel.textContent = updates["llm/model"];
+    sidebarModel.title = updates["llm/model"];
     setTimeout(() => { statusEl.textContent = ""; }, 2000);
     await loadS();
   });
@@ -565,6 +638,7 @@ export function renderSettingsTile(tileObj, body) {
       const result = await invoke("set_workspace_root", { req: { workspaceRoot: wsInput.value.trim() } });
       wsInput.value = field(result, "workspaceRoot", "workspace_root");
       sidebarWorkspace.textContent = projectLabel(wsInput.value);
+      sidebarWorkspace.title = wsInput.value;
       statusEl.textContent = "Default directory set";
       setTimeout(() => { statusEl.textContent = ""; }, 2000);
     } catch (e) { statusEl.textContent = String(e); }

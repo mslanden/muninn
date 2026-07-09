@@ -7,6 +7,7 @@ import { playTts, addToolCard, renderTodoPanel, showUserQuestion, renderDeferred
 import { renderTasksTile } from "./tasks.js";
 import { renderMemoryTile } from "./memory.js";
 import { renderContentTile } from "./content.js";
+import { isDarkTheme } from "./theme.js";
 
 // ==================== TAURI EVENT LISTENERS ====================
 export async function setupEventListeners() {
@@ -208,7 +209,7 @@ export async function setupEventListeners() {
 
     if (!ui.mapboxToken) return;
     setTimeout(() => {
-      const isDark = document.documentElement.getAttribute("data-theme") === "dark";
+      const isDark = isDarkTheme();
       const style = isDark ? "mapbox://styles/mapbox/dark-v11" : "mapbox://styles/mapbox/streets-v12";
       const map = new mapboxgl.Map({
         container: mapId,
@@ -261,7 +262,7 @@ export async function setupEventListeners() {
 
     if (!ui.mapboxToken || !geometry || geometry.length === 0) return;
     setTimeout(() => {
-      const isDark = document.documentElement.getAttribute("data-theme") === "dark";
+      const isDark = isDarkTheme();
       const style = isDark ? "mapbox://styles/mapbox/dark-v11" : "mapbox://styles/mapbox/streets-v12";
       // geometry is already [lon, lat] from Mapbox Directions API
       const map = new mapboxgl.Map({

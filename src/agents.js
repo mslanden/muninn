@@ -2,6 +2,7 @@ import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
 import { ui } from "./state.js";
 import { escapeHtml, field, parseAllowedTools } from "./utils.js";
+import { refreshAgentsList } from "./sidebar.js";
 
 // ========== AGENTS TILE ==========
 export function renderAgentsTile(tileObj, body) {
@@ -90,6 +91,7 @@ export function renderAgentsTile(tileObj, body) {
     let items;
     try { items = await invoke("get_agents"); } catch { items = []; }
     ui.cachedAgents = items;
+    try { refreshAgentsList(); } catch { /* sidebar absent in pop-out */ }
 
     countEl.textContent = `${items.length} agent${items.length !== 1 ? "s" : ""}`;
     list.innerHTML = "";

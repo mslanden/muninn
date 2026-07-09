@@ -171,7 +171,10 @@ async function setTileProject(tileObj, projectPath) {
   tileObj.projectPath = projectPath;
 
   const chatLog = tileObj.el.querySelector(`[data-chat-stream="${tileObj.id}"]`);
-  if (chatLog) chatLog.innerHTML = "";
+  if (chatLog) {
+    chatLog.innerHTML = "";
+    showChatWelcome(chatLog);
+  }
   updateContextBar(tileObj.id, 0);
 
   const badge = tileObj.el.querySelector(`[data-project-badge="${tileObj.id}"]`);
@@ -321,7 +324,10 @@ export function renderChatTile(tileObj, body) {
           stream.sessionId = newId;
           tileObj.chatId = newId;
           const chatLog = tileObj.el.querySelector(`[data-chat-stream="${tileObj.id}"]`);
-          if (chatLog) chatLog.innerHTML = "";
+          if (chatLog) {
+            chatLog.innerHTML = "";
+            showChatWelcome(chatLog);
+          }
           stream.bubble = null;
           stream.text = "";
           hideGoalBanner(tileObj);
@@ -554,6 +560,7 @@ export function renderChatTile(tileObj, body) {
     if (!stream) return;
 
     const chatLog = tileObj.el.querySelector(`[data-chat-stream="${tileObj.id}"]`);
+    clearChatWelcome(chatLog);
 
     // Handle /stop command
     if (text.toLowerCase().startsWith("/stop")) {
@@ -1071,6 +1078,29 @@ export function hideThinking(tileId) {
   stream.thinkingEl = null;
 }
 
+/** Empty-chat hero: brand + short guidance. Cleared on first send. */
+export function showChatWelcome(chatLog) {
+  if (!chatLog) return;
+  clearChatWelcome(chatLog);
+  const el = document.createElement("div");
+  el.className = "chat-welcome";
+  el.innerHTML = `
+    <div class="chat-welcome-brand">MUNINN</div>
+    <p class="chat-welcome-lead">Ask a question, create images, edit video, or work in a project folder.</p>
+    <ul class="chat-welcome-hints">
+      <li>Type naturally — Muninn can use tools in your workspace</li>
+      <li>Paste or attach a screenshot to talk about it</li>
+      <li>Use <kbd>/</kbd> for agents and slash commands</li>
+    </ul>
+  `;
+  chatLog.appendChild(el);
+}
+
+export function clearChatWelcome(chatLog) {
+  if (!chatLog) return;
+  chatLog.querySelectorAll(".chat-welcome").forEach((el) => el.remove());
+}
+
 export async function loadMessagesForTile(tileObj) {
   const stream = chatStreams[tileObj.id];
   if (!stream) return;
@@ -1108,12 +1138,16 @@ export async function loadMessagesForTile(tileObj) {
     timeline.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
     chatLog.innerHTML = "";
-    for (const item of timeline) {
-      if (item.type === "tool") {
-        addToolCard(chatLog, item.kind, "", item.status);
-      } else {
-        const role = item.role === "user" ? "you" : "muninn";
-        addTurn(chatLog, role, item.content, item.images || []);
+    if (!timeline.length) {
+      showChatWelcome(chatLog);
+    } else {
+      for (const item of timeline) {
+        if (item.type === "tool") {
+          addToolCard(chatLog, item.kind, "", item.status);
+        } else {
+          const role = item.role === "user" ? "you" : "muninn";
+          addTurn(chatLog, role, item.content, item.images || []);
+        }
       }
     }
     // Estimate context usage from loaded messages

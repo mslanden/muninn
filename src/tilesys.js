@@ -14,13 +14,14 @@ export const TILE_TYPES = [
   { type: "chat",       label: "Chat",       dot: "green" },
   { type: "feeds",      label: "Feeds",      dot: "amber" },
   { type: "web",        label: "Web",        dot: "blue"  },
-  { type: "logs",       label: "Logs",       dot: "amber" },
   { type: "tasks",      label: "Tasks",      dot: "blue"  },
-  { type: "tools",      label: "Tools",      dot: "purple" },
   { type: "agents",     label: "Agents",     dot: "blue"  },
   { type: "memory",     label: "Memory",     dot: "purple" },
   { type: "content",    label: "Content",    dot: "off"   },
   { type: "studio",     label: "Studio",     dot: "green" },
+  // Still renderable (Settings sub-pages / restored layouts) but not in Apps nav.
+  { type: "logs",       label: "Activity",   dot: "amber" },
+  { type: "tools",      label: "Tools",      dot: "purple" },
 ];
 
 export function updateWorkspaceGrid() {

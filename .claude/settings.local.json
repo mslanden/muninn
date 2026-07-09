@@ -68,7 +68,9 @@
       "Bash(rm -rf /Applications/Muninn.app)",
       "Bash(cp -R /Users/marcelinolanden/Documents/myProjects/Muninn/src-tauri/target/release/bundle/macos/Muninn.app /Applications/Muninn.app)",
       "Bash(xattr -dr com.apple.quarantine /Applications/Muninn.app)",
-      "Bash(/usr/libexec/PlistBuddy -c \"Print :NSAppleEventsUsageDescription\" /Applications/Muninn.app/Contents/Info.plist)"
+      "Bash(/usr/libexec/PlistBuddy -c \"Print :NSAppleEventsUsageDescription\" /Applications/Muninn.app/Contents/Info.plist)",
+      "Bash(git -c user.name=Marcelino -c user.email=landenmsjd@gmail.com commit -q -m 'Muninn UI: extract Muninn'\\\\''s design into a reusable React component library *)",
+      "Bash(kill %1)"
     ]
   }
 }
