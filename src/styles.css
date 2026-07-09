@@ -1741,6 +1741,13 @@ body.sidebar-collapsed .sidebar-panel-wrap {
 
 .studio-seg-pill button:hover { color: var(--text); }
 
+/* Insert (b-roll / image card) pills read distinctly from plain main keep-ranges. */
+.studio-seg-insert {
+  border-color: color-mix(in srgb, var(--accent, #6ea8fe) 55%, var(--border));
+  color: color-mix(in srgb, var(--accent, #6ea8fe) 75%, var(--text));
+  background: color-mix(in srgb, var(--accent, #6ea8fe) 12%, transparent);
+}
+
 .studio-progress {
   flex: 1;
   height: 6px;
@@ -1948,6 +1955,34 @@ body.sidebar-collapsed .sidebar-panel-wrap {
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
   pointer-events: none;
   z-index: 5;
+}
+
+/* Output ribbon: the segment sequence on the OUTPUT timeline. Only shown when there are
+   inserts (b-roll clips / image cards), which the single <video> can't preview. */
+.vp-inserts {
+  display: flex;
+  width: 100%;
+  height: 18px;
+  margin-top: 3px;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.vp-ins-main { background: color-mix(in srgb, var(--border) 45%, transparent); }
+.vp-ins-block {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  padding: 0 4px;
+  font-size: 9px;
+  line-height: 1;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: color-mix(in srgb, var(--accent, #6ea8fe) 78%, #000);
+  border-left: 1px solid rgba(0, 0, 0, 0.4);
 }
 
 .vp-legend {

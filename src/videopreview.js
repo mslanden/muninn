@@ -37,6 +37,52 @@ const CSS_FILTERS = {
   punchy: "saturate(1.35) contrast(1.1) brightness(1.03)",
 };
 
+// ---------- source vs. insert segments ----------
+//
+// plan.segments mixes MAIN keep-ranges (no `source`) with INSERTS (a `source` path — a b-roll
+// clip or a still-image card). Only main segments live on the source video's timeline, so only
+// they drive the single-<video> playback/scrub. Inserts occupy their own slot on the OUTPUT
+// timeline (they can't be previewed by one <video>), handled separately below.
+function isInsert(s) { return !!(s && s.source); }
+function mainSegments(segments) { return (segments || []).filter(s => !isInsert(s)); }
+function insertName(s) {
+  const p = (s && s.source) || "";
+  return p.split("/").pop() || p;
+}
+
+// Shared source→output-time mapping, mirroring the backend `map_interval_to_output` in
+// video.rs: overlap is measured against MAIN segments only (words never map into an insert
+// slot), but EVERY segment — inserts included — advances the cumulative output offset, so a
+// word after an inserted clip is pushed later by that clip's duration (÷ speed). Returns the
+// output start-time for a source instant, or null if it falls outside every main segment.
+function mapSourceToOutput(srcTime, segments, speed) {
+  const sp = speed > 0 ? speed : 1;
+  let acc = 0;
+  for (const s of segments || []) {
+    const dur = Math.max(0, s.end - s.start);
+    if (!isInsert(s) && srcTime >= s.start && srcTime < s.end) {
+      return (acc + (srcTime - s.start)) / sp;
+    }
+    acc += dur;
+  }
+  return null;
+}
+
+// Lay out every segment on the OUTPUT timeline (proportional widths), tagging inserts so the
+// ribbon can label them. Shares the same cumulative-offset math as mapSourceToOutput above.
+function outputLayout(segments, speed) {
+  const sp = speed > 0 ? speed : 1;
+  const total = (segments || []).reduce((a, s) => a + Math.max(0, s.end - s.start) / sp, 0);
+  const out = [];
+  let acc = 0;
+  for (const s of segments || []) {
+    const w = Math.max(0, s.end - s.start) / sp;
+    out.push({ seg: s, outStart: acc, outWidth: w, insert: isInsert(s), label: isInsert(s) ? insertName(s) : null });
+    acc += w;
+  }
+  return { total, blocks: out };
+}
+
 // ---------- pure range helpers (source-time {start,end}) ----------
 
 // Merge overlapping/adjacent ranges into a sorted, disjoint list. `join` closes hairline gaps
@@ -119,15 +165,19 @@ function playbackTarget(kept, t) {
 // Group transcript words into short caption lines for the overlay — a preview approximation of
 // the backend's ASS grouping (does not need to match it). Breaks a line at ~4 words, ~28 chars,
 // or a >0.8s gap. Words whose midpoint lands inside a cut are dropped so captions track edits.
-function buildCaptionLines(words, kept, duration) {
+// Caption lines carry SOURCE-time word timings (the <video> plays the source, so the live
+// overlay compares against source time). Word membership — which words survive the edit —
+// reuses the shared `mapSourceToOutput` mapper so it drops words in cuts AND words that fall
+// only inside an insert's slot, exactly like the backend's caption mapping.
+function buildCaptionLines(words, segments, speed, duration) {
   const lines = [];
   let cur = null;
-  const keptWhole = kept.length === 1 && kept[0].start <= EPS && kept[0].end >= duration - EPS;
+  const keptWhole = !mainSegments(segments).length; // no explicit main ranges = keep the whole clip
   for (const w of words) {
     const text = (w.word || "").trim();
     if (!text) continue;
     const mid = (w.start + w.end) / 2;
-    if (!keptWhole && !isKept(kept, mid)) { cur = null; continue; }
+    if (!keptWhole && mapSourceToOutput(mid, segments, speed) === null) { cur = null; continue; }
     const gap = cur ? w.start - cur.words[cur.words.length - 1].end : 0;
     const projected = cur ? cur.text.length + 1 + text.length : text.length;
     if (!cur || cur.words.length >= 4 || projected > 28 || gap > 0.8) {
@@ -175,7 +225,7 @@ export function createVideoPreview(container, callbacks = {}) {
     <div class="vp-stage" data-vp-stage>
       <video class="vp-video" data-vp-video playsinline preload="auto"></video>
       <div class="vp-caption" data-vp-caption></div>
-      <div class="vp-caveat">preview ≈ approximation — the final render differs</div>
+      <div class="vp-caveat">preview ≈ approximation — inserts aren't previewed; the final render differs</div>
     </div>
     <div class="vp-controls">
       <button class="vp-play" data-vp-play type="button" aria-label="Play/pause">&#9654;</button>
@@ -185,6 +235,7 @@ export function createVideoPreview(container, callbacks = {}) {
       <div class="vp-tl-layers" data-vp-layers></div>
       <div class="vp-tl-playhead" data-vp-playhead></div>
     </div>
+    <div class="vp-inserts" data-vp-inserts style="display:none;"></div>
     <div class="vp-legend">
       <span class="vp-lg vp-lg-cut">cut</span>
       <span class="vp-lg vp-lg-sil">silence</span>
@@ -204,6 +255,7 @@ export function createVideoPreview(container, callbacks = {}) {
   const layersEl = container.querySelector("[data-vp-layers]");
   const playhead = container.querySelector("[data-vp-playhead]");
   const transcriptEl = container.querySelector("[data-vp-transcript]");
+  const insertsEl = container.querySelector("[data-vp-inserts]");
   const cutSelBtn = container.querySelector("[data-vp-cutsel]");
 
   // ----- playback + rAF skip loop -----
@@ -320,6 +372,28 @@ export function createVideoPreview(container, callbacks = {}) {
     layersEl.innerHTML = thumbHtml + cutHtml + sil + fill + handles;
   }
 
+  // Insert ribbon: shows every segment on the OUTPUT timeline (proportional widths), with
+  // inserts labeled "insert: name". Purely informational — the single <video> can't play
+  // inserts, so this is where they become visible. Uses the shared outputLayout helper.
+  function renderInserts() {
+    const layout = outputLayout(plan.segments, plan.speed || 1);
+    const hasInserts = layout.blocks.some(b => b.insert);
+    if (!hasInserts || layout.total <= 0) {
+      insertsEl.style.display = "none";
+      insertsEl.innerHTML = "";
+      return;
+    }
+    insertsEl.style.display = "";
+    insertsEl.innerHTML = layout.blocks.map(b => {
+      const wpct = (b.outWidth / layout.total) * 100;
+      if (b.insert) {
+        const secs = fmt1(b.seg.end - b.seg.start);
+        return `<div class="vp-ins-block" style="width:${wpct}%" title="insert: ${escapeHtml(b.label)} (${secs}s)">insert: ${escapeHtml(b.label)}</div>`;
+      }
+      return `<div class="vp-ins-main" style="width:${wpct}%"></div>`;
+    }).join("");
+  }
+
   function posToTime(clientX) {
     const rect = timelineEl.getBoundingClientRect();
     const frac = rect.width > 0 ? Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)) : 0;
@@ -331,11 +405,14 @@ export function createVideoPreview(container, callbacks = {}) {
     renderPlayhead();
   }
 
-  // Push new keep-segments to studio. If they cover the whole clip, normalize to [] so the
-  // shared plan keeps its "keep everything" meaning (and the checkbox UI stays consistent).
+  // Push new MAIN keep-segments to studio (studio re-merges any inserts — see mergeMainWithInserts).
+  // If they cover the whole clip AND there are no inserts, normalize to [] so the plan keeps its
+  // "keep everything" meaning. With inserts present we must NOT collapse to []: once plan.segments
+  // is non-empty the backend renders only the listed ranges, so the main keep-range must stay explicit.
   function commitSegments(segs) {
     const merged = mergeRanges(segs).filter(s => s.end - s.start > 0.05);
-    const whole = merged.length === 1 && merged[0].start <= EPS && merged[0].end >= duration - EPS;
+    const hasInserts = (plan.segments || []).some(isInsert);
+    const whole = !hasInserts && merged.length === 1 && merged[0].start <= EPS && merged[0].end >= duration - EPS;
     onPlanChange({ segments: whole ? [] : merged });
   }
 
@@ -344,7 +421,7 @@ export function createVideoPreview(container, callbacks = {}) {
     const arr = kind === "sil" ? (analysis?.silences || []) : (analysis?.filler_ranges || []);
     const r = arr[parseInt(idxStr, 10)];
     if (!r) return;
-    const cur = materializeKept(plan.segments, duration);
+    const cur = materializeKept(mainSegments(plan.segments), duration);
     const mid = (r.start + r.end) / 2;
     // If this range is currently kept, cutting it means subtracting it; if already cut, restore.
     const next = isKept(cur, mid) ? subtractRange(cur, r.start, r.end) : addRange(cur, r.start, r.end, duration);
@@ -482,7 +559,7 @@ export function createVideoPreview(container, callbacks = {}) {
     const words = analysis?.transcript?.words || [];
     const a = words[selRange.a], b = words[selRange.b];
     if (!a || !b) { clearSelection(); return; }
-    const cur = materializeKept(plan.segments, duration);
+    const cur = materializeKept(mainSegments(plan.segments), duration);
     // ~40ms padding so we don't clip the neighbouring kept words.
     const next = subtractRange(cur, Math.max(0, a.start - 0.04), Math.min(duration, b.end + 0.04));
     clearSelection();
@@ -532,11 +609,15 @@ export function createVideoPreview(container, callbacks = {}) {
     }
 
     // Don't clobber a live drag's geometry; updateHandleDrag owns kept/cuts until pointerup.
+    // Only MAIN segments live on the source timeline the <video> scrubs — inserts are laid out
+    // separately on the output ribbon (renderInserts) and never join the source-time kept set.
     if (!drag) {
-      kept = materializeKept(plan.segments, duration);
+      kept = materializeKept(mainSegments(plan.segments), duration);
       cuts = complement(kept, duration);
     }
-    captionLines = plan.captions ? buildCaptionLines(analysis?.transcript?.words || [], kept, duration) : [];
+    captionLines = plan.captions
+      ? buildCaptionLines(analysis?.transcript?.words || [], plan.segments, plan.speed || 1, duration)
+      : [];
     // Sentinel (never equals a real key): forces renderCaption to re-evaluate — and, when
     // captions were just turned off, to run its clear branch and wipe any stale overlay.
     capKey = " ";
@@ -547,6 +628,7 @@ export function createVideoPreview(container, callbacks = {}) {
     applyAspect();
 
     renderTimeline();
+    renderInserts();
     renderTranscript();
     renderPlayhead();
     setPlayIcon();
@@ -559,5 +641,9 @@ export function createVideoPreview(container, callbacks = {}) {
     try { video.load(); } catch {}
   }
 
-  return { update, cleanup };
+  // Current SOURCE-time playhead (studio uses it to place a new insert after the segment the
+  // user is parked on).
+  function currentTime() { return video.currentTime || 0; }
+
+  return { update, cleanup, currentTime };
 }

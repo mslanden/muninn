@@ -1465,7 +1465,7 @@ pub(crate) async fn generate_video_edit_plan(
         "You are planning a video edit. Produce an edit plan as JSON.\n\n{context}\n\
         User's instruction: {instruction}\n\n\
         {refinement_note}Return ONLY a JSON object with these fields (all optional unless noted):\n\
-        - \"segments\": array of {{\"start\": s, \"end\": s}} — SOURCE-timeline ranges to keep, in playback order. Omit or [] to keep everything. Use the transcript/silences to pick what matters; cut dead air and filler. When the user asks to tighten things up, remove the \"ums\"/filler, or clean up stutters, exclude the detected filler-word/stutter ranges above from the kept segments.\n\
+        - \"segments\": array of {{\"start\": s, \"end\": s, \"source\": optional path}} — ranges in final playback order. For a MAIN-video segment omit \"source\": start/end are SOURCE-timeline seconds to keep. Omit or [] to keep everything. Use the transcript/silences to pick what matters; cut dead air and filler. When the user asks to tighten things up, remove the \"ums\"/filler, or clean up stutters, exclude the detected filler-word/stutter ranges above from the kept segments. To splice in OTHER media, set \"source\" to a file path: a VIDEO file inserts a b-roll clip (start/end trim THAT file's own timeline); a still IMAGE (.png/.jpg/.jpeg/.webp) is a silent title/intro card shown for end-start seconds (use start=0, duration 0.2–30s). Only add inserts when the user asks for b-roll, a title card, or an intro/outro slide.\n\
         - \"filter\": one of {presets}\n\
         - \"texts\": array of {{\"text\", \"start\", \"end\", \"position\" (\"top\"|\"center\"|\"bottom\"), \"size\"}} — overlay times are on the OUTPUT timeline (after cuts and speed), so compute them from the kept segments' cumulative durations.\n\
         - \"aspect\": \"9:16\", \"1:1\", \"4:5\", or \"16:9\" (center-crop) — only if the user asks for a platform/orientation.\n\
@@ -2284,15 +2284,15 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("edit_video") {
         defs.push((
             "edit_video",
-            "Edit a video with ffmpeg — non-destructive, renders a new .mp4 into the Content library. Keep only chosen segments (cuts), apply a color filter preset, overlay timed text, center-crop to an aspect ratio, change speed, mute, or burn in word-timed captions/subtitles. Also supports audio polish: normalize_audio for publishable loudness, denoise for noisy recordings, and fade for a smooth fade-in/out. Cuts always get an automatic de-click micro-fade so concatenated segments never pop. Run analyze_video first to choose cut points. Set captions=true for social/silent-viewing cuts or when the user asks for subtitles (the video is auto-transcribed).",
+            "Edit a video with ffmpeg — non-destructive, renders a new .mp4 into the Content library. Keep only chosen segments (cuts), splice in b-roll clips or still-image title/intro cards from other files (segments[].source), apply a color filter preset, overlay timed text, center-crop to an aspect ratio, change speed, mute, or burn in word-timed captions/subtitles. Also supports audio polish: normalize_audio for publishable loudness, denoise for noisy recordings, and fade for a smooth fade-in/out. Cuts always get an automatic de-click micro-fade so concatenated segments never pop. Run analyze_video first to choose cut points. Set captions=true for social/silent-viewing cuts or when the user asks for subtitles (the video is auto-transcribed). To build a title/intro card image, render HTML→PNG first (the Studio 'renderSlideToPng' helper) and reference the PNG as an image insert.",
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Source video path within the workspace"},
+                    "path": {"type": "string", "description": "Source (main) video path within the workspace"},
                     "segments": {
                         "type": "array",
-                        "items": {"type": "object", "properties": {"start": {"type": "number"}, "end": {"type": "number"}}, "required": ["start", "end"]},
-                        "description": "Source-timeline ranges (seconds) to keep, in playback order. Omit to keep the whole video. Pad speech boundaries ~0.2s."
+                        "items": {"type": "object", "properties": {"start": {"type": "number"}, "end": {"type": "number"}, "source": {"type": "string", "description": "Optional. Omit for the MAIN video. A workspace path to another VIDEO file makes this an inserted b-roll clip (start..end trimmed from THAT file). A workspace path to a still IMAGE (.png/.jpg/.jpeg/.webp) makes this a silent title/intro card shown for end-start seconds (use start=0; duration must be 0.2–30s). Inserts are auto-scaled/cropped to the main video's frame."}}, "required": ["start", "end"]},
+                        "description": "Ranges to keep/insert, in final playback order. For MAIN segments (no source) start/end are SOURCE-timeline seconds — pad speech boundaries ~0.2s. For inserts, start/end are on the inserted file's OWN timeline. Omit entirely to keep the whole main video."
                     },
                     "filter": {"type": "string", "enum": ["none", "cinematic", "warm", "cool", "vintage", "bw", "punchy"], "description": "Color filter preset"},
                     "texts": {

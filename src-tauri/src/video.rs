@@ -182,12 +182,12 @@ pub(crate) fn keep_segments(duration_s: f64, silences: &[SilenceRange], pad_s: f
     for s in silences {
         let end = (s.start + pad_s).min(duration_s);
         if end - cursor > 0.05 {
-            segments.push(Segment { start: cursor, end });
+            segments.push(Segment::keep(cursor, end));
         }
         cursor = (s.end - pad_s).max(cursor);
     }
     if duration_s - cursor > 0.05 {
-        segments.push(Segment { start: cursor, end: duration_s });
+        segments.push(Segment::keep(cursor, duration_s));
     }
     segments
 }
@@ -373,10 +373,31 @@ fn was_signal_killed(status: &std::process::ExitStatus) -> bool {
 
 // ---------- edit plan ----------
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Segment {
     pub start: f64,
     pub end: f64,
+    /// Which source the `start`..`end` range comes from. `None` (the serde default) means
+    /// the MAIN video being edited. `Some(path)` makes this an *insert*: a b-roll clip from
+    /// another video file (trim `start`..`end` from it), or a still image (png/jpg/jpeg/webp)
+    /// shown for `end - start` seconds as a silent title/intro card. Insert `start`/`end` are
+    /// on the insert's OWN timeline, not the main video's (images conventionally use start=0).
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+impl Segment {
+    /// A keep-range on the MAIN source (no separate insert file).
+    pub(crate) fn keep(start: f64, end: f64) -> Self {
+        Segment { start, end, source: None }
+    }
+}
+
+/// Whether a source path points at a still image we should show as a card (by extension —
+/// so it works in `validate()` without touching the filesystem). Case-insensitive.
+pub(crate) fn is_image_source(path: &str) -> bool {
+    let lower = path.trim().to_lowercase();
+    [".png", ".jpg", ".jpeg", ".webp"].iter().any(|ext| lower.ends_with(ext))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -444,10 +465,39 @@ impl EditPlan {
             return Err("too many text overlays (max 20)".to_string());
         }
         for s in &mut self.segments {
-            s.start = s.start.max(0.0);
-            s.end = s.end.min(probe.duration_s + 0.5);
-            if s.end - s.start < 0.05 {
-                return Err(format!("segment {:.2}–{:.2}s is empty or inverted", s.start, s.end));
+            match &s.source {
+                // MAIN-source keep-range: clamp against the (probed) main duration.
+                None => {
+                    s.start = s.start.max(0.0);
+                    s.end = s.end.min(probe.duration_s + 0.5);
+                    if s.end - s.start < 0.05 {
+                        return Err(format!("segment {:.2}–{:.2}s is empty or inverted", s.start, s.end));
+                    }
+                }
+                // Insert segment: its start/end are on the INSERT's own timeline, which we
+                // can't probe here (no fs in validate). Do only static checks — existence and
+                // per-file probing happen in `render_edit`.
+                Some(src) => {
+                    let src = src.trim();
+                    if src.is_empty() {
+                        return Err("segment has an empty source path".to_string());
+                    }
+                    if s.end - s.start < 0.05 {
+                        return Err(format!(
+                            "insert segment '{src}' has an empty or inverted range ({:.2}–{:.2}s)",
+                            s.start, s.end
+                        ));
+                    }
+                    if is_image_source(src) {
+                        let dur = s.end - s.start;
+                        if !(0.2..=30.0).contains(&dur) {
+                            return Err(format!(
+                                "image insert '{src}' duration must be 0.2–30s (got {dur:.2}s)"
+                            ));
+                        }
+                    }
+                    s.start = s.start.max(0.0);
+                }
             }
         }
         if let Some(sp) = self.speed {
@@ -535,7 +585,7 @@ fn drawtext_position(position: Option<&str>) -> &'static str {
 /// The kept segments the render actually uses (empty plan = the whole source).
 fn effective_segments(plan: &EditPlan, probe: &VideoProbe) -> Vec<Segment> {
     if plan.segments.is_empty() {
-        vec![Segment { start: 0.0, end: probe.duration_s }]
+        vec![Segment::keep(0.0, probe.duration_s)]
     } else {
         plan.segments.clone()
     }
@@ -556,6 +606,12 @@ fn segment_offsets(segments: &[Segment]) -> Vec<f64> {
 /// speed. Returns `(out_start, out_end, segment_index)`. Intervals that fall entirely
 /// outside every kept segment return `None` (the word is dropped); partially-clipped
 /// intervals are clamped to the kept segment they most overlap.
+///
+/// Transcript words belong to the MAIN source only, so overlap is measured against
+/// MAIN-source segments (`source == None`) exclusively — an insert segment's `start`..`end`
+/// live on a different timeline and must never "capture" a main-source word. Insert segments
+/// still count toward the cumulative output offset (via `segment_offsets`), so a word after
+/// an inserted b-roll clip is pushed later on the output timeline by that clip's duration.
 fn map_interval_to_output(
     ws: f64,
     we: f64,
@@ -566,6 +622,9 @@ fn map_interval_to_output(
     let offs = segment_offsets(segments);
     let mut best: Option<(usize, f64)> = None;
     for (i, s) in segments.iter().enumerate() {
+        if s.source.is_some() {
+            continue; // insert segment — words never map into it
+        }
         let overlap = we.min(s.end) - ws.max(s.start);
         if overlap > 0.0 && best.map_or(true, |(_, b)| overlap > b) {
             best = Some((i, overlap));
@@ -789,7 +848,7 @@ pub(crate) fn build_subtitles(
 ) -> String {
     let (segments, speed) = match plan {
         Some(p) => (effective_segments(p, probe), p.speed.unwrap_or(1.0)),
-        None => (vec![Segment { start: 0.0, end: probe.duration_s }], 1.0),
+        None => (vec![Segment::keep(0.0, probe.duration_s)], 1.0),
     };
     let lines = group_caption_lines(transcript, &segments, speed);
     let vtt = format == "vtt";
@@ -811,62 +870,128 @@ pub(crate) fn build_subtitles(
     out
 }
 
+/// One distinct input source in a (possibly multi-source) render. Index 0 in the slice passed
+/// to `build_render_args` is always the MAIN video being edited; any further entries are insert
+/// sources (b-roll clips or still-image cards) referenced by `Segment.source`.
+pub(crate) struct SourceInput {
+    pub path: PathBuf,
+    /// Probe of this input. For images `duration_s`/`fps` are 0 and `has_audio` is false, but
+    /// `width`/`height` are populated — normalization scales inserts to the MAIN dims regardless.
+    pub probe: VideoProbe,
+    pub is_image: bool,
+}
+
 /// Build the full ffmpeg argument list for a plan. Pure so it can be unit-tested.
-/// `text_files` must contain one temp-file path per entry in `plan.texts` (drawtext
-/// reads the text from a file, which sidesteps filter-graph escaping entirely).
-/// `ass_file`, when present, burns those subtitles in after the crop stage.
+/// `inputs[0]` must be the MAIN source; any further entries are insert sources, matched to a
+/// `Segment.source` by path. `text_files` must contain one temp-file path per entry in
+/// `plan.texts` (drawtext reads the text from a file, which sidesteps filter-graph escaping
+/// entirely). `ass_file`, when present, burns those subtitles in after the crop stage.
 pub(crate) fn build_render_args(
-    src: &Path,
+    inputs: &[SourceInput],
     plan: &EditPlan,
-    probe: &VideoProbe,
     font: &str,
     text_files: &[PathBuf],
     ass_file: Option<&Path>,
     encoder: VideoEncoder,
     out: &Path,
 ) -> Result<Vec<String>, String> {
+    let main = inputs.first().ok_or_else(|| "no render inputs".to_string())?;
+    let probe = &main.probe;
+    let (main_w, main_h) = (probe.width.max(2), probe.height.max(2));
+    // fps to normalize insert clips/images to the main timeline's frame rate before concat.
+    let target_fps = if probe.fps > 1.0 { probe.fps } else { 30.0 };
     let with_audio = probe.has_audio && !plan.mute;
     let segments: Vec<Segment> = if plan.segments.is_empty() {
-        vec![Segment { start: 0.0, end: probe.duration_s }]
+        vec![Segment::keep(0.0, probe.duration_s)]
     } else {
         plan.segments.clone()
+    };
+
+    // More than the main input means at least one insert → concat has to reconcile audio
+    // streams that differ in sample rate/format, so every real-audio branch gets a canonical
+    // `aformat` and silent inserts an `anullsrc` at the same params. Single-source renders keep
+    // the exact old graph (no aformat), so existing behavior is untouched.
+    let multi = inputs.len() > 1;
+    const CANON_RATE: u32 = 48_000;
+    let aformat = format!("aformat=sample_fmts=fltp:sample_rates={CANON_RATE}:channel_layouts=stereo");
+
+    // Resolve a segment to its input index (None = main = 0), matched by path string.
+    let seg_input = |s: &Segment| -> Result<usize, String> {
+        match &s.source {
+            None => Ok(0),
+            Some(src) => inputs
+                .iter()
+                .position(|i| i.path == PathBuf::from(src.trim()))
+                .ok_or_else(|| format!("insert source '{src}' is not among the render inputs")),
+        }
     };
 
     // De-click micro-fades: with 2+ segments, concat stitches independently-decoded audio
     // clips together, and a hard cut mid-waveform is audible as a click/pop. A ~20ms
     // in/out fade on each clip (clamped to half its own duration for very short segments)
-    // fixes that with no new EditPlan field — it's always on whenever there's a cut.
+    // fixes that with no new EditPlan field — it's always on whenever there's a cut. Silent
+    // inserts skip it (nothing to click).
     const MICRO_FADE_S: f64 = 0.02;
     let apply_microfades = with_audio && segments.len() > 1;
 
     let mut graph = String::new();
     for (i, s) in segments.iter().enumerate() {
-        graph.push_str(&format!(
-            "[0:v]trim=start={:.4}:end={:.4},setpts=PTS-STARTPTS[v{i}];",
-            s.start, s.end
-        ));
-        if with_audio {
-            let seg_dur = (s.end - s.start).max(0.0);
+        let k = seg_input(s)?;
+        let is_img = inputs[k].is_image;
+        let seg_dur = (s.end - s.start).max(0.0);
+        // ---- video branch ----
+        if k == 0 {
+            // MAIN source: kept exactly as before (already at the output's base dims/fps/sar).
             graph.push_str(&format!(
-                "[0:a]atrim=start={:.4}:end={:.4},asetpts=PTS-STARTPTS",
+                "[0:v]trim=start={:.4}:end={:.4},setpts=PTS-STARTPTS[v{i}];",
                 s.start, s.end
             ));
-            // Denoise per kept segment (simpler and just as effective as denoising the
-            // whole track once, without needing an explicit asplit to fan `[0:a]` out to
-            // both a denoise stage and the per-segment atrims).
-            if plan.denoise {
-                graph.push_str(",afftdn=nf=-25");
-            }
-            if apply_microfades {
-                let fd = MICRO_FADE_S.min(seg_dur / 2.0).max(0.0);
-                if fd > 0.0 {
-                    graph.push_str(&format!(
-                        ",afade=t=in:st=0:d={fd:.4},afade=t=out:st={:.4}:d={fd:.4}",
-                        (seg_dur - fd).max(0.0)
-                    ));
+        } else {
+            // Insert (b-roll clip or image card): trim, then scale-to-cover + center-crop to the
+            // MAIN dims, reset SAR, and normalize fps + pixel format so concat sees uniform
+            // frames. Images play from 0.. (start is conventionally 0) off the looped input.
+            let (ts, te) = if is_img { (0.0, seg_dur) } else { (s.start, s.end) };
+            graph.push_str(&format!(
+                "[{k}:v]trim=start={ts:.4}:end={te:.4},setpts=PTS-STARTPTS,\
+                 scale={main_w}:{main_h}:force_original_aspect_ratio=increase,\
+                 crop={main_w}:{main_h},setsar=1,fps={target_fps:.4},format=yuv420p[v{i}];"
+            ));
+        }
+        // ---- audio branch ----
+        if with_audio {
+            let real_audio = k == 0 || (!is_img && inputs[k].probe.has_audio);
+            if real_audio {
+                graph.push_str(&format!(
+                    "[{k}:a]atrim=start={:.4}:end={:.4},asetpts=PTS-STARTPTS",
+                    s.start, s.end
+                ));
+                // Denoise per kept segment (simpler and just as effective as denoising the
+                // whole track once, without needing an explicit asplit to fan the input out to
+                // both a denoise stage and the per-segment atrims).
+                if plan.denoise {
+                    graph.push_str(",afftdn=nf=-25");
                 }
+                if multi {
+                    graph.push_str(&format!(",{aformat}"));
+                }
+                if apply_microfades {
+                    let fd = MICRO_FADE_S.min(seg_dur / 2.0).max(0.0);
+                    if fd > 0.0 {
+                        graph.push_str(&format!(
+                            ",afade=t=in:st=0:d={fd:.4},afade=t=out:st={:.4}:d={fd:.4}",
+                            (seg_dur - fd).max(0.0)
+                        ));
+                    }
+                }
+                graph.push_str(&format!("[a{i}];"));
+            } else {
+                // Silent insert (image card, or a b-roll clip with no audio track): synthesize
+                // matching silence so concat's audio pad count stays balanced.
+                graph.push_str(&format!(
+                    "anullsrc=channel_layout=stereo:sample_rate={CANON_RATE},\
+                     atrim=end={seg_dur:.4},asetpts=PTS-STARTPTS,{aformat}[a{i}];"
+                ));
             }
-            graph.push_str(&format!("[a{i}];"));
         }
     }
     for i in 0..segments.len() {
@@ -964,13 +1089,37 @@ pub(crate) fn build_render_args(
         "-nostats".into(),
         "-progress".into(),
         "pipe:1".into(),
-        "-i".into(),
-        src.to_string_lossy().to_string(),
+    ];
+    // One `-i` per distinct input, in index order (so `[k:v]`/`[k:a]` line up). Image inputs
+    // are looped into a finite clip long enough for the longest segment that uses them.
+    for (k, inp) in inputs.iter().enumerate() {
+        if inp.is_image {
+            let max_dur = segments
+                .iter()
+                .filter(|s| seg_input(s).ok() == Some(k))
+                .map(|s| (s.end - s.start).max(0.0))
+                .fold(0.0_f64, f64::max)
+                .max(0.2);
+            args.extend([
+                "-loop".into(),
+                "1".into(),
+                "-framerate".into(),
+                format!("{target_fps:.4}"),
+                "-t".into(),
+                format!("{max_dur:.4}"),
+                "-i".into(),
+                inp.path.to_string_lossy().to_string(),
+            ]);
+        } else {
+            args.extend(["-i".into(), inp.path.to_string_lossy().to_string()]);
+        }
+    }
+    args.extend([
         "-filter_complex".into(),
         graph,
         "-map".into(),
         "[vout]".into(),
-    ];
+    ]);
     if with_audio {
         args.extend(["-map".into(), "[aout]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
     } else {
@@ -1125,6 +1274,30 @@ pub(crate) fn render_edit(
     let mut plan = plan.clone();
     plan.validate(&probe)?;
 
+    // Probe each distinct source once. Index 0 is always the MAIN video; insert sources
+    // (b-roll clips and image cards referenced by `Segment.source`) follow, deduped by path.
+    // Existence/probe errors surface here with the offending path — `validate()` can't touch
+    // the filesystem, so per-file checks live here.
+    let mut inputs: Vec<SourceInput> = vec![SourceInput {
+        path: src.to_path_buf(),
+        probe: probe.clone(),
+        is_image: false,
+    }];
+    let mut seen_sources: HashMap<String, usize> = HashMap::new();
+    for seg in &plan.segments {
+        if let Some(raw) = &seg.source {
+            let key = raw.trim().to_string();
+            if key.is_empty() || seen_sources.contains_key(&key) {
+                continue;
+            }
+            let path = PathBuf::from(&key);
+            let is_image = is_image_source(&key);
+            let sp = probe_video(&path).map_err(|e| format!("insert source '{key}': {e}"))?;
+            seen_sources.insert(key, inputs.len());
+            inputs.push(SourceInput { path, probe: sp, is_image });
+        }
+    }
+
     let font = font_path().ok_or_else(|| "no usable system font found for text overlays".to_string())?;
     let total_s = plan.output_duration(&probe).max(0.01);
 
@@ -1169,7 +1342,7 @@ pub(crate) fn render_edit(
 
     let encoder = pick_encoder(prefer_hw_encode);
     let mut used_encoder = encoder;
-    let args = build_render_args(src, &plan, &probe, font, &text_files, ass_file.as_deref(), encoder, &out_path)?;
+    let args = build_render_args(&inputs, &plan, font, &text_files, ass_file.as_deref(), encoder, &out_path)?;
     let mut attempt = run_ffmpeg_attempt(app, job_id, &args, total_s)?;
     let mut fallback_note = String::new();
 
@@ -1185,9 +1358,8 @@ pub(crate) fn render_edit(
         let hw_tail = stderr_tail(&attempt.stderr, 6);
         let _ = std::fs::remove_file(&out_path);
         let fallback_args = build_render_args(
-            src,
+            &inputs,
             &plan,
-            &probe,
             font,
             &text_files,
             ass_file.as_deref(),
@@ -1460,6 +1632,35 @@ async fn transcribe_cloud(state: &AppState, audio: &Path) -> Result<Transcript, 
 mod tests {
     use super::*;
 
+    /// Single-main-source shim so the many pre-multi-source tests keep their old call shape.
+    fn build_args_single(
+        src: &Path,
+        plan: &EditPlan,
+        probe: &VideoProbe,
+        font: &str,
+        text_files: &[PathBuf],
+        ass_file: Option<&Path>,
+        encoder: VideoEncoder,
+        out: &Path,
+    ) -> Result<Vec<String>, String> {
+        let inputs = vec![SourceInput { path: src.to_path_buf(), probe: probe.clone(), is_image: false }];
+        build_render_args(&inputs, plan, font, text_files, ass_file, encoder, out)
+    }
+
+    /// A minimal image-insert probe (dims only; no duration/audio, like ffprobe on a PNG).
+    fn image_probe(path: &str, w: u32, h: u32) -> VideoProbe {
+        VideoProbe {
+            path: path.into(),
+            duration_s: 0.0,
+            width: w,
+            height: h,
+            fps: 0.0,
+            has_audio: false,
+            video_codec: "png".into(),
+            size_bytes: 1,
+        }
+    }
+
     fn probe_16x9() -> VideoProbe {
         VideoProbe {
             path: "/tmp/x.mp4".into(),
@@ -1507,7 +1708,7 @@ mod tests {
     #[test]
     fn validate_rejects_bad_plans() {
         let probe = probe_16x9();
-        let mut p = EditPlan { segments: vec![Segment { start: 5.0, end: 4.0 }], ..Default::default() };
+        let mut p = EditPlan { segments: vec![Segment::keep(5.0, 4.0)], ..Default::default() };
         assert!(p.validate(&probe).is_err());
         let mut p = EditPlan { filter: Some("sepia-dreams".into()), ..Default::default() };
         assert!(p.validate(&probe).is_err());
@@ -1516,7 +1717,7 @@ mod tests {
         let mut p = EditPlan { aspect: Some("9x16".into()), ..Default::default() };
         assert!(p.validate(&probe).is_err());
         let mut ok = EditPlan {
-            segments: vec![Segment { start: 0.0, end: 10.0 }],
+            segments: vec![Segment::keep(0.0, 10.0)],
             filter: Some("punchy".into()),
             speed: Some(1.5),
             aspect: Some("9:16".into()),
@@ -1529,7 +1730,7 @@ mod tests {
     fn build_args_full_plan_shape() {
         let probe = probe_16x9();
         let plan = EditPlan {
-            segments: vec![Segment { start: 1.0, end: 4.0 }, Segment { start: 7.0, end: 11.0 }],
+            segments: vec![Segment::keep(1.0, 4.0), Segment::keep(7.0, 11.0)],
             filter: Some("punchy".into()),
             texts: vec![TextOverlay { text: "Hi".into(), start: 0.5, end: 3.0, position: None, size: None }],
             aspect: Some("9:16".into()),
@@ -1540,7 +1741,7 @@ mod tests {
             caption_style: None,
             ..Default::default()
         };
-        let args = build_render_args(
+        let args = build_args_single(
             Path::new("/tmp/in.mp4"),
             &plan,
             &probe,
@@ -1586,7 +1787,7 @@ mod tests {
         let text_file = dir.join("t0.txt");
         std::fs::write(&text_file, "Hello: 100% 'quoted'\\ text").unwrap(); // hostile chars
         let mut plan = EditPlan {
-            segments: vec![Segment { start: 1.0, end: 3.0 }, Segment { start: 5.0, end: 8.0 }],
+            segments: vec![Segment::keep(1.0, 3.0), Segment::keep(5.0, 8.0)],
             filter: Some("cinematic".into()),
             texts: vec![TextOverlay { text: "x".into(), start: 0.5, end: 2.0, position: Some("top".into()), size: Some(36) }],
             aspect: Some("9:16".into()),
@@ -1602,7 +1803,7 @@ mod tests {
         plan.validate(&probe).unwrap();
         let out = dir.join("out.mp4");
         let args =
-            build_render_args(&src, &plan, &probe, font_path().unwrap(), &[text_file], None, VideoEncoder::Libx264, &out)
+            build_args_single(&src, &plan, &probe, font_path().unwrap(), &[text_file], None, VideoEncoder::Libx264, &out)
                 .unwrap();
         let result = Command::new(ffmpeg_path().unwrap()).args(&args).output().unwrap();
         assert!(
@@ -1623,7 +1824,7 @@ mod tests {
         let ass_path = dir.join("captions.ass");
         std::fs::write(&ass_path, build_ass(&transcript, &cap_plan, &probe)).unwrap();
         let cap_out = dir.join("captioned.mp4");
-        let cap_args = build_render_args(
+        let cap_args = build_args_single(
             &src,
             &cap_plan,
             &probe,
@@ -1641,6 +1842,54 @@ mod tests {
             String::from_utf8_lossy(&cap_result.stderr)
         );
         assert!(probe_video(&cap_out).unwrap().duration_s > 5.0);
+
+        // Multi-source: main clip + a still-image title card insert. Generate a solid-color PNG
+        // (the same lavfi trick the src clip uses) and splice it in as a 2s silent card.
+        let card = dir.join("card.png");
+        let card_status = Command::new(ffmpeg_path().unwrap())
+            .args(["-y", "-f", "lavfi", "-i", "color=c=navy:s=400x300", "-frames:v", "1", "-update", "1"])
+            .arg(&card)
+            .status()
+            .unwrap();
+        assert!(card_status.success());
+        let card_probe = probe_video(&card).unwrap();
+        assert!(card_probe.width == 400 && card_probe.height == 300);
+
+        let multi_inputs = vec![
+            SourceInput { path: src.clone(), probe: probe.clone(), is_image: false },
+            SourceInput { path: card.clone(), probe: card_probe, is_image: true },
+        ];
+        // 2s card, then keep 1..4 (3s) of the main → ~5s output.
+        let mut multi_plan = EditPlan {
+            segments: vec![
+                Segment { start: 0.0, end: 2.0, source: Some(card.to_string_lossy().to_string()) },
+                Segment::keep(1.0, 4.0),
+            ],
+            ..Default::default()
+        };
+        multi_plan.validate(&probe).unwrap();
+        let multi_out = dir.join("multi.mp4");
+        let multi_args = build_render_args(
+            &multi_inputs,
+            &multi_plan,
+            font_path().unwrap(),
+            &[],
+            None,
+            VideoEncoder::Libx264,
+            &multi_out,
+        )
+        .unwrap();
+        let multi_result = Command::new(ffmpeg_path().unwrap()).args(&multi_args).output().unwrap();
+        assert!(
+            multi_result.status.success(),
+            "multi-source (image insert) ffmpeg render failed:\n{}",
+            String::from_utf8_lossy(&multi_result.stderr)
+        );
+        let multi_probe = probe_video(&multi_out).unwrap();
+        assert!((multi_probe.duration_s - 5.0).abs() < 0.4, "expected ~5s, got {}", multi_probe.duration_s);
+        // The image insert was scaled/cropped to the MAIN dims (640x360) for concat.
+        assert_eq!((multi_probe.width, multi_probe.height), (640, 360));
+        assert!(multi_probe.has_audio, "silent card + main audio → output keeps an audio track");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1682,10 +1931,10 @@ mod tests {
             denoise: true,
             normalize_audio: true,
             fade: Some(1.0),
-            segments: vec![Segment { start: 0.0, end: 10.0 }, Segment { start: 20.0, end: 30.0 }],
+            segments: vec![Segment::keep(0.0, 10.0), Segment::keep(20.0, 30.0)],
             ..Default::default()
         };
-        let args = build_render_args(
+        let args = build_args_single(
             Path::new("/tmp/in.mp4"),
             &plan,
             &probe,
@@ -1711,7 +1960,7 @@ mod tests {
     fn build_args_normalize_audio_is_last_filter() {
         let probe = probe_16x9();
         let plan = EditPlan { normalize_audio: true, speed: Some(1.5), ..Default::default() };
-        let args = build_render_args(
+        let args = build_args_single(
             Path::new("/tmp/in.mp4"),
             &plan,
             &probe,
@@ -1736,7 +1985,7 @@ mod tests {
     fn build_args_denoise_runs_before_atempo_and_loudnorm() {
         let probe = probe_16x9();
         let plan = EditPlan { denoise: true, normalize_audio: true, speed: Some(2.0), ..Default::default() };
-        let args = build_render_args(
+        let args = build_args_single(
             Path::new("/tmp/in.mp4"),
             &plan,
             &probe,
@@ -1761,12 +2010,12 @@ mod tests {
         let probe = probe_16x9();
         // Single 8s segment at 2x speed → 4s output; a 1s fade should fade out starting at 3s.
         let plan = EditPlan {
-            segments: vec![Segment { start: 0.0, end: 8.0 }],
+            segments: vec![Segment::keep(0.0, 8.0)],
             speed: Some(2.0),
             fade: Some(1.0),
             ..Default::default()
         };
-        let args = build_render_args(
+        let args = build_args_single(
             Path::new("/tmp/in.mp4"),
             &plan,
             &probe,
@@ -1801,8 +2050,8 @@ mod tests {
     fn build_args_microfades_only_with_two_or_more_segments() {
         let probe = probe_16x9();
         // Single segment: no cut, so no de-click micro-fades should appear.
-        let one_seg = EditPlan { segments: vec![Segment { start: 1.0, end: 10.0 }], ..Default::default() };
-        let args = build_render_args(
+        let one_seg = EditPlan { segments: vec![Segment::keep(1.0, 10.0)], ..Default::default() };
+        let args = build_args_single(
             Path::new("/tmp/in.mp4"), &one_seg, &probe, "/tmp/f.ttc", &[], None, VideoEncoder::Libx264, Path::new("/tmp/out.mp4"),
         ).unwrap();
         let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
@@ -1811,10 +2060,10 @@ mod tests {
         // Two segments: a concat happens, so each per-segment audio clip gets a ~20ms
         // in/out afade to avoid an audible click at the cut.
         let two_segs = EditPlan {
-            segments: vec![Segment { start: 1.0, end: 5.0 }, Segment { start: 10.0, end: 15.0 }],
+            segments: vec![Segment::keep(1.0, 5.0), Segment::keep(10.0, 15.0)],
             ..Default::default()
         };
-        let args = build_render_args(
+        let args = build_args_single(
             Path::new("/tmp/in.mp4"), &two_segs, &probe, "/tmp/f.ttc", &[], None, VideoEncoder::Libx264, Path::new("/tmp/out.mp4"),
         ).unwrap();
         let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
@@ -1841,7 +2090,7 @@ mod tests {
 
     #[test]
     fn map_interval_whole_video_identity_and_speed() {
-        let segs = vec![Segment { start: 0.0, end: 10.0 }];
+        let segs = vec![Segment::keep(0.0, 10.0)];
         // speed 1: identity
         let (s, e, i) = map_interval_to_output(2.0, 3.0, &segs, 1.0).unwrap();
         assert!((s - 2.0).abs() < 1e-9 && (e - 3.0).abs() < 1e-9 && i == 0);
@@ -1853,7 +2102,7 @@ mod tests {
     #[test]
     fn map_interval_multiple_segments_and_dropping() {
         // Keep 1–4 and 7–11: cumulative offsets 0 and 3.
-        let segs = vec![Segment { start: 1.0, end: 4.0 }, Segment { start: 7.0, end: 11.0 }];
+        let segs = vec![Segment::keep(1.0, 4.0), Segment::keep(7.0, 11.0)];
         // A word in the first kept segment.
         let (s, e, i) = map_interval_to_output(2.0, 3.0, &segs, 1.0).unwrap();
         assert!((s - 1.0).abs() < 1e-9 && (e - 2.0).abs() < 1e-9 && i == 0);
@@ -1866,7 +2115,7 @@ mod tests {
 
     #[test]
     fn map_interval_straddling_a_cut_is_clamped() {
-        let segs = vec![Segment { start: 0.0, end: 5.0 }, Segment { start: 10.0, end: 15.0 }];
+        let segs = vec![Segment::keep(0.0, 5.0), Segment::keep(10.0, 15.0)];
         // Word 4.5–6.0 straddles the cut; most overlap is in segment 0 (4.5–5.0).
         let (s, e, i) = map_interval_to_output(4.5, 6.0, &segs, 1.0).unwrap();
         assert_eq!(i, 0);
@@ -1888,7 +2137,7 @@ mod tests {
     #[test]
     fn group_lines_breaks_on_gap_and_word_count() {
         let t = transcript_fixture();
-        let segs = vec![Segment { start: 0.0, end: 6.0 }];
+        let segs = vec![Segment::keep(0.0, 6.0)];
         let lines = group_caption_lines(&t, &segs, 1.0);
         // The 1.5→4.0 gap (2.5s > 0.8s) splits "one two three" from "four five six".
         assert_eq!(lines.len(), 2, "lines: {:?}", lines.iter().map(|l| l.text()).collect::<Vec<_>>());
@@ -1902,7 +2151,7 @@ mod tests {
     fn group_lines_maps_output_times_under_speed_and_cuts() {
         let t = transcript_fixture();
         // Keep only 0–2 (drops four/five/six), at 2x speed → output halved.
-        let plan = EditPlan { segments: vec![Segment { start: 0.0, end: 2.0 }], speed: Some(2.0), ..Default::default() };
+        let plan = EditPlan { segments: vec![Segment::keep(0.0, 2.0)], speed: Some(2.0), ..Default::default() };
         let lines = group_caption_lines(&t, &effective_segments(&plan, &probe_16x9()), 2.0);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text(), "one two three");
@@ -2102,7 +2351,7 @@ mod tests {
             ..Default::default()
         };
         let ass = PathBuf::from("/tmp/muninn-video-x/captions.ass");
-        let args = build_render_args(
+        let args = build_args_single(
             Path::new("/tmp/in.mp4"),
             &plan,
             &probe,
@@ -2150,7 +2399,7 @@ mod tests {
     fn build_args_videotoolbox_uses_bitrate_not_crf() {
         let probe = probe_16x9();
         let plan = EditPlan::default();
-        let args = build_render_args(
+        let args = build_args_single(
             Path::new("/tmp/in.mp4"),
             &plan,
             &probe,
@@ -2171,6 +2420,176 @@ mod tests {
         // pix_fmt/movflags stay the same across encoders.
         assert!(args.iter().any(|a| a == "yuv420p"));
         assert!(args.iter().any(|a| a == "+faststart"));
+    }
+
+    #[test]
+    fn build_args_multi_source_inputs_and_normalization() {
+        let main = probe_16x9(); // 1920x1080, 30fps, audio
+        let broll = VideoProbe {
+            path: "/tmp/broll.mp4".into(),
+            duration_s: 30.0,
+            width: 1280,
+            height: 720,
+            fps: 25.0,
+            has_audio: true,
+            video_codec: "h264".into(),
+            size_bytes: 1,
+        };
+        let inputs = vec![
+            SourceInput { path: PathBuf::from("/tmp/main.mp4"), probe: main, is_image: false },
+            SourceInput { path: PathBuf::from("/tmp/broll.mp4"), probe: broll, is_image: false },
+            SourceInput { path: PathBuf::from("/tmp/card.png"), probe: image_probe("/tmp/card.png", 800, 600), is_image: true },
+        ];
+        let plan = EditPlan {
+            segments: vec![
+                Segment::keep(0.0, 5.0),
+                Segment { start: 2.0, end: 4.0, source: Some("/tmp/broll.mp4".into()) },
+                Segment { start: 0.0, end: 3.0, source: Some("/tmp/card.png".into()) },
+            ],
+            ..Default::default()
+        };
+        let args = build_render_args(
+            &inputs,
+            &plan,
+            "/tmp/f.ttc",
+            &[],
+            None,
+            VideoEncoder::Libx264,
+            Path::new("/tmp/out.mp4"),
+        )
+        .unwrap();
+
+        // Three distinct `-i` inputs, in index order.
+        assert_eq!(args.iter().filter(|a| *a == "-i").count(), 3);
+        let i0 = args.iter().position(|a| a == "/tmp/main.mp4").unwrap();
+        let i1 = args.iter().position(|a| a == "/tmp/broll.mp4").unwrap();
+        let i2 = args.iter().position(|a| a == "/tmp/card.png").unwrap();
+        assert!(i0 < i1 && i1 < i2, "inputs must stay in index order");
+        // Image input is looped for exactly the longest segment that uses it (3s here).
+        assert!(args.iter().any(|a| a == "-loop"));
+        assert!(args.windows(2).any(|w| w[0] == "-t" && w[1] == "3.0000"), "image -t: {args:?}");
+
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(graph.contains("concat=n=3:v=1:a=1"), "graph: {graph}");
+        // Main segment is untouched (no scale/crop normalization on [0:v]).
+        assert!(graph.contains("[0:v]trim=start=0.0000:end=5.0000,setpts=PTS-STARTPTS[v0];"));
+        // Both inserts are normalized to the MAIN dims/fps/sar and yuv420p before concat.
+        assert!(graph.contains("[1:v]trim=start=2.0000:end=4.0000"), "broll video: {graph}");
+        assert!(graph.contains("[2:v]trim=start=0.0000:end=3.0000"), "image video: {graph}");
+        assert_eq!(
+            graph.matches("scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1,fps=30.0000,format=yuv420p").count(),
+            2,
+            "both inserts normalized: {graph}"
+        );
+        // Real-audio branches (main + b-roll) get a canonical aformat once inserts are present.
+        assert!(graph.contains("[0:a]atrim=start=0.0000:end=5.0000"));
+        assert!(graph.contains("[1:a]atrim=start=2.0000:end=4.0000"));
+        assert_eq!(
+            graph.matches("aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo").count(),
+            3, // main audio + b-roll audio + the image's silent branch
+            "graph: {graph}"
+        );
+        // The silent image insert synthesizes matching silence, no [2:a] input pad.
+        assert!(graph.contains("anullsrc=channel_layout=stereo:sample_rate=48000,atrim=end=3.0000"));
+        assert!(!graph.contains("[2:a]"), "image has no audio stream to map: {graph}");
+    }
+
+    #[test]
+    fn build_args_single_source_unchanged_no_aformat() {
+        // With only the main input, the graph must stay exactly as before — no aformat, no
+        // anullsrc — so single-source renders are byte-for-byte unaffected.
+        let probe = probe_16x9();
+        let plan = EditPlan {
+            segments: vec![Segment::keep(0.0, 5.0), Segment::keep(10.0, 15.0)],
+            ..Default::default()
+        };
+        let args = build_args_single(
+            Path::new("/tmp/in.mp4"), &plan, &probe, "/tmp/f.ttc", &[], None, VideoEncoder::Libx264, Path::new("/tmp/out.mp4"),
+        ).unwrap();
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(!graph.contains("aformat="), "single source needs no aformat: {graph}");
+        assert!(!graph.contains("anullsrc"), "single source needs no anullsrc: {graph}");
+        assert!(!graph.contains("force_original_aspect_ratio"), "no insert normalization: {graph}");
+        assert_eq!(args.iter().filter(|a| *a == "-i").count(), 1);
+    }
+
+    #[test]
+    fn build_args_image_insert_is_silent_when_main_muted_stays_valid() {
+        // mute=true with an image insert: no audio chain at all, but the image still renders.
+        let main = probe_16x9();
+        let inputs = vec![
+            SourceInput { path: PathBuf::from("/tmp/main.mp4"), probe: main, is_image: false },
+            SourceInput { path: PathBuf::from("/tmp/card.png"), probe: image_probe("/tmp/card.png", 400, 400), is_image: true },
+        ];
+        let plan = EditPlan {
+            mute: true,
+            segments: vec![
+                Segment { start: 0.0, end: 3.0, source: Some("/tmp/card.png".into()) },
+                Segment::keep(0.0, 5.0),
+            ],
+            ..Default::default()
+        };
+        let args = build_render_args(&inputs, &plan, "/tmp/f.ttc", &[], None, VideoEncoder::Libx264, Path::new("/tmp/out.mp4")).unwrap();
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(graph.contains("concat=n=2:v=1:a=0"), "graph: {graph}");
+        assert!(!graph.contains("anullsrc"), "muted → no audio work at all: {graph}");
+        assert!(!graph.contains("[aout]"));
+        assert!(args.iter().any(|a| a == "-an"));
+    }
+
+    #[test]
+    fn validate_image_insert_duration_bounds() {
+        let probe = probe_16x9(); // 60s main
+        let mut too_short = EditPlan {
+            segments: vec![Segment { start: 0.0, end: 0.1, source: Some("/x/card.png".into()) }],
+            ..Default::default()
+        };
+        assert!(too_short.validate(&probe).is_err());
+        let mut too_long = EditPlan {
+            segments: vec![Segment { start: 0.0, end: 40.0, source: Some("card.png".into()) }],
+            ..Default::default()
+        };
+        assert!(too_long.validate(&probe).is_err());
+        let mut empty_src = EditPlan {
+            segments: vec![Segment { start: 0.0, end: 3.0, source: Some("   ".into()) }],
+            ..Default::default()
+        };
+        assert!(empty_src.validate(&probe).is_err());
+        // A b-roll VIDEO insert whose end exceeds the MAIN duration must NOT be clamped or
+        // rejected — its range is on the insert's own timeline, checked at render time.
+        let mut broll = EditPlan {
+            segments: vec![Segment { start: 0.0, end: 500.0, source: Some("/x/b.mp4".into()) }],
+            ..Default::default()
+        };
+        assert!(broll.validate(&probe).is_ok());
+        let mut ok = EditPlan {
+            segments: vec![Segment { start: 0.0, end: 3.0, source: Some("/x/card.png".into()) }],
+            ..Default::default()
+        };
+        assert!(ok.validate(&probe).is_ok());
+    }
+
+    #[test]
+    fn map_interval_skips_inserts_but_offset_shifts_after_them() {
+        // main A: source 0..5, insert B: a 3s image card, main C: source 5..10.
+        let segs = vec![
+            Segment::keep(0.0, 5.0),
+            Segment { start: 0.0, end: 3.0, source: Some("/tmp/card.png".into()) },
+            Segment::keep(5.0, 10.0),
+        ];
+        // A word at source 7 (inside C) lands 3s later on the output timeline because of the
+        // inserted card: output offset for C = 5 (A) + 3 (insert) = 8, plus (7-5) = 10.
+        let (s, e, i) = map_interval_to_output(7.0, 7.5, &segs, 1.0).unwrap();
+        assert_eq!(i, 2);
+        assert!((s - 10.0).abs() < 1e-9, "expected 10.0, got {s}");
+        assert!((e - 10.5).abs() < 1e-9, "got {e}");
+        // A word at source 1.5 overlaps A AND the insert's 0..3 slot — it must map to A (no leak).
+        let (s, _e, i) = map_interval_to_output(1.5, 2.0, &segs, 1.0).unwrap();
+        assert_eq!(i, 0, "word must not leak into the insert slot");
+        assert!((s - 1.5).abs() < 1e-9);
+        // Under 2x speed the after-insert word halves on the output timeline: 10 → 5.
+        let (s, _e, _i) = map_interval_to_output(7.0, 7.5, &segs, 2.0).unwrap();
+        assert!((s - 5.0).abs() < 1e-9, "expected 5.0 at 2x, got {s}");
     }
 
     /// Full pipeline against the real hardware encoder — needs ffmpeg built with
@@ -2203,7 +2622,7 @@ mod tests {
         let plan = EditPlan::default();
         let out = dir.join("out-hw.mp4");
         let args =
-            build_render_args(&src, &plan, &probe, font_path().unwrap(), &[], None, encoder, &out).unwrap();
+            build_args_single(&src, &plan, &probe, font_path().unwrap(), &[], None, encoder, &out).unwrap();
         assert!(args.iter().any(|a| a == "h264_videotoolbox"));
 
         let result = Command::new(ffmpeg_path().unwrap()).args(&args).output().unwrap();

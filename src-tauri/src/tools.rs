@@ -2466,8 +2466,23 @@ pub(crate) async fn execute_agent_tool(
             let resolved =
                 resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)?;
             // The plan fields live flat in the tool arguments; serde ignores `path`.
-            let plan: crate::video::EditPlan = serde_json::from_value(arguments.clone())
+            let mut plan: crate::video::EditPlan = serde_json::from_value(arguments.clone())
                 .map_err(|e| format!("invalid edit plan: {e}"))?;
+            // SAFETY BOUNDARY: every insert source an agent supplies is an arbitrary path, so
+            // each MUST be re-resolved through the workspace scope (rejecting escapes) and
+            // rewritten to its canonical in-workspace path before it ever reaches the renderer.
+            // The studio command path (commands/video.rs) is user-picked and stays unscoped.
+            for seg in &mut plan.segments {
+                if let Some(src) = seg.source.as_ref() {
+                    let resolved = resolve_within_workspace(
+                        &effective_scope.root,
+                        &effective_scope.root_canon,
+                        src,
+                        false,
+                    )?;
+                    seg.source = Some(resolved.to_string_lossy().to_string());
+                }
+            }
             // Burned captions need a transcript — transcribe on-demand before rendering.
             let transcript = if plan.captions {
                 Some(crate::video::transcribe_video(state, &resolved).await.map_err(|e| {

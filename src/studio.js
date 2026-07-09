@@ -479,6 +479,36 @@ function fmtT(s) {
   return (Math.round(s * 100) / 100).toFixed(2);
 }
 
+// Extensions that count as still-image inserts (title/intro cards). Mirrors is_image_source
+// in video.rs.
+const INSERT_IMAGE_EXTS = ["png", "jpg", "jpeg", "webp"];
+function isImageInsertPath(p) {
+  const ext = (p || "").split(".").pop().toLowerCase();
+  return INSERT_IMAGE_EXTS.includes(ext);
+}
+
+// The preview edits only MAIN segments (drag/cut/toggle); this re-weaves the existing inserts
+// back into the new main list so their relative position (after the Nth main segment) survives.
+// Each insert is anchored to the count of main segments that preceded it in the old array.
+function mergeMainWithInserts(newMains, oldSegments) {
+  const inserts = [];
+  let mainCount = 0;
+  for (const s of oldSegments || []) {
+    if (s.source) inserts.push({ seg: s, anchor: mainCount });
+    else mainCount++;
+  }
+  if (!inserts.length) return newMains.slice();
+  const placed = new Array(inserts.length).fill(false);
+  const result = [];
+  const flushAt = (n) => inserts.forEach((ins, i) => {
+    if (!placed[i] && ins.anchor === n) { result.push(ins.seg); placed[i] = true; }
+  });
+  flushAt(0);
+  newMains.forEach((m, idx) => { result.push(m); flushAt(idx + 1); });
+  inserts.forEach((ins, i) => { if (!placed[i]) result.push(ins.seg); }); // anchor past the end
+  return result;
+}
+
 function renderVideoSection(el, id) {
   el.innerHTML = `
     <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
@@ -610,7 +640,10 @@ function renderVideoSection(el, id) {
   // the shared `plan` and re-runs drawPlan() so the checkbox/pill UI and the preview stay in sync.
   const preview = createVideoPreview(previewMount, {
     onPlanChange: (patch) => {
-      if (patch && Array.isArray(patch.segments)) plan.segments = patch.segments;
+      // The preview sends back MAIN segments only; re-weave any inserts so they keep their slot.
+      if (patch && Array.isArray(patch.segments)) {
+        plan.segments = mergeMainWithInserts(patch.segments, plan.segments);
+      }
       drawPlan(); // drawPlan() calls refreshPreview() at its end, so the preview redraws too
     },
   });
@@ -781,6 +814,7 @@ function renderVideoSection(el, id) {
       <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
         <button class="hint-chip" data-vd-cutsil>Cut silences</button>
         <button class="hint-chip" data-vd-clearsegs>Keep everything</button>
+        <button class="hint-chip" data-vd-addinsert title="Splice in a b-roll clip or a still-image title card after the current spot">Insert clip/image…</button>
         <label class="studio-chip" title="${fillerCount ? "Cut detected filler words (um, uh, ...) and repeated-word stutters" : "Analyze speech first to find filler words"}">
           <input type="checkbox" data-vd-fillers ${cutFillers ? "checked" : ""} ${fillerCount ? "" : "disabled"} /> Cut filler words (${fillerCount} found)
         </label>
@@ -835,9 +869,13 @@ function renderVideoSection(el, id) {
     `;
 
     const segsEl = planBox.querySelector("[data-vd-segs]");
-    segsEl.innerHTML = plan.segments.map((s, i) =>
-      `<span class="studio-seg-pill">${fmtT(s.start)}–${fmtT(s.end)}s <button data-vd-rmseg="${i}" title="Remove">×</button></span>`
-    ).join("");
+    segsEl.innerHTML = plan.segments.map((s, i) => {
+      if (s.source) {
+        const name = s.source.split("/").pop();
+        return `<span class="studio-seg-pill studio-seg-insert" title="${escapeHtml(s.source)}">insert: ${escapeHtml(name)} (${fmtT(s.end - s.start)}s) <button data-vd-rmseg="${i}" title="Remove">×</button></span>`;
+      }
+      return `<span class="studio-seg-pill">${fmtT(s.start)}–${fmtT(s.end)}s <button data-vd-rmseg="${i}" title="Remove">×</button></span>`;
+    }).join("");
     segsEl.querySelectorAll("[data-vd-rmseg]").forEach(btn => {
       btn.addEventListener("click", () => { plan.segments.splice(parseInt(btn.dataset.vdRmseg, 10), 1); drawPlan(); });
     });
@@ -860,6 +898,7 @@ function renderVideoSection(el, id) {
       drawPlan();
     });
     planBox.querySelector("[data-vd-clearsegs]").addEventListener("click", () => { plan.segments = []; cutFillers = false; drawPlan(); });
+    planBox.querySelector("[data-vd-addinsert]").addEventListener("click", addInsert);
     const fillersBox = planBox.querySelector("[data-vd-fillers]");
     if (fillersBox) {
       fillersBox.addEventListener("change", (e) => {
@@ -906,6 +945,50 @@ function renderVideoSection(el, id) {
     refreshPreview();
   }
   drawPlan();
+
+  // Pick a b-roll clip or still-image card and splice it in AFTER the main kept segment the
+  // preview playhead sits in (else at the end). Images default to a 3s card; videos default to
+  // their full length capped at 5s.
+  async function addInsert() {
+    if (!srcPath) { statusEl.textContent = "Choose a main video first."; return; }
+    let selected;
+    try {
+      selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "Clip or image", extensions: ["mp4", "mov", "m4v", "avi", "mkv", "webm", "png", "jpg", "jpeg", "webp"] }],
+      });
+    } catch (e) { logError("insert pick", e); return; }
+    if (!selected) return;
+    const path = typeof selected === "string" ? selected : selected.path;
+
+    let seg;
+    if (isImageInsertPath(path)) {
+      seg = { start: 0, end: 3, source: path }; // 3s title/intro card
+    } else {
+      let dur = 5;
+      try {
+        const ip = await invoke("video_probe", { path });
+        if (ip && ip.duration_s > 0) dur = Math.min(5, ip.duration_s);
+      } catch (e) { logError("insert probe", e); }
+      seg = { start: 0, end: dur > 0 ? dur : 5, source: path };
+    }
+
+    // An empty plan means "keep the whole main video"; once we add an insert the segment list
+    // becomes explicit, so materialize the whole main range first or the backend would render
+    // only the insert and drop the main clip.
+    if (!plan.segments.length && probe) {
+      plan.segments = [{ start: 0, end: probe.duration_s }];
+    }
+    const t = preview.currentTime ? preview.currentTime() : 0;
+    let idx = plan.segments.length; // default: append at the end
+    for (let i = 0; i < plan.segments.length; i++) {
+      const s = plan.segments[i];
+      if (!s.source && t >= s.start && t < s.end) { idx = i + 1; break; }
+    }
+    plan.segments.splice(idx, 0, seg);
+    statusEl.textContent = `Inserted ${path.split("/").pop()} — review below, then Render.`;
+    drawPlan();
+  }
 
   // Snake-case plan payload shared by Render and Export (EditPlan uses snake_case fields).
   function planPayload() {
