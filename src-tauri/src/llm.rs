@@ -1008,6 +1008,19 @@ fn extract_json_array(text: &str) -> Option<Vec<Value>> {
         .and_then(|v| v.as_array().cloned())
 }
 
+/// Pull a JSON object out of a model response, tolerating code fences / stray prose.
+fn extract_json_object(text: &str) -> Option<Value> {
+    if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(text.trim()) {
+        return Some(v);
+    }
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<Value>(&text[start..=end]).ok().filter(Value::is_object)
+}
+
 /// Generate tailored social-media post copy (3 variants per platform) in one LLM call.
 /// Returns structured per-platform variants for the Studio tile.
 pub(crate) async fn generate_social_copy(
@@ -1365,6 +1378,149 @@ pub(crate) async fn generate_doc_html(
         return Err(format!("Model did not return HTML. It said:\n{}", html.chars().take(400).collect::<String>()));
     }
     Ok(html)
+}
+
+/// Turn a natural-language edit instruction + the video's analysis (probe, transcript,
+/// silences) into a structured `EditPlan` for the Studio Video tab. One-shot JSON call,
+/// validated by deserializing into the plan struct.
+///
+/// When `current_plan` is `Some`, this is a *refinement*: the existing plan's JSON is
+/// included in the prompt with instructions to mutate only what the new instruction asks
+/// for and preserve every other field verbatim (so "make the captions karaoke" doesn't
+/// silently drop segments/filters/texts from a prior AI or manual edit).
+pub(crate) async fn generate_video_edit_plan(
+    state: &AppState,
+    instruction: &str,
+    probe: &crate::video::VideoProbe,
+    transcript: Option<&crate::video::Transcript>,
+    silences: &[crate::video::SilenceRange],
+    filler_ranges: &[crate::video::SilenceRange],
+    current_plan: Option<&crate::video::EditPlan>,
+) -> Result<crate::video::EditPlan, String> {
+    if instruction.trim().is_empty() {
+        return Err("Describe the edit you want.".to_string());
+    }
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+
+    let presets = crate::video::FILTER_PRESETS
+        .iter()
+        .map(|(k, label, _)| format!("\"{k}\" ({label})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut context = format!(
+        "Video: {:.1}s, {}x{}, {:.0} fps, audio: {}.\n",
+        probe.duration_s, probe.width, probe.height, probe.fps,
+        if probe.has_audio { "yes" } else { "no" }
+    );
+    if !silences.is_empty() {
+        context.push_str("Detected silences (source seconds):\n");
+        for s in silences.iter().take(60) {
+            context.push_str(&format!("  {:.2}–{:.2}\n", s.start, s.end));
+        }
+    }
+    if !filler_ranges.is_empty() {
+        context.push_str(&format!(
+            "Detected filler words/stutters ({} found — \"um\", \"uh\", repeated words, etc., source seconds):\n",
+            filler_ranges.len()
+        ));
+        for f in filler_ranges.iter().take(60) {
+            context.push_str(&format!("  {:.2}–{:.2}\n", f.start, f.end));
+        }
+    }
+    if let Some(t) = transcript {
+        if !t.segments.is_empty() {
+            context.push_str("Transcript (source seconds):\n");
+            let mut budget = 0usize;
+            for seg in &t.segments {
+                let line = format!("  [{:.1}–{:.1}] {}\n", seg.start, seg.end, seg.text);
+                budget += line.len();
+                if budget > 24_000 {
+                    context.push_str("  … (transcript truncated)\n");
+                    break;
+                }
+                context.push_str(&line);
+            }
+        }
+    }
+
+    let refinement_note = if let Some(existing) = current_plan {
+        let existing_json = serde_json::to_string(existing)
+            .map_err(|e| format!("could not serialize current plan: {e}"))?;
+        context.push_str(&format!(
+            "\nThe user already has an edit plan in progress (JSON below). This is a REFINEMENT \
+            request: apply ONLY what the new instruction below asks for, and copy every other \
+            field from this existing plan UNCHANGED (segments, filter, texts, aspect, speed, \
+            mute, captions/caption_style, normalize_audio, denoise, fade, output_name). Do not \
+            reset or drop fields the instruction doesn't mention.\n\
+            Current plan JSON:\n{existing_json}\n"
+        ));
+        "Treat the instruction as an incremental change to the current plan above, not a fresh edit — \
+        preserve every field it doesn't ask you to change. "
+    } else {
+        ""
+    };
+
+    let prompt = format!(
+        "You are planning a video edit. Produce an edit plan as JSON.\n\n{context}\n\
+        User's instruction: {instruction}\n\n\
+        {refinement_note}Return ONLY a JSON object with these fields (all optional unless noted):\n\
+        - \"segments\": array of {{\"start\": s, \"end\": s}} — SOURCE-timeline ranges to keep, in playback order. Omit or [] to keep everything. Use the transcript/silences to pick what matters; cut dead air and filler. When the user asks to tighten things up, remove the \"ums\"/filler, or clean up stutters, exclude the detected filler-word/stutter ranges above from the kept segments.\n\
+        - \"filter\": one of {presets}\n\
+        - \"texts\": array of {{\"text\", \"start\", \"end\", \"position\" (\"top\"|\"center\"|\"bottom\"), \"size\"}} — overlay times are on the OUTPUT timeline (after cuts and speed), so compute them from the kept segments' cumulative durations.\n\
+        - \"aspect\": \"9:16\", \"1:1\", \"4:5\", or \"16:9\" (center-crop) — only if the user asks for a platform/orientation.\n\
+        - \"speed\": playback speed 0.25–4.0.\n\
+        - \"mute\": true to drop audio.\n\
+        - \"captions\": true to burn in word-timed subtitles from the transcript. Use when the user mentions captions/subtitles, or wants a social/silent-viewing cut (TikTok, Reels, Shorts).\n\
+        - \"caption_style\": \"boxed\" (default — white text on a black box), \"outline\" (white with a heavy outline), or \"karaoke\" (word-by-word highlight). Only set when captions is true.\n\
+        - \"normalize_audio\": true to loudness-normalize the mix to a publishable level (EBU R128, -14 LUFS). Use when the user wants the audio ready to publish/upload, or mentions it sounding too quiet/loud/inconsistent.\n\
+        - \"denoise\": true to reduce background hiss/hum/fan noise from the recording. Use when the user mentions noisy audio, background noise, or a bad-sounding mic.\n\
+        - \"fade\": overall fade-in/fade-out duration in seconds (0.1–5.0), applied to both video and audio at the very start and end of the clip. Use for a polished open/close; omit for a hard cut in/out.\n\
+        - \"output_name\": short kebab-case stem for the output file.\n\n\
+        Keep cuts conservative: pad speech boundaries ~0.2s so words aren't clipped. \
+        No markdown, no code fences, no commentary — the JSON object only."
+    );
+    let system = "You are a precise video editor. You reason about timestamps carefully and output strict JSON only.";
+
+    let request_body = if is_anthropic {
+        json!({"model": model, "max_tokens": 4000, "stream": false, "system": system,
+               "messages": [{"role": "user", "content": prompt}]})
+    } else {
+        json!({"model": model, "max_tokens": 4000, "stream": false,
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
+    };
+
+    let resp = if is_anthropic {
+        state.http.post(&endpoint)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body)
+            .send().await.map_err(|e| e.to_string())?
+    } else {
+        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Edit planning failed ({status}): {body}"));
+    }
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let text = if is_anthropic {
+        body.get("content").and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
+    } else {
+        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
+            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
+    }
+    .ok_or_else(|| "Edit planning returned no text".to_string())?;
+
+    let obj = extract_json_object(&text)
+        .ok_or_else(|| format!("Could not parse the edit plan as JSON. Model said:\n{}", text.trim()))?;
+    let mut plan: crate::video::EditPlan =
+        serde_json::from_value(obj).map_err(|e| format!("Edit plan had the wrong shape: {e}"))?;
+    plan.validate(probe)?;
+    Ok(plan)
 }
 
 /// Backfill embeddings for entities that don't have one yet.
@@ -2095,6 +2251,66 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "style": {"type": "string", "description": "Art style hint: realistic, artistic, cartoon, abstract"}
                 },
                 "required": ["prompt"]
+            }),
+        ));
+    }
+    if enabled.contains("probe_video") {
+        defs.push((
+            "probe_video",
+            "Get a video file's metadata: duration, resolution, fps, codec, and whether it has audio. Use before analyzing or editing a video.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Video file path within the workspace"}
+                },
+                "required": ["path"]
+            }),
+        ));
+    }
+    if enabled.contains("analyze_video") {
+        defs.push((
+            "analyze_video",
+            "Analyze a video for editing: metadata, detected silence ranges (dead air), detected filler-word/stutter ranges (\"um\", \"uh\", repeated words), suggested keep-segments (silences + fillers removed), and a timestamped speech transcript. Use the timestamps to pick precise cut points for edit_video.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Video file path within the workspace"},
+                    "transcribe": {"type": "boolean", "description": "Include a timestamped transcript (default true; requires a Groq or OpenAI API key)"}
+                },
+                "required": ["path"]
+            }),
+        ));
+    }
+    if enabled.contains("edit_video") {
+        defs.push((
+            "edit_video",
+            "Edit a video with ffmpeg — non-destructive, renders a new .mp4 into the Content library. Keep only chosen segments (cuts), apply a color filter preset, overlay timed text, center-crop to an aspect ratio, change speed, mute, or burn in word-timed captions/subtitles. Also supports audio polish: normalize_audio for publishable loudness, denoise for noisy recordings, and fade for a smooth fade-in/out. Cuts always get an automatic de-click micro-fade so concatenated segments never pop. Run analyze_video first to choose cut points. Set captions=true for social/silent-viewing cuts or when the user asks for subtitles (the video is auto-transcribed).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Source video path within the workspace"},
+                    "segments": {
+                        "type": "array",
+                        "items": {"type": "object", "properties": {"start": {"type": "number"}, "end": {"type": "number"}}, "required": ["start", "end"]},
+                        "description": "Source-timeline ranges (seconds) to keep, in playback order. Omit to keep the whole video. Pad speech boundaries ~0.2s."
+                    },
+                    "filter": {"type": "string", "enum": ["none", "cinematic", "warm", "cool", "vintage", "bw", "punchy"], "description": "Color filter preset"},
+                    "texts": {
+                        "type": "array",
+                        "items": {"type": "object", "properties": {"text": {"type": "string"}, "start": {"type": "number"}, "end": {"type": "number"}, "position": {"type": "string", "enum": ["top", "center", "bottom"]}, "size": {"type": "integer"}}, "required": ["text", "start", "end"]},
+                        "description": "Text overlays. Times are on the OUTPUT timeline (after cuts and speed change)."
+                    },
+                    "aspect": {"type": "string", "description": "Center-crop to an aspect like \"9:16\", \"1:1\", \"4:5\""},
+                    "speed": {"type": "number", "description": "Playback speed multiplier, 0.25–4.0"},
+                    "mute": {"type": "boolean", "description": "Drop the audio track"},
+                    "captions": {"type": "boolean", "description": "Burn in word-timed subtitles from the transcript (auto-transcribes). Use for social/silent-viewing cuts or when subtitles are requested."},
+                    "caption_style": {"type": "string", "enum": ["boxed", "outline", "karaoke"], "description": "Caption look: boxed (default), outline, or karaoke word-by-word highlight. Only with captions=true."},
+                    "normalize_audio": {"type": "boolean", "description": "Loudness-normalize the mix for publishable audio (EBU R128, -14 LUFS). Use when the audio should be upload-ready or sounds too quiet/loud."},
+                    "denoise": {"type": "boolean", "description": "Reduce background hiss/hum/fan noise from the recording. Use for noisy audio or a bad-sounding mic."},
+                    "fade": {"type": "number", "description": "Overall fade-in/fade-out duration in seconds (0.1-5.0), applied to both video and audio at the clip's start and end."},
+                    "output_name": {"type": "string", "description": "Short kebab-case stem for the output file"}
+                },
+                "required": ["path"]
             }),
         ));
     }

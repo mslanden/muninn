@@ -5,3 +5,4 @@ src-tauri/target
 app-icon.png
 maya.png
 vite.config.js.timestamp-*.mjs
+src-tauri/binaries

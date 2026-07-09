@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -154,9 +154,26 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 6)?;
     }
 
+    if version < 7 {
+        // Per-source-video edit plan persistence for the Studio Video tab: keyed by the
+        // video's absolute path so reopening the same file restores the last plan (AI or
+        // manual) instead of starting over.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS video_plans (
+              path TEXT PRIMARY KEY,
+              plan_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .map_err(|e| e.to_string())?;
+        set_schema_version(conn, 7)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 6, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 7, "add a migration block for the new version");
 
     Ok(())
 }
@@ -370,6 +387,12 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           resolved_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS video_plans (
+          path TEXT PRIMARY KEY,
+          plan_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -422,6 +445,24 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             "generate_image",
             "Generate Image",
             "Generate images from text descriptions.",
+            "image",
+        ),
+        (
+            "probe_video",
+            "Probe Video",
+            "Read a video's metadata (duration, resolution, fps, audio).",
+            "image",
+        ),
+        (
+            "analyze_video",
+            "Analyze Video",
+            "Detect silences and produce a timestamped transcript to plan video edits.",
+            "image",
+        ),
+        (
+            "edit_video",
+            "Edit Video",
+            "Cut, filter, caption, reframe, and re-render videos with ffmpeg.",
             "image",
         ),
         (
@@ -1160,5 +1201,43 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn legacy_v6_database_gains_video_plans_on_migrate() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a DB at schema v6 (no video_plans table yet).
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+        assert!(conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='video_plans'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_none());
+        run_migrations(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        // Now it exists, is usable, and enforces path uniqueness (upsert target).
+        conn.execute(
+            "INSERT INTO video_plans (path, plan_json, updated_at) VALUES ('/tmp/a.mp4', '{}', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO video_plans (path, plan_json, updated_at) VALUES ('/tmp/a.mp4', '{}', '2026-01-02T00:00:00Z') \
+             ON CONFLICT(path) DO UPDATE SET plan_json = excluded.plan_json, updated_at = excluded.updated_at",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM video_plans", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

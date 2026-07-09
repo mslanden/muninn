@@ -19,6 +19,7 @@ mod mcp;
 mod studio;
 mod safety;
 mod mobile;
+mod video;
 
 pub use sessions::*;
 pub use toolconfig::*;
@@ -38,3 +39,4 @@ pub use mcp::*;
 pub use studio::*;
 pub use safety::*;
 pub use mobile::*;
+pub use video::*;

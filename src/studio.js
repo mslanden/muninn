@@ -1,7 +1,11 @@
 import { registerTileRenderer } from "./registry.js";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { escapeHtml } from "./utils.js";
 import { logError } from "./uikit.js";
+import { tiles } from "./state.js";
+import { createVideoPreview } from "./videopreview.js";
 import html2canvas from "html2canvas";
 
 // Aspect presets for carousels/graphics (width × height in px).
@@ -72,10 +76,16 @@ export function renderStudioTile(tileObj, body) {
     media: renderMediaSection,
     writing: renderWritingSection,
     docs: renderDocsSection,
-    video: (el) => renderComingSoon(el, "Video", "Generate short clips or assemble slideshow videos (images + voiceover). Coming later."),
+    video: renderVideoSection,
   };
   function selectTab(key) {
     tabsEl.querySelectorAll(".studio-tab").forEach(b => b.classList.toggle("active", b.dataset.stTab === key));
+    // Let the outgoing section tear down (e.g. the video preview pauses playback + drops
+    // its media element) before we blow away its DOM.
+    if (typeof sectionEl._sectionCleanup === "function") {
+      try { sectionEl._sectionCleanup(); } catch {}
+      sectionEl._sectionCleanup = null;
+    }
     sectionEl.innerHTML = "";
     (renderers[key] || renderers.media)(sectionEl, id);
   }
@@ -84,10 +94,6 @@ export function renderStudioTile(tileObj, body) {
   });
 
   selectTab("media");
-}
-
-function renderComingSoon(el, title, note) {
-  el.innerHTML = `<div class="studio-soon"><h4 class="studio-h">${escapeHtml(title)}</h4><p class="muted">${escapeHtml(note)}</p></div>`;
 }
 
 // ---------- MEDIA section ----------
@@ -445,6 +451,536 @@ function renderDocsSection(el, id) {
     if (!html) return;
     try { await navigator.clipboard.writeText(html); copyBtn.textContent = "Copied ✓"; setTimeout(() => { copyBtn.textContent = "Copy HTML"; }, 1200); }
     catch { copyBtn.textContent = "Copy failed"; }
+  });
+}
+
+// ---------- VIDEO section ----------
+// AI video editor: pick a file → analyze (silences + timestamped transcript) → build an
+// edit plan (by hand or from a natural-language instruction) → render via ffmpeg.
+
+const VIDEO_ASPECTS = [
+  ["", "Keep aspect"],
+  ["9:16", "9:16 vertical"],
+  ["1:1", "1:1 square"],
+  ["4:5", "4:5 portrait"],
+  ["16:9", "16:9 wide"],
+];
+
+const CAPTION_STYLES = [
+  ["boxed", "Boxed"],
+  ["outline", "Outline"],
+  ["karaoke", "Karaoke"],
+];
+
+// One progress listener per tile; re-rendering the section replaces it.
+const videoUnlisteners = new Map();
+
+function fmtT(s) {
+  return (Math.round(s * 100) / 100).toFixed(2);
+}
+
+function renderVideoSection(el, id) {
+  el.innerHTML = `
+    <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+      <button class="form-btn" data-vd-pick="${id}">Choose video…</button>
+      <span class="muted" data-vd-info="${id}" style="font-size:11px;"></span>
+    </div>
+    <div class="studio-filmstrip" data-vd-strip="${id}"></div>
+
+    <div class="vp-mount" data-vd-preview="${id}" style="display:none;"></div>
+
+    <div class="form-row" style="gap:6px; align-items:center;">
+      <button class="form-btn" data-vd-analyze="${id}" disabled>Analyze speech &amp; silence</button>
+      <span class="muted" data-vd-an-status="${id}" style="font-size:10px;"></span>
+    </div>
+    <div class="studio-transcript" data-vd-transcript="${id}" style="display:none;"></div>
+
+    <h4 class="studio-h" style="margin-top:8px;">Edit</h4>
+    <div class="form-row" style="gap:6px;">
+      <textarea class="studio-topic" rows="2" style="flex:1;"
+        placeholder="Describe the edit (e.g. 'keep the best 30s, cut the dead air, add a title, make it punchy for TikTok')"
+        data-vd-instr="${id}"></textarea>
+      <button class="form-btn" data-vd-plan="${id}" disabled>Plan with AI</button>
+    </div>
+
+    <div class="studio-plan" data-vd-planbox="${id}"></div>
+
+    <div class="form-row" style="gap:6px; align-items:center; margin-top:4px;">
+      <button class="form-btn" data-vd-render="${id}" disabled>Render</button>
+      <button class="hint-chip" data-vd-cancel="${id}" style="display:none;">Cancel</button>
+      <div class="studio-progress" data-vd-progwrap="${id}" style="display:none;">
+        <div class="studio-progress-bar" data-vd-prog="${id}"></div>
+      </div>
+      <span class="muted" data-vd-status="${id}" style="font-size:10px;"></span>
+    </div>
+    <div class="studio-video-out" data-vd-out="${id}"></div>
+  `;
+
+  const pickBtn = el.querySelector(`[data-vd-pick="${id}"]`);
+  const infoEl = el.querySelector(`[data-vd-info="${id}"]`);
+  const stripEl = el.querySelector(`[data-vd-strip="${id}"]`);
+  const previewMount = el.querySelector(`[data-vd-preview="${id}"]`);
+  const analyzeBtn = el.querySelector(`[data-vd-analyze="${id}"]`);
+  const anStatusEl = el.querySelector(`[data-vd-an-status="${id}"]`);
+  const transcriptEl = el.querySelector(`[data-vd-transcript="${id}"]`);
+  const instrEl = el.querySelector(`[data-vd-instr="${id}"]`);
+  const planBtn = el.querySelector(`[data-vd-plan="${id}"]`);
+  const planBox = el.querySelector(`[data-vd-planbox="${id}"]`);
+  const renderBtn = el.querySelector(`[data-vd-render="${id}"]`);
+  const cancelBtn = el.querySelector(`[data-vd-cancel="${id}"]`);
+  const progWrap = el.querySelector(`[data-vd-progwrap="${id}"]`);
+  const progBar = el.querySelector(`[data-vd-prog="${id}"]`);
+  const statusEl = el.querySelector(`[data-vd-status="${id}"]`);
+  const outEl = el.querySelector(`[data-vd-out="${id}"]`);
+
+  let srcPath = null;
+  let probe = null;
+  let analysis = null;
+  let thumbs = [];
+  let currentJobId = null;
+  // Default shape for `plan` — used to reset on a new file pick, to apply an AI/saved plan
+  // on top of, and to detect whether the user has made any edit yet (drives refinement mode
+  // and the "restored previous edit" note). A fresh object each call so callers get their own
+  // arrays instead of sharing references with a previous plan.
+  function defaultPlanFields() {
+    return {
+      segments: [], filter: "none", texts: [], aspect: "", speed: 1, mute: false,
+      captions: false, captionStyle: "boxed",
+      normalizeAudio: false, denoise: false, fade: null, output_name: null,
+    };
+  }
+  // The single source of truth for what Render produces. "Plan with AI" fills it;
+  // every control below edits it.
+  const plan = defaultPlanFields();
+  function resetPlanToDefault() { Object.assign(plan, defaultPlanFields()); }
+  // True once the plan has any AI/manual edit — drives "Plan with AI" refinement mode (send
+  // the current plan so the model mutates it instead of starting over) and the instruction
+  // box's placeholder hint.
+  function isDefaultPlan() {
+    const d = defaultPlanFields();
+    return plan.segments.length === d.segments.length &&
+      plan.filter === d.filter &&
+      plan.texts.length === d.texts.length &&
+      plan.aspect === d.aspect &&
+      plan.speed === d.speed &&
+      plan.mute === d.mute &&
+      plan.captions === d.captions &&
+      plan.normalizeAudio === d.normalizeAudio &&
+      plan.denoise === d.denoise &&
+      plan.fade === d.fade &&
+      !plan.output_name;
+  }
+  // Copy a plan-shaped object (an AI result or a saved plan — both use EditPlan's snake_case
+  // fields) onto the shared `plan`, defaulting anything missing. Shared by "Plan with AI" and
+  // the saved-plan restore on file pick so the two paths can't drift apart.
+  function applyPlanFields(src) {
+    const d = defaultPlanFields();
+    plan.segments = src.segments || d.segments;
+    plan.filter = src.filter || d.filter;
+    plan.texts = src.texts || d.texts;
+    plan.aspect = src.aspect || d.aspect;
+    plan.speed = src.speed || d.speed;
+    plan.mute = !!src.mute;
+    plan.captions = !!src.captions;
+    plan.captionStyle = src.caption_style || d.captionStyle;
+    plan.normalizeAudio = !!src.normalize_audio;
+    plan.denoise = !!src.denoise;
+    plan.fade = src.fade || d.fade;
+    plan.output_name = src.output_name || d.output_name;
+  }
+  // UI-only toggle for the "Cut filler words" checkbox — not part of the render payload.
+  let cutFillers = false;
+  let presets = [{ key: "none", label: "None" }];
+  invoke("video_filter_presets").then(p => { presets = p; drawPlan(); }).catch(() => {});
+
+  // Autosave: debounced so dragging a slider or typing doesn't spam saves. Every plan
+  // mutation path (drawPlan()'s many callers, plus the handful of controls that only call
+  // refreshPreview()) calls this — it's the one place that actually talks to the DB.
+  let saveTimer = null;
+  function scheduleAutosave() {
+    if (!srcPath) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      invoke("video_save_plan", { req: { path: srcPath, plan: planPayload() } }).catch(() => {});
+    }, 800);
+  }
+
+  // Instant edit preview (player + timeline + interactive transcript). Edits made inside it
+  // (marker toggles, edge drags, transcript cuts) come back through onPlanChange, which mutates
+  // the shared `plan` and re-runs drawPlan() so the checkbox/pill UI and the preview stay in sync.
+  const preview = createVideoPreview(previewMount, {
+    onPlanChange: (patch) => {
+      if (patch && Array.isArray(patch.segments)) plan.segments = patch.segments;
+      drawPlan(); // drawPlan() calls refreshPreview() at its end, so the preview redraws too
+    },
+  });
+  function refreshPreview() {
+    if (!srcPath || !probe) return;
+    previewMount.style.display = "";
+    preview.update({ srcPath, probe, plan, analysis, thumbs });
+    // Every drawPlan() call ends here, and so do the handful of controls that mutate `plan`
+    // without a full drawPlan() rebuild (filter/aspect/mute/caption style) — so this one spot
+    // catches nearly every plan change for autosave. See scheduleAutosave() for the rest.
+    scheduleAutosave();
+  }
+  // Tear the preview down when the tile closes or the Studio tab switches away (see selectTab).
+  el._sectionCleanup = () => { try { preview.cleanup(); } catch {} };
+  const tileObj = tiles.find(t => t.id === id);
+  if (tileObj) {
+    const prevCleanup = tileObj.cleanup;
+    tileObj.cleanup = () => { try { preview.cleanup(); } catch {} if (typeof prevCleanup === "function") { try { prevCleanup(); } catch {} } };
+  }
+
+  // Progress events for this tile's renders.
+  const prev = videoUnlisteners.get(id);
+  if (prev) prev.then(un => un()).catch(() => {});
+  videoUnlisteners.set(id, listen("video-render-progress", (e) => {
+    const p = e.payload || {};
+    if (p.job_id !== currentJobId) return;
+    progBar.style.width = `${Math.max(1, p.pct || 0)}%`;
+    statusEl.textContent = `Rendering… ${Math.floor(p.pct || 0)}%`;
+  }));
+
+  pickBtn.addEventListener("click", async () => {
+    let selected;
+    try {
+      selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "Video", extensions: ["mp4", "mov", "m4v", "avi", "mkv", "webm"] }],
+      });
+    } catch (e) { logError("video pick", e); return; }
+    if (!selected) return;
+    srcPath = typeof selected === "string" ? selected : selected.path;
+    probe = null;
+    analysis = null;
+    thumbs = [];
+    resetPlanToDefault();
+    cutFillers = false;
+    transcriptEl.style.display = "none";
+    previewMount.style.display = "none";
+    outEl.innerHTML = "";
+    stripEl.innerHTML = "";
+    statusEl.textContent = "";
+    infoEl.textContent = "Reading file…";
+    try {
+      probe = await invoke("video_probe", { path: srcPath });
+      const name = srcPath.split("/").pop();
+      const mins = Math.floor(probe.duration_s / 60);
+      const secs = Math.round(probe.duration_s % 60);
+      infoEl.textContent = `${name} — ${mins}:${String(secs).padStart(2, "0")}, ${probe.width}×${probe.height}, ${probe.fps} fps${probe.has_audio ? "" : ", no audio"}`;
+      analyzeBtn.disabled = !probe.has_audio;
+      anStatusEl.textContent = probe.has_audio ? "" : "No audio track — silence/transcript analysis unavailable.";
+      planBtn.disabled = false;
+      renderBtn.disabled = false;
+      // Restore a previously saved edit for this exact file, if any — "Keep everything"
+      // below resets back to the default plan.
+      try {
+        const savedPlan = await invoke("video_load_plan", { req: { path: srcPath } });
+        if (savedPlan) {
+          applyPlanFields(savedPlan);
+          statusEl.textContent = "Restored previous edit — \"Keep everything\" resets.";
+        }
+      } catch (e) {
+        logError("video_load_plan", e);
+      }
+      drawPlan();
+      invoke("video_thumbnails", { path: srcPath, count: 8 }).then(t => {
+        thumbs = t || [];
+        stripEl.innerHTML = thumbs.map(u => `<img src="${u}" alt="frame" />`).join("");
+        refreshPreview(); // fill the timeline strip once frames arrive
+      }).catch(() => {});
+    } catch (e) {
+      logError("video_probe", e);
+      infoEl.textContent = String(e);
+      srcPath = null;
+    }
+  });
+
+  analyzeBtn.addEventListener("click", async () => {
+    if (!srcPath) return;
+    analyzeBtn.disabled = true;
+    anStatusEl.textContent = "Analyzing… (detecting silence, transcribing speech)";
+    try {
+      analysis = await invoke("video_analyze", { req: { path: srcPath } });
+      const parts = [];
+      if (analysis.silences.length) {
+        parts.push(`<div class="muted" style="font-size:10px;">${analysis.silences.length} silence${analysis.silences.length === 1 ? "" : "s"} detected — "Cut silences" below removes them.</div>`);
+      }
+      if (analysis.filler_ranges?.length) {
+        parts.push(`<div class="muted" style="font-size:10px;">${analysis.filler_ranges.length} filler word${analysis.filler_ranges.length === 1 ? "" : "s"}/stutter${analysis.filler_ranges.length === 1 ? "" : "s"} detected — "Cut filler words" below removes them.</div>`);
+      }
+      if (analysis.transcript && analysis.transcript.segments.length) {
+        parts.push(analysis.transcript.segments.map(s =>
+          `<div class="studio-tr-line"><span class="studio-tr-time">${fmtT(s.start)}–${fmtT(s.end)}</span> ${escapeHtml(s.text)}</div>`
+        ).join(""));
+      } else if (analysis.transcript_error) {
+        parts.push(`<div class="muted" style="font-size:10px;">Transcript unavailable: ${escapeHtml(analysis.transcript_error)}</div>`);
+      } else {
+        parts.push(`<div class="muted" style="font-size:10px;">No speech found.</div>`);
+      }
+      transcriptEl.innerHTML = parts.join("");
+      transcriptEl.style.display = "";
+      anStatusEl.textContent = "";
+      drawPlan();
+    } catch (e) {
+      logError("video_analyze", e);
+      anStatusEl.textContent = String(e);
+    } finally {
+      analyzeBtn.disabled = false;
+    }
+  });
+
+  planBtn.addEventListener("click", async () => {
+    if (!srcPath) return;
+    const instruction = instrEl.value.trim();
+    if (!instruction) { statusEl.textContent = "Describe the edit first."; return; }
+    planBtn.disabled = true;
+    statusEl.textContent = "Planning edit…";
+    // Any edit so far (a prior AI plan or manual tweaks) is sent along so the model refines
+    // it in place instead of starting from a blank plan — see isDefaultPlan()/applyPlanFields.
+    const refining = !isDefaultPlan();
+    try {
+      const aiPlan = await invoke("video_plan_edit", {
+        req: {
+          path: srcPath,
+          instruction,
+          transcript: analysis?.transcript || null,
+          silences: analysis?.silences || null,
+          fillerRanges: analysis?.filler_ranges || null,
+          currentPlan: refining ? planPayload() : null,
+        },
+      });
+      applyPlanFields(aiPlan);
+      statusEl.textContent = "Plan ready — review below, then Render.";
+      drawPlan();
+    } catch (e) {
+      logError("video_plan_edit", e);
+      statusEl.textContent = String(e);
+    } finally {
+      planBtn.disabled = false;
+    }
+  });
+
+  function drawPlan() {
+    // Once there's anything to refine (a prior AI plan or a manual tweak), hint that the next
+    // instruction refines rather than replaces — matches the currentPlan wiring in planBtn.
+    instrEl.placeholder = isDefaultPlan()
+      ? "Describe the edit (e.g. 'keep the best 30s, cut the dead air, add a title, make it punchy for TikTok')"
+      : "Refine the current edit… (e.g. 'make the captions karaoke style and speed it up a bit')";
+    const dur = probe ? probe.duration_s : 0;
+    const hasTranscript = !!(analysis && analysis.transcript &&
+      (analysis.transcript.words?.length || analysis.transcript.segments?.length));
+    if (!hasTranscript) plan.captions = false;
+    const fillerCount = analysis?.filler_ranges?.length || 0;
+    if (!fillerCount) cutFillers = false;
+    const kept = plan.segments.length
+      ? plan.segments.reduce((a, s) => a + (s.end - s.start), 0)
+      : dur;
+    const outDur = kept / (plan.speed || 1);
+    planBox.innerHTML = `
+      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+        <button class="hint-chip" data-vd-cutsil>Cut silences</button>
+        <button class="hint-chip" data-vd-clearsegs>Keep everything</button>
+        <label class="studio-chip" title="${fillerCount ? "Cut detected filler words (um, uh, ...) and repeated-word stutters" : "Analyze speech first to find filler words"}">
+          <input type="checkbox" data-vd-fillers ${cutFillers ? "checked" : ""} ${fillerCount ? "" : "disabled"} /> Cut filler words (${fillerCount} found)
+        </label>
+        <span class="muted" style="font-size:10px;">
+          ${plan.segments.length ? `${plan.segments.length} segment${plan.segments.length === 1 ? "" : "s"} kept` : "keeping the whole video"}${probe ? ` · output ≈ ${fmtT(outDur)}s` : ""}
+        </span>
+      </div>
+      <div class="studio-segs" data-vd-segs></div>
+      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+        <select data-vd-filter style="width:auto;">
+          ${presets.map(p => `<option value="${escapeHtml(p.key)}" ${p.key === plan.filter ? "selected" : ""}>${escapeHtml(p.label)}</option>`).join("")}
+        </select>
+        <select data-vd-aspect style="width:auto;">
+          ${VIDEO_ASPECTS.map(([v, l]) => `<option value="${v}" ${v === plan.aspect ? "selected" : ""}>${l}</option>`).join("")}
+        </select>
+        <label class="muted" style="font-size:11px;">Speed
+          <input type="number" min="0.25" max="4" step="0.25" value="${plan.speed}" data-vd-speed style="width:64px; margin-left:4px;" />
+        </label>
+        <label class="studio-chip"><input type="checkbox" data-vd-mute ${plan.mute ? "checked" : ""} /> Mute</label>
+      </div>
+      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+        <label class="studio-chip" title="${hasTranscript ? "Burn word-timed subtitles from the transcript" : "Analyze speech first to enable captions"}">
+          <input type="checkbox" data-vd-captions ${plan.captions ? "checked" : ""} ${hasTranscript ? "" : "disabled"} /> Burn captions
+        </label>
+        <select data-vd-capstyle style="width:auto;" ${hasTranscript && plan.captions ? "" : "disabled"}>
+          ${CAPTION_STYLES.map(([v, l]) => `<option value="${v}" ${v === plan.captionStyle ? "selected" : ""}>${l}</option>`).join("")}
+        </select>
+        <button class="hint-chip" data-vd-exportsrt ${hasTranscript ? "" : "disabled"}>Export SRT</button>
+        ${hasTranscript ? "" : `<span class="muted" style="font-size:10px;">Analyze speech to enable captions.</span>`}
+      </div>
+      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+        <label class="studio-chip" title="Loudness-normalize the mix for publishable audio (EBU R128, -14 LUFS)">
+          <input type="checkbox" data-vd-normalize ${plan.normalizeAudio ? "checked" : ""} /> Normalize loudness
+        </label>
+        <label class="studio-chip" title="Reduce background hiss/hum/fan noise">
+          <input type="checkbox" data-vd-denoise ${plan.denoise ? "checked" : ""} /> Reduce noise
+        </label>
+        <label class="muted" style="font-size:11px;" title="Fade in/out at the start and end of the clip (video + audio)">Fade (s)
+          <input type="number" min="0.1" max="5" step="0.1" placeholder="none" value="${plan.fade ?? ""}" data-vd-fade style="width:64px; margin-left:4px;" />
+        </label>
+      </div>
+      <div class="studio-texts" data-vd-texts></div>
+      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+        <input type="text" placeholder="Overlay text (optional)" data-vd-newtext style="flex:1; min-width:140px;" />
+        <input type="number" min="0" step="0.5" placeholder="start s" data-vd-newstart style="width:70px;" />
+        <input type="number" min="0" step="0.5" placeholder="end s" data-vd-newend style="width:70px;" />
+        <select data-vd-newpos style="width:auto;">
+          <option value="bottom">Bottom</option><option value="center">Center</option><option value="top">Top</option>
+        </select>
+        <button class="hint-chip" data-vd-addtext>Add text</button>
+      </div>
+    `;
+
+    const segsEl = planBox.querySelector("[data-vd-segs]");
+    segsEl.innerHTML = plan.segments.map((s, i) =>
+      `<span class="studio-seg-pill">${fmtT(s.start)}–${fmtT(s.end)}s <button data-vd-rmseg="${i}" title="Remove">×</button></span>`
+    ).join("");
+    segsEl.querySelectorAll("[data-vd-rmseg]").forEach(btn => {
+      btn.addEventListener("click", () => { plan.segments.splice(parseInt(btn.dataset.vdRmseg, 10), 1); drawPlan(); });
+    });
+
+    const textsEl = planBox.querySelector("[data-vd-texts]");
+    textsEl.innerHTML = plan.texts.map((t, i) =>
+      `<span class="studio-seg-pill">"${escapeHtml(t.text)}" ${fmtT(t.start)}–${fmtT(t.end)}s (${escapeHtml(t.position || "bottom")}) <button data-vd-rmtext="${i}" title="Remove">×</button></span>`
+    ).join("");
+    textsEl.querySelectorAll("[data-vd-rmtext]").forEach(btn => {
+      btn.addEventListener("click", () => { plan.texts.splice(parseInt(btn.dataset.vdRmtext, 10), 1); drawPlan(); });
+    });
+
+    planBox.querySelector("[data-vd-cutsil]").addEventListener("click", () => {
+      if (!analysis || !analysis.suggested_segments?.length) {
+        statusEl.textContent = analysis ? "No silences to cut." : "Run Analyze first.";
+        return;
+      }
+      plan.segments = analysis.suggested_segments.map(s => ({ start: s.start, end: s.end }));
+      cutFillers = false;
+      drawPlan();
+    });
+    planBox.querySelector("[data-vd-clearsegs]").addEventListener("click", () => { plan.segments = []; cutFillers = false; drawPlan(); });
+    const fillersBox = planBox.querySelector("[data-vd-fillers]");
+    if (fillersBox) {
+      fillersBox.addEventListener("change", (e) => {
+        cutFillers = e.target.checked;
+        // Same one-shot "apply a suggestion" pattern as "Cut silences" above: checking
+        // this replaces plan.segments with the combined silence+filler keep-segments
+        // (which reduces to filler-only cuts when no silences were detected).
+        if (cutFillers && analysis?.filler_keep_segments?.length) {
+          plan.segments = analysis.filler_keep_segments.map(s => ({ start: s.start, end: s.end }));
+        }
+        drawPlan();
+      });
+    }
+    // These edit `plan` in place without a full drawPlan() rebuild, so refresh the preview
+    // directly (filter/aspect are visible in the player; mute/caption-style feed it too).
+    planBox.querySelector("[data-vd-filter]").addEventListener("change", (e) => { plan.filter = e.target.value; refreshPreview(); });
+    planBox.querySelector("[data-vd-aspect]").addEventListener("change", (e) => { plan.aspect = e.target.value; refreshPreview(); });
+    planBox.querySelector("[data-vd-speed]").addEventListener("change", (e) => { plan.speed = parseFloat(e.target.value) || 1; drawPlan(); });
+    planBox.querySelector("[data-vd-mute]").addEventListener("change", (e) => { plan.mute = e.target.checked; refreshPreview(); });
+    planBox.querySelector("[data-vd-captions]").addEventListener("change", (e) => { plan.captions = e.target.checked; drawPlan(); });
+    planBox.querySelector("[data-vd-capstyle]").addEventListener("change", (e) => { plan.captionStyle = e.target.value; refreshPreview(); });
+    planBox.querySelector("[data-vd-normalize]").addEventListener("change", (e) => { plan.normalizeAudio = e.target.checked; scheduleAutosave(); });
+    planBox.querySelector("[data-vd-denoise]").addEventListener("change", (e) => { plan.denoise = e.target.checked; scheduleAutosave(); });
+    planBox.querySelector("[data-vd-fade]").addEventListener("change", (e) => {
+      const v = parseFloat(e.target.value);
+      plan.fade = isNaN(v) ? null : Math.min(5, Math.max(0.1, v));
+      scheduleAutosave();
+    });
+    planBox.querySelector("[data-vd-exportsrt]").addEventListener("click", exportSrt);
+    planBox.querySelector("[data-vd-addtext]").addEventListener("click", () => {
+      const text = planBox.querySelector("[data-vd-newtext]").value.trim();
+      const start = parseFloat(planBox.querySelector("[data-vd-newstart]").value);
+      const end = parseFloat(planBox.querySelector("[data-vd-newend]").value);
+      if (!text || isNaN(start) || isNaN(end) || end <= start) {
+        statusEl.textContent = "Text overlays need text plus valid start/end seconds.";
+        return;
+      }
+      plan.texts.push({ text, start, end, position: planBox.querySelector("[data-vd-newpos]").value });
+      drawPlan();
+    });
+
+    // Every plan mutation funnels through drawPlan(), so refreshing the preview here means one
+    // code path keeps the player/timeline/transcript in lockstep with the plan.
+    refreshPreview();
+  }
+  drawPlan();
+
+  // Snake-case plan payload shared by Render and Export (EditPlan uses snake_case fields).
+  function planPayload() {
+    return {
+      segments: plan.segments,
+      filter: plan.filter === "none" ? null : plan.filter,
+      texts: plan.texts,
+      aspect: plan.aspect || null,
+      speed: plan.speed === 1 ? null : plan.speed,
+      mute: plan.mute,
+      captions: plan.captions,
+      caption_style: plan.captions ? plan.captionStyle : null,
+      normalize_audio: plan.normalizeAudio,
+      denoise: plan.denoise,
+      fade: plan.fade || null,
+      output_name: plan.output_name || null,
+    };
+  }
+
+  async function exportSrt() {
+    if (!srcPath) return;
+    statusEl.textContent = "Exporting SRT…";
+    try {
+      const out = await invoke("video_export_subtitles", {
+        req: {
+          path: srcPath,
+          transcript: analysis?.transcript || null,
+          format: "srt",
+          plan: planPayload(),
+        },
+      });
+      statusEl.textContent = `Saved ${out.split("/").pop()} to Content ✓`;
+    } catch (e) {
+      logError("video_export_subtitles", e);
+      statusEl.textContent = String(e);
+    }
+  }
+
+  renderBtn.addEventListener("click", async () => {
+    if (!srcPath) return;
+    currentJobId = `studio-${id}-${Date.now()}`;
+    renderBtn.disabled = true;
+    cancelBtn.style.display = "";
+    progWrap.style.display = "";
+    progBar.style.width = "1%";
+    statusEl.textContent = "Rendering…";
+    outEl.innerHTML = "";
+    try {
+      const req = {
+        path: srcPath,
+        jobId: currentJobId,
+        plan: planPayload(),
+        transcript: analysis?.transcript || null,
+      };
+      const outPath = await invoke("video_render", { req });
+      statusEl.textContent = "Saved to Content ✓";
+      progBar.style.width = "100%";
+      outEl.innerHTML = `<video controls src="${convertFileSrc(outPath)}" class="studio-video-preview"></video>`;
+      // Save the plan that just rendered immediately, ahead of the debounced autosave.
+      clearTimeout(saveTimer);
+      invoke("video_save_plan", { req: { path: srcPath, plan: req.plan } }).catch(() => {});
+    } catch (e) {
+      logError("video_render", e);
+      statusEl.textContent = String(e);
+    } finally {
+      renderBtn.disabled = false;
+      cancelBtn.style.display = "none";
+      setTimeout(() => { progWrap.style.display = "none"; }, 1500);
+    }
+  });
+
+  cancelBtn.addEventListener("click", async () => {
+    if (!currentJobId) return;
+    try { await invoke("video_cancel_render", { jobId: currentJobId }); } catch {}
+    statusEl.textContent = "Cancelled.";
   });
 }
 

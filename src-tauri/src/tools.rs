@@ -2040,6 +2040,9 @@ pub(crate) async fn execute_agent_tool(
         "search" | "brave" | "brave_search" => "web_search",
         "fetch" | "curl" | "wget" => "web_fetch",
         "imagine" | "image" | "draw" => "generate_image",
+        "video_info" => "probe_video",
+        "transcribe_video" => "analyze_video",
+        "cut_video" | "trim_video" | "render_video" => "edit_video",
         "places" | "find_places" => "search_places",
         "nearby" | "around_me" => "search_nearby",
         "directions" | "route" | "navigate" => "get_directions",
@@ -2377,6 +2380,124 @@ pub(crate) async fn execute_agent_tool(
                 .ok_or_else(|| "missing prompt".to_string())?;
             let style = arguments.get("style").and_then(Value::as_str);
             generate_image_impl(app, state, session_id, prompt, style).await
+        }
+        "probe_video" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing path".to_string())?;
+            let resolved =
+                resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)?;
+            let probe = crate::video::probe_video(&resolved)?;
+            serde_json::to_string_pretty(&probe).map_err(|e| e.to_string())
+        }
+        "analyze_video" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing path".to_string())?;
+            let transcribe = arguments.get("transcribe").and_then(Value::as_bool).unwrap_or(true);
+            let resolved =
+                resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)?;
+            let probe = crate::video::probe_video(&resolved)?;
+            let silences = crate::video::detect_silences(&resolved, -35.0, 0.6)?;
+            let suggested = crate::video::keep_segments(probe.duration_s, &silences, 0.15);
+
+            let mut out = format!(
+                "Video: {:.1}s, {}x{}, {:.0} fps, audio: {}\n",
+                probe.duration_s, probe.width, probe.height, probe.fps,
+                if probe.has_audio { "yes" } else { "no" }
+            );
+            if silences.is_empty() {
+                out.push_str("No silences detected (≥0.6s below -35dB).\n");
+            } else {
+                out.push_str("Silences (source seconds):\n");
+                for s in silences.iter().take(100) {
+                    out.push_str(&format!("  {:.2}–{:.2}\n", s.start, s.end));
+                }
+                out.push_str("Suggested keep-segments (silences removed, padded 0.15s):\n");
+                for s in &suggested {
+                    out.push_str(&format!("  {:.2}–{:.2}\n", s.start, s.end));
+                }
+            }
+            if transcribe && probe.has_audio {
+                match crate::video::transcribe_video(state, &resolved).await {
+                    Ok(t) => {
+                        let filler_ranges = crate::video::detect_filler_words(&t);
+                        if filler_ranges.is_empty() {
+                            out.push_str("No filler words/stutters detected.\n");
+                        } else {
+                            out.push_str(&format!(
+                                "Filler words/stutters detected ({} found, source seconds):\n",
+                                filler_ranges.len()
+                            ));
+                            for f in filler_ranges.iter().take(100) {
+                                out.push_str(&format!("  {:.2}–{:.2}\n", f.start, f.end));
+                            }
+                            let combined =
+                                crate::video::combined_keep_segments(probe.duration_s, &silences, &filler_ranges, 0.15);
+                            out.push_str("Suggested keep-segments (silences + fillers removed, padded 0.15s):\n");
+                            for s in &combined {
+                                out.push_str(&format!("  {:.2}–{:.2}\n", s.start, s.end));
+                            }
+                        }
+                        out.push_str("Transcript (source seconds):\n");
+                        let mut budget = 0usize;
+                        for seg in &t.segments {
+                            let line = format!("  [{:.1}–{:.1}] {}\n", seg.start, seg.end, seg.text);
+                            budget += line.len();
+                            if budget > 30_000 {
+                                out.push_str("  … (transcript truncated)\n");
+                                break;
+                            }
+                            out.push_str(&line);
+                        }
+                    }
+                    Err(e) => out.push_str(&format!("Transcript unavailable: {e}\n")),
+                }
+            }
+            Ok(out)
+        }
+        "edit_video" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing path".to_string())?;
+            let resolved =
+                resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)?;
+            // The plan fields live flat in the tool arguments; serde ignores `path`.
+            let plan: crate::video::EditPlan = serde_json::from_value(arguments.clone())
+                .map_err(|e| format!("invalid edit plan: {e}"))?;
+            // Burned captions need a transcript — transcribe on-demand before rendering.
+            let transcript = if plan.captions {
+                Some(crate::video::transcribe_video(state, &resolved).await.map_err(|e| {
+                    format!("captions were requested but transcription failed: {e}")
+                })?)
+            } else {
+                None
+            };
+            let prefer_hw_encode = crate::video::hw_encode_preferred(state);
+            let out_dir = content_dir(app)?;
+            let job_id = format!("agent-{session_id}");
+            let app_clone = app.clone();
+            let out = tauri::async_runtime::spawn_blocking(move || {
+                crate::video::render_edit(
+                    &app_clone,
+                    &job_id,
+                    &resolved,
+                    &plan,
+                    transcript.as_ref(),
+                    &out_dir,
+                    prefer_hw_encode,
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            let _ = app.emit("content-changed", ());
+            Ok(format!(
+                "Rendered edit saved to {} (visible in the Content library).",
+                out.display()
+            ))
         }
         "search_places" => {
             let query = arguments
