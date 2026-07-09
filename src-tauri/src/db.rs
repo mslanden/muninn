@@ -466,6 +466,12 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             "image",
         ),
         (
+            "generate_shorts",
+            "Generate Shorts",
+            "Auto-clip a long recording into captioned 9:16 vertical shorts (great for scheduled runs).",
+            "image",
+        ),
+        (
             "search_places",
             "Search Places",
             "Find places, businesses, and points of interest.",

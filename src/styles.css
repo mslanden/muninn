@@ -1773,6 +1773,29 @@ body.sidebar-collapsed .sidebar-panel-wrap {
   margin-top: 6px;
 }
 
+/* Auto-shorts results: one card per generated clip. */
+.studio-shorts-out {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.studio-short-item {
+  display: flex;
+  flex-direction: column;
+  max-width: 220px;
+}
+
+.studio-short-item .studio-video-preview {
+  max-height: 320px;
+  margin-top: 4px;
+}
+
+.studio-short-meta strong {
+  font-size: 12px;
+}
+
 /* ===== Instant edit preview (videopreview.js): player + timeline + transcript ===== */
 .vp-root {
   position: relative;

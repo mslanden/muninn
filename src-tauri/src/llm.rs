@@ -1524,6 +1524,148 @@ pub(crate) async fn generate_video_edit_plan(
     Ok(plan)
 }
 
+/// Parse the model's shorts response into raw specs, tolerating a bare array, a `{"shorts": [...]}`
+/// wrapper (or `specs`/`clips`/`highlights`), or a single bare spec object.
+fn parse_shorts_specs(text: &str) -> Result<Vec<crate::video::ShortSpec>, String> {
+    if let Some(obj) = extract_json_object(text) {
+        for key in ["shorts", "specs", "clips", "highlights"] {
+            if let Some(arr) = obj.get(key).and_then(Value::as_array) {
+                return serde_json::from_value(Value::Array(arr.clone()))
+                    .map_err(|e| format!("shorts had the wrong shape: {e}"));
+            }
+        }
+        // A single unwrapped spec object is also acceptable.
+        if obj.get("segments").is_some() {
+            let spec: crate::video::ShortSpec =
+                serde_json::from_value(obj).map_err(|e| format!("short had the wrong shape: {e}"))?;
+            return Ok(vec![spec]);
+        }
+    }
+    if let Some(arr) = extract_json_array(text) {
+        return serde_json::from_value(Value::Array(arr))
+            .map_err(|e| format!("shorts had the wrong shape: {e}"));
+    }
+    Err(format!("could not parse shorts JSON. Model said:\n{}", text.trim()))
+}
+
+/// Pick the best `count` highlight moments from a (possibly long) transcript for auto-shorts.
+///
+/// Feeds the LLM the SEGMENT-level transcript with timestamps (word-level timings are far too
+/// many tokens for a 40-minute video; precise trims happen later at render), the video duration,
+/// the target clip count + per-clip duration, and an optional user `brief`. Instructs the model
+/// to pick self-contained moments with a strong hook up front, snapping boundaries to transcript
+/// segments and never starting mid-sentence. Validates hard via `sanitize_short_specs` and
+/// re-prompts once with the validation error before giving up.
+pub(crate) async fn generate_shorts_specs(
+    state: &AppState,
+    transcript: &crate::video::Transcript,
+    probe: &crate::video::VideoProbe,
+    count: usize,
+    duration_hint_s: Option<f64>,
+    brief: Option<&str>,
+) -> Result<Vec<crate::video::ShortSpec>, String> {
+    let count = count.clamp(1, 8);
+    let target_s = duration_hint_s
+        .unwrap_or(crate::video::DEFAULT_SHORT_TARGET_S)
+        .clamp(10.0, 180.0);
+    if transcript.segments.is_empty() {
+        return Err("no transcript segments to pick shorts from".to_string());
+    }
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+
+    // Segment-level transcript with timestamps, budgeted so a long video still fits the context.
+    let mut tr = String::new();
+    let mut budget = 0usize;
+    for seg in &transcript.segments {
+        let line = format!("[{:.1}-{:.1}] {}\n", seg.start, seg.end, seg.text.trim());
+        budget += line.len();
+        if budget > 40_000 {
+            tr.push_str("… (transcript truncated — pick from what's shown above)\n");
+            break;
+        }
+        tr.push_str(&line);
+    }
+
+    let brief_line = match brief.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => format!("\nUser brief (prioritize this): {b}\n"),
+        None => String::new(),
+    };
+
+    let base_prompt = format!(
+        "You are an expert short-form video editor. From the transcript of a {dur:.0}s video, pick the \
+        {count} BEST self-contained moments to cut into vertical short clips (~{target:.0}s each).\n\n\
+        Transcript (segment start–end in source seconds):\n{tr}{brief}\n\
+        Rules for every pick:\n\
+        - Self-contained: it must stand on its own, with a strong HOOK in the first ~3 seconds and a clear payoff.\n\
+        - Never start or end mid-sentence. Snap every start/end to the transcript segment boundaries shown above.\n\
+        - Total kept duration per clip ≈ {target:.0}s (must be between {tmin:.0}s and {tmax:.0}s).\n\
+        - A clip may stitch a few in-order, NON-overlapping segments if that makes a tighter moment.\n\
+        - All timestamps are SOURCE seconds within [0, {dur:.0}]. Segment boundaries are precise enough — finer trims happen later.\n\n\
+        Return ONLY a JSON object of this shape:\n\
+        {{\"shorts\": [ {{\"title\": \"≤60 char title\", \"hook\": \"the opening line you're banking on\", \"rationale\": \"why this moment works as a short\", \"segments\": [{{\"start\": 12.0, \"end\": 55.0}}] }} ]}}\n\
+        Order the array best-first. No markdown, no code fences, no commentary — the JSON object only.",
+        dur = probe.duration_s,
+        count = count,
+        target = target_s,
+        tr = tr,
+        brief = brief_line,
+        tmin = 0.5 * target_s,
+        tmax = 2.0 * target_s,
+    );
+    let system = "You are a precise short-form video editor. You reason about timestamps carefully and output strict JSON only.";
+
+    let mut attempt_prompt = base_prompt.clone();
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        let request_body = if is_anthropic {
+            json!({"model": model, "max_tokens": 4000, "stream": false, "system": system,
+                   "messages": [{"role": "user", "content": attempt_prompt}]})
+        } else {
+            json!({"model": model, "max_tokens": 4000, "stream": false,
+                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": attempt_prompt}]})
+        };
+        let resp = if is_anthropic {
+            state.http.post(&endpoint)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&request_body)
+                .send().await.map_err(|e| e.to_string())?
+        } else {
+            state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Shorts planning failed ({status}): {body}"));
+        }
+        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+        let text = if is_anthropic {
+            body.get("content").and_then(Value::as_array)
+                .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+                .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
+        } else {
+            body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
+                .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
+        }
+        .unwrap_or_default();
+
+        match parse_shorts_specs(&text)
+            .and_then(|specs| crate::video::sanitize_short_specs(specs, probe, count, target_s))
+        {
+            Ok(specs) => return Ok(specs),
+            Err(e) => {
+                last_err = e;
+                if attempt == 0 {
+                    attempt_prompt = format!(
+                        "{base_prompt}\n\nYour previous answer was rejected: {last_err}\nReturn corrected JSON only."
+                    );
+                }
+            }
+        }
+    }
+    Err(format!("Could not get a usable set of shorts from the model: {last_err}"))
+}
+
 /// Backfill embeddings for entities that don't have one yet.
 /// Called once on startup to handle entities created before embeddings were added.
 pub(crate) async fn backfill_embeddings(state: &AppState) {
@@ -2311,6 +2453,22 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "denoise": {"type": "boolean", "description": "Reduce background hiss/hum/fan noise from the recording. Use for noisy audio or a bad-sounding mic."},
                     "fade": {"type": "number", "description": "Overall fade-in/fade-out duration in seconds (0.1-5.0), applied to both video and audio at the clip's start and end."},
                     "output_name": {"type": "string", "description": "Short kebab-case stem for the output file"}
+                },
+                "required": ["path"]
+            }),
+        ));
+    }
+    if enabled.contains("generate_shorts") {
+        defs.push((
+            "generate_shorts",
+            "Auto-clip a long video into short vertical clips: transcribes it, uses AI to pick the best self-contained highlight moments (strong hook + payoff), and renders each as a captioned 9:16 short (smart-reframed to keep faces in frame, loudness-normalized) into the Content library. Ideal for scheduled/background tasks that auto-clip new recordings into ready-to-post Reels/Shorts/TikToks — it never prompts, so it works in unattended runs. Returns the titles and output paths.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Video file path within the workspace"},
+                    "count": {"type": "integer", "description": "How many shorts to produce (default 3, max 8)"},
+                    "duration_s": {"type": "number", "description": "Target seconds per clip (default ~45; typically 30–60)"},
+                    "brief": {"type": "string", "description": "Optional focus, e.g. 'focus on the pricing discussion' or 'pick the funniest moments'"}
                 },
                 "required": ["path"]
             }),

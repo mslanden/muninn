@@ -2514,6 +2514,41 @@ pub(crate) async fn execute_agent_tool(
                 out.display()
             ))
         }
+        "generate_shorts" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing path".to_string())?;
+            // SAFETY BOUNDARY: agent-supplied path must be resolved through the workspace scope.
+            let resolved =
+                resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)?;
+            let count = arguments.get("count").and_then(Value::as_u64).unwrap_or(3) as u32;
+            let duration_hint_s = arguments.get("duration_s").and_then(Value::as_f64);
+            let brief = arguments.get("brief").and_then(Value::as_str);
+            // Background/scheduled runs must work: this pipeline never calls ask_user — it only
+            // transcribes + renders, so it's safe unattended. Job id is namespaced per session.
+            let job_id = format!("agent-shorts-{session_id}");
+            let results = crate::video::run_shorts_pipeline(
+                app,
+                state,
+                &resolved,
+                count,
+                duration_hint_s,
+                brief,
+                &job_id,
+                true,  // captions on by default for social clips
+                false, // keep the polish pass
+            )
+            .await?;
+            if results.is_empty() {
+                return Ok("No shorts were produced (the video may have no clear highlight moments).".to_string());
+            }
+            let mut out = format!("Generated {} short{}:\n", results.len(), if results.len() == 1 { "" } else { "s" });
+            for r in &results {
+                out.push_str(&format!("- \"{}\" ({:.0}s) → {}\n", r.title, r.duration_s, r.path));
+            }
+            Ok(out.trim_end().to_string())
+        }
         "search_places" => {
             let query = arguments
                 .get("query")

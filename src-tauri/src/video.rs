@@ -1559,7 +1559,50 @@ pub(crate) fn cancel_render(job_id: &str) -> bool {
     }
 }
 
-fn sanitize_stem(name: &str) -> String {
+/// Kill every registered render whose `job_id` starts with `prefix` (SIGKILL). Used to cancel
+/// the active per-short sub-render of a shorts job, whose ids are `{job}-1..n`. Returns whether
+/// any process was killed.
+fn cancel_render_prefix(prefix: &str) -> bool {
+    let pids: Vec<u32> = renders()
+        .lock()
+        .ok()
+        .map(|m| m.iter().filter(|(k, _)| k.starts_with(prefix)).map(|(_, v)| *v).collect())
+        .unwrap_or_default();
+    let killed = !pids.is_empty();
+    for pid in pids {
+        let _ = Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
+    }
+    killed
+}
+
+/// Parent-job-id set flagged for cancellation by `request_cancel_shorts`. The shorts loop
+/// checks `is_shorts_cancelled` between shorts (mirrors `AppState.stop_requests` for chat).
+fn shorts_cancels() -> &'static Mutex<std::collections::HashSet<String>> {
+    static CANCELS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    CANCELS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Flag a shorts job for cancellation AND kill its currently-rendering sub-render, so a cancel
+/// mid-render stops immediately rather than only at the next between-shorts boundary. Returns
+/// whether an active sub-render was killed.
+pub(crate) fn request_cancel_shorts(job_id: &str) -> bool {
+    if let Ok(mut s) = shorts_cancels().lock() {
+        s.insert(job_id.to_string());
+    }
+    cancel_render_prefix(&format!("{job_id}-"))
+}
+
+fn is_shorts_cancelled(job_id: &str) -> bool {
+    shorts_cancels().lock().map(|s| s.contains(job_id)).unwrap_or(false)
+}
+
+fn clear_shorts_cancel(job_id: &str) {
+    if let Ok(mut s) = shorts_cancels().lock() {
+        s.remove(job_id);
+    }
+}
+
+pub(crate) fn sanitize_stem(name: &str) -> String {
     let mut s: String = name
         .trim()
         .chars()
@@ -1776,6 +1819,246 @@ pub(crate) fn render_edit(
         seconds: total_s,
     });
     Ok(out_path)
+}
+
+// ---------- auto-shorts (highlight → vertical clip pipeline) ----------
+
+/// Default target duration (seconds) for one generated short when the caller gives no
+/// `duration_hint_s`. Sits in the sweet spot for a Reels/Shorts/TikTok clip.
+pub(crate) const DEFAULT_SHORT_TARGET_S: f64 = 45.0;
+
+/// One LLM-picked highlight: a self-contained moment to cut into a vertical short. `segments`
+/// are SOURCE-timeline keep-ranges (MAIN video only — never inserts). `hook` is the opening
+/// line the clip banks on; `rationale` is the model's reasoning (surfaced for transparency).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct ShortSpec {
+    pub title: String,
+    pub segments: Vec<Segment>,
+    pub hook: String,
+    pub rationale: String,
+}
+
+/// One rendered short returned to the caller.
+#[derive(Serialize, Clone, Debug)]
+pub struct ShortResult {
+    pub title: String,
+    pub hook: String,
+    pub path: String,
+    pub duration_s: f64,
+}
+
+/// Pipeline stage event so the UI can show which phase a shorts job is in.
+#[derive(Serialize, Clone)]
+struct ShortsProgress {
+    job_id: String,
+    current: usize,
+    total: usize,
+    title: String,
+    /// "transcribing" | "planning" | "rendering" | "done".
+    stage: String,
+}
+
+/// Validate + normalize LLM-produced shorts specs against the probed source, returning the
+/// best `count` usable specs. Pure so it's unit-testable without an LLM. Rules:
+/// - the model must return 1..=`count`*2 specs (fewer than 1 or a wild overflow ⇒ error);
+/// - each spec's MAIN-source segments are clamped into `[0, duration]`, sorted, and must be
+///   non-empty and non-overlapping (a spec that overlaps itself or clamps to nothing is dropped);
+/// - each spec's total kept duration must land within 0.5×–2× of `target_s` (else dropped);
+/// - titles are trimmed to ≤60 chars; any `source` (insert) on a segment is stripped — shorts
+///   are cut from the main video only.
+/// After filtering, the first `count` survivors are returned (the model is told to order best-first).
+pub(crate) fn sanitize_short_specs(
+    specs: Vec<ShortSpec>,
+    probe: &VideoProbe,
+    count: usize,
+    target_s: f64,
+) -> Result<Vec<ShortSpec>, String> {
+    let count = count.max(1);
+    if specs.is_empty() {
+        return Err("the model returned no shorts".to_string());
+    }
+    if specs.len() > count * 2 {
+        return Err(format!(
+            "the model returned {} shorts (expected at most {})",
+            specs.len(),
+            count * 2
+        ));
+    }
+    let dur = probe.duration_s.max(0.0);
+    let min_total = 0.5 * target_s;
+    let max_total = 2.0 * target_s;
+
+    let mut valid: Vec<ShortSpec> = Vec::new();
+    for mut spec in specs {
+        // Clamp segments into the source, main-source only, dropping empties.
+        let mut segs: Vec<Segment> = spec
+            .segments
+            .iter()
+            .map(|s| {
+                let start = s.start.max(0.0);
+                let end = s.end.min(dur);
+                Segment::keep(start, end)
+            })
+            .filter(|s| s.end - s.start >= 0.5)
+            .collect();
+        if segs.is_empty() {
+            continue;
+        }
+        segs.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+        // Reject a spec whose segments overlap each other (playback would double-cover time).
+        let overlaps = segs.windows(2).any(|w| w[1].start < w[0].end - 1e-6);
+        if overlaps {
+            continue;
+        }
+        let total: f64 = segs.iter().map(|s| s.end - s.start).sum();
+        if total < min_total || total > max_total {
+            continue;
+        }
+        spec.segments = segs;
+        spec.title = {
+            let t: String = spec.title.trim().chars().take(60).collect();
+            if t.is_empty() { "Untitled clip".to_string() } else { t }
+        };
+        valid.push(spec);
+        if valid.len() >= count {
+            break;
+        }
+    }
+    if valid.is_empty() {
+        return Err(format!(
+            "no usable shorts after validation (need clips of ~{:.0}s within {:.0}–{:.0}s, non-overlapping, inside the video)",
+            target_s, min_total, max_total
+        ));
+    }
+    Ok(valid)
+}
+
+/// The full auto-shorts pipeline: transcribe → LLM highlight picking → sequential vertical
+/// renders into the Content library. Shared by the Studio command (`video_generate_shorts`)
+/// and the `generate_shorts` agent tool so both behave identically.
+///
+/// Emits `shorts-progress` events (`{job_id, current, total, title, stage}`) at each phase, and
+/// per-short `video-render-progress` events keyed `{job_id}-{n}` (so the existing render bar
+/// works). Renders run ONE AT A TIME to avoid saturating ffmpeg/VideoToolbox. Cancellation is
+/// cooperative: `request_cancel_shorts(job_id)` both flags the job (checked between shorts) and
+/// SIGKILLs the active sub-render. A cancel mid-run returns whatever shorts already finished.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_shorts_pipeline(
+    app: &AppHandle,
+    state: &AppState,
+    src: &Path,
+    count: u32,
+    duration_hint_s: Option<f64>,
+    brief: Option<&str>,
+    job_id: &str,
+    captions: bool,
+    skip_polish: bool,
+) -> Result<Vec<ShortResult>, String> {
+    clear_shorts_cancel(job_id); // clear any stale flag from a previous job reusing this id
+    let count = count.clamp(1, 8) as usize;
+
+    let src_owned = src.to_path_buf();
+    let probe = tauri::async_runtime::spawn_blocking(move || probe_video(&src_owned))
+        .await
+        .map_err(|e| e.to_string())??;
+    if !probe.has_audio {
+        return Err("this video has no audio track — auto-shorts needs speech to find highlights".to_string());
+    }
+
+    let emit_stage = |current: usize, total: usize, title: &str, stage: &str| {
+        let _ = app.emit(
+            "shorts-progress",
+            ShortsProgress {
+                job_id: job_id.to_string(),
+                current,
+                total,
+                title: title.to_string(),
+                stage: stage.to_string(),
+            },
+        );
+    };
+
+    emit_stage(0, count, "", "transcribing");
+    let transcript = transcribe_video(state, src).await?;
+    if transcript.segments.is_empty() {
+        return Err("transcription produced no speech segments to build shorts from".to_string());
+    }
+    if is_shorts_cancelled(job_id) {
+        clear_shorts_cancel(job_id);
+        emit_stage(0, count, "", "done");
+        return Ok(Vec::new());
+    }
+
+    emit_stage(0, count, "", "planning");
+    let specs =
+        crate::llm::generate_shorts_specs(state, &transcript, &probe, count, duration_hint_s, brief).await?;
+
+    let prefer_hw = hw_encode_preferred(state);
+    let out_dir = crate::tools::content_dir(app)?;
+    let total = specs.len();
+    let mut results: Vec<ShortResult> = Vec::new();
+    let mut last_err: Option<String> = None;
+
+    for (i, spec) in specs.iter().enumerate() {
+        if is_shorts_cancelled(job_id) {
+            break;
+        }
+        emit_stage(i + 1, total, &spec.title, "rendering");
+        let sub_job = format!("{job_id}-{}", i + 1);
+        let plan = EditPlan {
+            segments: spec.segments.clone(),
+            aspect: Some("9:16".to_string()),
+            smart_reframe: true,
+            captions,
+            caption_style: if captions { Some("karaoke".to_string()) } else { None },
+            normalize_audio: !skip_polish,
+            fade: if skip_polish { None } else { Some(0.3) },
+            output_name: Some(sanitize_stem(&spec.title)),
+            ..Default::default()
+        };
+        let dur: f64 = spec.segments.iter().map(|s| (s.end - s.start).max(0.0)).sum();
+
+        let app_c = app.clone();
+        let transcript_c = transcript.clone();
+        let out_dir_c = out_dir.clone();
+        let src_c = src.to_path_buf();
+        let render = tauri::async_runtime::spawn_blocking(move || {
+            render_edit(&app_c, &sub_job, &src_c, &plan, Some(&transcript_c), &out_dir_c, prefer_hw)
+        })
+        .await
+        .map_err(|e| e.to_string());
+
+        match render {
+            Ok(Ok(path)) => results.push(ShortResult {
+                title: spec.title.clone(),
+                hook: spec.hook.clone(),
+                path: path.to_string_lossy().to_string(),
+                duration_s: dur,
+            }),
+            Ok(Err(e)) | Err(e) => {
+                // A cancel SIGKILLs the sub-render, which surfaces as a render error — swallow it
+                // and stop the loop rather than reporting a spurious failure.
+                if is_shorts_cancelled(job_id) {
+                    break;
+                }
+                eprintln!("[shorts] render of '{}' failed: {e}", spec.title);
+                last_err = Some(e);
+            }
+        }
+    }
+
+    clear_shorts_cancel(job_id);
+    emit_stage(results.len(), total, "", "done");
+    let _ = app.emit("content-changed", ());
+
+    if results.is_empty() {
+        if let Some(e) = last_err {
+            return Err(format!("no shorts rendered; last error: {e}"));
+        }
+        // No error and no results ⇒ cancelled before any short finished.
+    }
+    Ok(results)
 }
 
 // ---------- thumbnails ----------
@@ -3274,5 +3557,130 @@ mod tests {
         assert!((ratio - 9.0 / 16.0).abs() < 0.02, "expected ~9:16, got {}x{}", out_probe.width, out_probe.height);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- auto-shorts: spec validation, slug naming, cancel flag -----
+
+    fn spec(title: &str, ranges: &[(f64, f64)]) -> ShortSpec {
+        ShortSpec {
+            title: title.into(),
+            segments: ranges.iter().map(|&(s, e)| Segment::keep(s, e)).collect(),
+            hook: "hook".into(),
+            rationale: "why".into(),
+        }
+    }
+
+    /// 600s source so target=45 (window 22.5–90s) is comfortably inside.
+    fn probe_long() -> VideoProbe {
+        VideoProbe { duration_s: 600.0, ..probe_16x9() }
+    }
+
+    #[test]
+    fn sanitize_shorts_selects_best_count_in_order() {
+        let probe = probe_long();
+        let specs = vec![
+            spec("a", &[(0.0, 45.0)]),
+            spec("b", &[(60.0, 105.0)]),
+            spec("c", &[(120.0, 165.0)]),
+            spec("d", &[(200.0, 245.0)]),
+        ];
+        let out = sanitize_short_specs(specs, &probe, 2, 45.0).unwrap();
+        assert_eq!(out.len(), 2, "take best `count`");
+        assert_eq!(out[0].title, "a");
+        assert_eq!(out[1].title, "b");
+    }
+
+    #[test]
+    fn sanitize_shorts_rejects_too_many_specs() {
+        let probe = probe_long();
+        // count=1 ⇒ at most 2 specs allowed; 3 is garbage.
+        let specs = vec![spec("a", &[(0.0, 45.0)]), spec("b", &[(60.0, 105.0)]), spec("c", &[(120.0, 165.0)])];
+        assert!(sanitize_short_specs(specs, &probe, 1, 45.0).is_err());
+    }
+
+    #[test]
+    fn sanitize_shorts_errors_on_empty() {
+        assert!(sanitize_short_specs(vec![], &probe_long(), 3, 45.0).is_err());
+    }
+
+    #[test]
+    fn sanitize_shorts_clamps_segments_to_source() {
+        let probe = probe_long();
+        // start below 0 and end past the 600s source are clamped in.
+        let out = sanitize_short_specs(vec![spec("x", &[(-10.0, 45.0)])], &probe, 3, 45.0).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!((out[0].segments[0].start - 0.0).abs() < 1e-9);
+        assert!((out[0].segments[0].end - 45.0).abs() < 1e-9);
+
+        let clamped_end = sanitize_short_specs(vec![spec("x", &[(560.0, 999.0)])], &probe, 3, 45.0).unwrap();
+        assert!((clamped_end[0].segments[0].end - 600.0).abs() < 1e-9, "end clamps to source duration");
+    }
+
+    #[test]
+    fn sanitize_shorts_drops_out_of_range_durations() {
+        let probe = probe_long();
+        // target 45 → allowed 22.5–90s. 10s is too short, 120s too long; both dropped.
+        let specs = vec![spec("short", &[(0.0, 10.0)]), spec("long", &[(0.0, 120.0)]), spec("ok", &[(0.0, 45.0)])];
+        let out = sanitize_short_specs(specs, &probe, 3, 45.0).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "ok");
+    }
+
+    #[test]
+    fn sanitize_shorts_rejects_overlapping_segments_within_a_spec() {
+        let probe = probe_long();
+        // Two overlapping ranges (10–40 and 30–60) in one spec ⇒ that spec is dropped.
+        let bad = spec("overlap", &[(10.0, 40.0), (30.0, 60.0)]);
+        let good = spec("stitched", &[(0.0, 20.0), (100.0, 130.0)]); // total 50s, non-overlapping
+        let out = sanitize_short_specs(vec![bad, good], &probe, 3, 45.0).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "stitched");
+        // Multi-segment kept and sorted.
+        assert_eq!(out[0].segments.len(), 2);
+        assert!(out[0].segments[0].start <= out[0].segments[1].start);
+    }
+
+    #[test]
+    fn sanitize_shorts_sorts_segments_and_strips_insert_source() {
+        let probe = probe_long();
+        // Out-of-order, and one segment carries an insert `source` that must be stripped (shorts
+        // are cut from the main video only).
+        let mut s = spec("s", &[(100.0, 130.0), (0.0, 20.0)]);
+        s.segments[0].source = Some("/tmp/broll.mp4".into());
+        let out = sanitize_short_specs(vec![s], &probe, 3, 45.0).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!((out[0].segments[0].start - 0.0).abs() < 1e-9, "sorted ascending");
+        assert!(out[0].segments.iter().all(|seg| seg.source.is_none()), "insert sources stripped");
+    }
+
+    #[test]
+    fn sanitize_shorts_truncates_title_to_60_chars() {
+        let probe = probe_long();
+        let long_title = "z".repeat(200);
+        let out = sanitize_short_specs(vec![spec(&long_title, &[(0.0, 45.0)])], &probe, 3, 45.0).unwrap();
+        assert_eq!(out[0].title.chars().count(), 60);
+
+        let blank = sanitize_short_specs(vec![spec("   ", &[(0.0, 45.0)])], &probe, 3, 45.0).unwrap();
+        assert_eq!(blank[0].title, "Untitled clip");
+    }
+
+    #[test]
+    fn sanitize_stem_slugifies_titles_for_output_names() {
+        assert_eq!(sanitize_stem("The Pricing Discussion!"), "The-Pricing-Discussion");
+        assert_eq!(sanitize_stem("  spaces  &&  symbols  "), "spaces-symbols");
+        assert_eq!(sanitize_stem("already-kebab_case"), "already-kebab_case");
+        assert_eq!(sanitize_stem("!!!"), "edit"); // nothing usable → fallback stem
+    }
+
+    #[test]
+    fn shorts_cancel_flag_roundtrips() {
+        let job = "test-shorts-cancel-job";
+        clear_shorts_cancel(job);
+        assert!(!is_shorts_cancelled(job));
+        // request_cancel_shorts sets the flag (and would kill any active sub-render — none here).
+        request_cancel_shorts(job);
+        assert!(is_shorts_cancelled(job));
+        clear_shorts_cancel(job);
+        assert!(!is_shorts_cancelled(job), "flag cleared for reuse");
     }
 }

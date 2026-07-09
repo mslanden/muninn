@@ -243,6 +243,54 @@ pub fn video_cancel_render(job_id: String) -> bool {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct VideoShortsRequest {
+    pub path: String,
+    /// How many shorts to produce (default 3, max 8).
+    pub count: Option<u32>,
+    /// Target seconds per clip (default ~45; overrides the 30–60s default range).
+    pub duration_hint_s: Option<f64>,
+    /// Optional focus, e.g. "focus on the pricing discussion".
+    pub brief: Option<String>,
+    /// Correlates `shorts-progress` (and per-short `video-render-progress`) events + cancellation.
+    pub job_id: String,
+    /// Burn karaoke captions into each short (default true).
+    pub captions: Option<bool>,
+    /// Skip the normalize-audio + fade polish pass.
+    pub skip_polish: Option<bool>,
+}
+
+/// Auto-shorts: transcribe a recording, have the LLM pick the best highlight moments, and render
+/// each as a captioned 9:16 vertical clip into the Content library. Long-running; emits
+/// `shorts-progress` for the pipeline stage and `video-render-progress` (keyed `{job_id}-{n}`)
+/// for the active short. Cancel with `video_cancel_shorts`.
+#[tauri::command]
+pub async fn video_generate_shorts(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: VideoShortsRequest,
+) -> Result<Vec<video::ShortResult>, String> {
+    let src = PathBuf::from(&req.path);
+    video::run_shorts_pipeline(
+        &app,
+        &state,
+        &src,
+        req.count.unwrap_or(3),
+        req.duration_hint_s,
+        req.brief.as_deref(),
+        &req.job_id,
+        req.captions.unwrap_or(true),
+        req.skip_polish.unwrap_or(false),
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn video_cancel_shorts(job_id: String) -> bool {
+    video::request_cancel_shorts(&job_id)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VideoSavePlanRequest {
     pub path: String,
     pub plan: EditPlan,

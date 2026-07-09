@@ -525,6 +525,24 @@ function renderVideoSection(el, id) {
     </div>
     <div class="studio-transcript" data-vd-transcript="${id}" style="display:none;"></div>
 
+    <h4 class="studio-h" style="margin-top:8px;">Auto-shorts</h4>
+    <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+      <label class="muted" style="font-size:11px;">Clips
+        <select data-vd-shorts-count="${id}" style="width:auto; margin-left:4px;">
+          <option value="1">1</option><option value="2">2</option>
+          <option value="3" selected>3</option><option value="4">4</option><option value="5">5</option>
+        </select>
+      </label>
+      <input type="text" placeholder="Optional focus (e.g. 'the pricing discussion')" data-vd-shorts-brief="${id}" style="flex:1; min-width:160px;" />
+      <button class="form-btn" data-vd-shorts-go="${id}" disabled title="Transcribe, pick the best moments, and render captioned 9:16 shorts">Make shorts</button>
+      <button class="hint-chip" data-vd-shorts-cancel="${id}" style="display:none;">Cancel</button>
+      <span class="muted" data-vd-shorts-status="${id}" style="font-size:10px;"></span>
+    </div>
+    <div class="studio-progress" data-vd-shorts-progwrap="${id}" style="display:none;">
+      <div class="studio-progress-bar" data-vd-shorts-prog="${id}"></div>
+    </div>
+    <div class="studio-shorts-out" data-vd-shorts-out="${id}"></div>
+
     <h4 class="studio-h" style="margin-top:8px;">Edit</h4>
     <div class="form-row" style="gap:6px;">
       <textarea class="studio-topic" rows="2" style="flex:1;"
@@ -562,12 +580,21 @@ function renderVideoSection(el, id) {
   const progBar = el.querySelector(`[data-vd-prog="${id}"]`);
   const statusEl = el.querySelector(`[data-vd-status="${id}"]`);
   const outEl = el.querySelector(`[data-vd-out="${id}"]`);
+  const shortsCountEl = el.querySelector(`[data-vd-shorts-count="${id}"]`);
+  const shortsBriefEl = el.querySelector(`[data-vd-shorts-brief="${id}"]`);
+  const shortsGoBtn = el.querySelector(`[data-vd-shorts-go="${id}"]`);
+  const shortsCancelBtn = el.querySelector(`[data-vd-shorts-cancel="${id}"]`);
+  const shortsProgWrap = el.querySelector(`[data-vd-shorts-progwrap="${id}"]`);
+  const shortsProgBar = el.querySelector(`[data-vd-shorts-prog="${id}"]`);
+  const shortsStatusEl = el.querySelector(`[data-vd-shorts-status="${id}"]`);
+  const shortsOutEl = el.querySelector(`[data-vd-shorts-out="${id}"]`);
 
   let srcPath = null;
   let probe = null;
   let analysis = null;
   let thumbs = [];
   let currentJobId = null;
+  let shortsJobId = null;
   // Default shape for `plan` — used to reset on a new file pick, to apply an AI/saved plan
   // on top of, and to detect whether the user has made any edit yet (drives refinement mode
   // and the "restored previous edit" note). A fresh object each call so callers get their own
@@ -667,15 +694,36 @@ function renderVideoSection(el, id) {
     tileObj.cleanup = () => { try { preview.cleanup(); } catch {} if (typeof prevCleanup === "function") { try { prevCleanup(); } catch {} } };
   }
 
-  // Progress events for this tile's renders.
+  // Progress events for this tile's renders. `videoUnlisteners` holds an array of unlisten
+  // promises per tile (render-progress + shorts-progress); a re-render tears them all down.
   const prev = videoUnlisteners.get(id);
-  if (prev) prev.then(un => un()).catch(() => {});
-  videoUnlisteners.set(id, listen("video-render-progress", (e) => {
+  if (Array.isArray(prev)) prev.forEach(pr => pr.then(un => un()).catch(() => {}));
+  const renderProgUn = listen("video-render-progress", (e) => {
     const p = e.payload || {};
-    if (p.job_id !== currentJobId) return;
-    progBar.style.width = `${Math.max(1, p.pct || 0)}%`;
-    statusEl.textContent = `Rendering… ${Math.floor(p.pct || 0)}%`;
-  }));
+    if (currentJobId && p.job_id === currentJobId) {
+      progBar.style.width = `${Math.max(1, p.pct || 0)}%`;
+      statusEl.textContent = `Rendering… ${Math.floor(p.pct || 0)}%`;
+    } else if (shortsJobId && typeof p.job_id === "string" && p.job_id.startsWith(`${shortsJobId}-`)) {
+      // Per-short sub-render (job id `{shortsJobId}-{n}`) drives the shorts progress bar.
+      shortsProgBar.style.width = `${Math.max(1, p.pct || 0)}%`;
+    }
+  });
+  const shortsProgUn = listen("shorts-progress", (e) => {
+    const p = e.payload || {};
+    if (!shortsJobId || p.job_id !== shortsJobId) return;
+    if (p.stage === "transcribing") {
+      shortsStatusEl.textContent = "Transcribing…";
+    } else if (p.stage === "planning") {
+      shortsStatusEl.textContent = "Finding the best moments…";
+    } else if (p.stage === "rendering") {
+      shortsStatusEl.textContent = `Rendering short ${p.current}/${p.total}: ${p.title || ""}`;
+      shortsProgWrap.style.display = "";
+      shortsProgBar.style.width = "1%";
+    } else if (p.stage === "done") {
+      shortsProgWrap.style.display = "none";
+    }
+  });
+  videoUnlisteners.set(id, [renderProgUn, shortsProgUn]);
 
   pickBtn.addEventListener("click", async () => {
     let selected;
@@ -695,6 +743,9 @@ function renderVideoSection(el, id) {
     transcriptEl.style.display = "none";
     previewMount.style.display = "none";
     outEl.innerHTML = "";
+    shortsOutEl.innerHTML = "";
+    shortsStatusEl.textContent = "";
+    shortsGoBtn.disabled = true;
     stripEl.innerHTML = "";
     statusEl.textContent = "";
     infoEl.textContent = "Reading file…";
@@ -708,6 +759,8 @@ function renderVideoSection(el, id) {
       anStatusEl.textContent = probe.has_audio ? "" : "No audio track — silence/transcript analysis unavailable.";
       planBtn.disabled = false;
       renderBtn.disabled = false;
+      // Auto-shorts needs speech to find highlights, so it requires an audio track.
+      shortsGoBtn.disabled = !probe.has_audio;
       // Restore a previously saved edit for this exact file, if any — "Keep everything"
       // below resets back to the default plan.
       try {
@@ -1082,6 +1135,56 @@ function renderVideoSection(el, id) {
     if (!currentJobId) return;
     try { await invoke("video_cancel_render", { jobId: currentJobId }); } catch {}
     statusEl.textContent = "Cancelled.";
+  });
+
+  // Auto-shorts: one click transcribes, picks highlights, and renders each as a vertical clip.
+  function renderShortsResults(results) {
+    shortsOutEl.innerHTML = results.map(r => `
+      <div class="studio-short-item">
+        <div class="studio-short-meta">
+          <strong>${escapeHtml(r.title)}</strong>
+          <span class="muted" style="font-size:10px;"> · ${fmtT(r.duration_s)}s</span>
+          ${r.hook ? `<div class="muted" style="font-size:10px;">Hook: ${escapeHtml(r.hook)}</div>` : ""}
+        </div>
+        <video controls preload="none" src="${convertFileSrc(r.path)}" class="studio-video-preview"></video>
+      </div>
+    `).join("");
+  }
+
+  shortsGoBtn.addEventListener("click", async () => {
+    if (!srcPath) return;
+    shortsJobId = `studio-shorts-${id}-${Date.now()}`;
+    const count = parseInt(shortsCountEl.value, 10) || 3;
+    const brief = shortsBriefEl.value.trim();
+    shortsGoBtn.disabled = true;
+    shortsCancelBtn.style.display = "";
+    shortsOutEl.innerHTML = "";
+    shortsStatusEl.textContent = "Starting…";
+    try {
+      const results = await invoke("video_generate_shorts", {
+        req: { path: srcPath, count, brief: brief || null, jobId: shortsJobId, captions: true },
+      });
+      if (!results || !results.length) {
+        shortsStatusEl.textContent = "No shorts produced.";
+      } else {
+        shortsStatusEl.textContent = `Done — ${results.length} short${results.length === 1 ? "" : "s"} saved to Content ✓`;
+        renderShortsResults(results);
+      }
+    } catch (e) {
+      logError("video_generate_shorts", e);
+      shortsStatusEl.textContent = String(e);
+    } finally {
+      shortsGoBtn.disabled = !srcPath;
+      shortsCancelBtn.style.display = "none";
+      shortsProgWrap.style.display = "none";
+      shortsJobId = null;
+    }
+  });
+
+  shortsCancelBtn.addEventListener("click", async () => {
+    if (!shortsJobId) return;
+    try { await invoke("video_cancel_shorts", { jobId: shortsJobId }); } catch {}
+    shortsStatusEl.textContent = "Cancelling…";
   });
 }
 
