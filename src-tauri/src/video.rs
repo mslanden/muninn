@@ -609,19 +609,71 @@ fn segment_offsets(segments: &[Segment]) -> Vec<f64> {
     offs
 }
 
-/// Map a SOURCE-timeline interval to the OUTPUT timeline for the given kept segments and
-/// speed. Returns `(out_start, out_end, segment_index)`. Intervals that fall entirely
-/// outside every kept segment return `None` (the word is dropped); partially-clipped
-/// intervals are clamped to the kept segment they most overlap.
+/// Whether two source references denote the same render input: both `None` = the MAIN video,
+/// or a trimmed-path match. Insert sources are matched by the same trimmed-path string the
+/// renderer uses in `seg_input`, so a caption's source key lines up with its segments.
+fn source_key_eq(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.trim() == y.trim(),
+        _ => false,
+    }
+}
+
+/// Transcripts for a (possibly multi-source) render, keyed by the source they describe. The
+/// `None` key is the MAIN video (`inputs[0]`); a `Some(path)` key matches a `Segment.source`
+/// by the same trimmed-path string the renderer resolves inputs with. A single-source render
+/// carries just one `None` entry, and that path produces byte-identical captions to the
+/// pre-multi-source behavior (see `build_ass`/`build_subtitles`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TranscriptMap {
+    /// (source_key, transcript) pairs. `source_key == None` is the MAIN source.
+    entries: Vec<(Option<String>, Transcript)>,
+}
+
+impl TranscriptMap {
+    /// The MAIN video's transcript only — the common single-source case.
+    pub(crate) fn single(transcript: Transcript) -> Self {
+        TranscriptMap { entries: vec![(None, transcript)] }
+    }
+
+    /// Build from the `Option<&Transcript>` the existing single-source callers hold. `None`
+    /// yields an empty map (no captions), matching the old "no transcript" behavior.
+    pub(crate) fn from_single(transcript: Option<&Transcript>) -> Self {
+        match transcript {
+            Some(t) => TranscriptMap::single(t.clone()),
+            None => TranscriptMap::default(),
+        }
+    }
+
+    /// Add a source's transcript. `source == None` is the MAIN source; a `Some(path)` key is
+    /// trimmed so it matches `Segment.source` the way the renderer resolves inputs.
+    pub(crate) fn insert(&mut self, source: Option<&str>, transcript: Transcript) {
+        let key = source.map(|s| s.trim().to_string());
+        self.entries.push((key, transcript));
+    }
+
+    /// Whether any source carries words/segments worth burning captions for.
+    pub(crate) fn has_captions(&self) -> bool {
+        self.entries.iter().any(|(_, t)| !(t.words.is_empty() && t.segments.is_empty()))
+    }
+}
+
+/// Map a SOURCE-timeline interval from `word_source` to the OUTPUT timeline for the given kept
+/// segments and speed. Returns `(out_start, out_end, segment_index)`. Intervals that fall
+/// entirely outside every kept segment of that source return `None` (the word is dropped);
+/// partially-clipped intervals are clamped to the segment they most overlap.
 ///
-/// Transcript words belong to the MAIN source only, so overlap is measured against
-/// MAIN-source segments (`source == None`) exclusively — an insert segment's `start`..`end`
-/// live on a different timeline and must never "capture" a main-source word. Insert segments
-/// still count toward the cumulative output offset (via `segment_offsets`), so a word after
-/// an inserted b-roll clip is pushed later on the output timeline by that clip's duration.
-fn map_interval_to_output(
+/// A word only maps into segments whose `source` matches `word_source` — a segment from
+/// another source lives on a different timeline and must never "capture" this word. ALL
+/// segments (of every source) still count toward the cumulative output offset (via
+/// `segment_offsets`), so a word is pushed later on the output timeline by the duration of
+/// every earlier segment, whichever source it came from. With `word_source == &None` this is
+/// exactly the old main-source-only mapping.
+fn map_interval_to_output_for_source(
     ws: f64,
     we: f64,
+    word_source: &Option<String>,
     segments: &[Segment],
     speed: f64,
 ) -> Option<(f64, f64, usize)> {
@@ -629,8 +681,8 @@ fn map_interval_to_output(
     let offs = segment_offsets(segments);
     let mut best: Option<(usize, f64)> = None;
     for (i, s) in segments.iter().enumerate() {
-        if s.source.is_some() {
-            continue; // insert segment — words never map into it
+        if !source_key_eq(&s.source, word_source) {
+            continue; // segment belongs to another source — this word never maps into it
         }
         let overlap = we.min(s.end) - ws.max(s.start);
         if overlap > 0.0 && best.map_or(true, |(_, b)| overlap > b) {
@@ -644,6 +696,17 @@ fn map_interval_to_output(
     let out_start = (offs[i] + (cs - s.start)) / speed;
     let out_end = (offs[i] + (ce - s.start)) / speed;
     Some((out_start, out_end, i))
+}
+
+/// Main-source (`source == None`) interval mapping — the common single-transcript path.
+#[cfg_attr(not(test), allow(dead_code))]
+fn map_interval_to_output(
+    ws: f64,
+    we: f64,
+    segments: &[Segment],
+    speed: f64,
+) -> Option<(f64, f64, usize)> {
+    map_interval_to_output_for_source(ws, we, &None, segments, speed)
 }
 
 /// OUTPUT resolution after an optional center-crop, floored to even pixels (mirrors the
@@ -684,11 +747,18 @@ impl CaptionLine {
     }
 }
 
-/// Group a transcript's words into short caption lines (~3–5 words / ~28 chars), breaking
-/// at speech gaps > 0.8s, transcript-segment boundaries, or edit cuts, and mapping each
-/// word onto the OUTPUT timeline. Falls back to segment-level lines when the transcript
-/// has no word timings. Words outside the kept segments are dropped.
-fn group_caption_lines(transcript: &Transcript, segments: &[Segment], speed: f64) -> Vec<CaptionLine> {
+/// Group ONE source's transcript into short caption lines (~3–5 words / ~28 chars), breaking
+/// at speech gaps > 0.8s, transcript-segment boundaries, or edit cuts, and mapping each word
+/// onto the OUTPUT timeline via that source's kept segments (`word_source`). Falls back to
+/// segment-level lines when the transcript has no word timings. Words that don't land inside
+/// any of `word_source`'s kept segments are dropped. A line never spans two segments/sources
+/// because every kept-segment change flushes the current line (`eseg != prev_eseg`).
+fn group_caption_lines_for_source(
+    transcript: &Transcript,
+    word_source: &Option<String>,
+    segments: &[Segment],
+    speed: f64,
+) -> Vec<CaptionLine> {
     const MAX_WORDS: usize = 5;
     const MAX_CHARS: usize = 28;
     const GAP_S: f64 = 0.8;
@@ -732,10 +802,11 @@ fn group_caption_lines(transcript: &Transcript, segments: &[Segment], speed: f64
     };
 
     for it in &items {
-        let (os, oe, eseg) = match map_interval_to_output(it.start, it.end, segments, speed) {
-            Some(v) => v,
-            None => continue,
-        };
+        let (os, oe, eseg) =
+            match map_interval_to_output_for_source(it.start, it.end, word_source, segments, speed) {
+                Some(v) => v,
+                None => continue,
+            };
         let wlen = it.text.chars().count().max(1);
         let gap = it.start - prev_src_end;
         let boundary = !cur.is_empty()
@@ -758,6 +829,27 @@ fn group_caption_lines(transcript: &Transcript, segments: &[Segment], speed: f64
     lines
 }
 
+/// Main-source (`source == None`) caption grouping — the single-transcript path.
+#[cfg_attr(not(test), allow(dead_code))]
+fn group_caption_lines(transcript: &Transcript, segments: &[Segment], speed: f64) -> Vec<CaptionLine> {
+    group_caption_lines_for_source(transcript, &None, segments, speed)
+}
+
+/// Group EVERY source's transcript into caption lines and merge them onto one output timeline.
+/// Each source is grouped independently against its own kept segments (so a line never mixes
+/// words from different sources), then all lines are sorted by output start time. A source with
+/// no transcript, or whose segments were all cut, simply contributes no lines. With a single
+/// `None`-keyed transcript this is identical to `group_caption_lines` (one pass + a stable
+/// sort over already-ordered lines).
+fn group_caption_lines_multi(transcripts: &TranscriptMap, segments: &[Segment], speed: f64) -> Vec<CaptionLine> {
+    let mut lines: Vec<CaptionLine> = Vec::new();
+    for (src_key, transcript) in &transcripts.entries {
+        lines.extend(group_caption_lines_for_source(transcript, src_key, segments, speed));
+    }
+    lines.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    lines
+}
+
 /// Format seconds as an ASS timestamp `H:MM:SS.cc` (centiseconds).
 fn ass_time(t: f64) -> String {
     let cs = (t.max(0.0) * 100.0).round() as i64;
@@ -770,9 +862,18 @@ fn ass_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('{', "(").replace('}', ")").replace('\n', "\\N")
 }
 
-/// Build a full ASS subtitle document for the plan's captions. Pure/unit-testable. Times
-/// are on the OUTPUT timeline and PlayResX/Y match the OUTPUT resolution so styling scales.
+/// Single-source convenience wrapper for `build_ass_multi` (used by the studio single-video
+/// render + tests). Behaves EXACTLY as before multi-source captions existed.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_ass(transcript: &Transcript, plan: &EditPlan, probe: &VideoProbe) -> String {
+    build_ass_multi(&TranscriptMap::single(transcript.clone()), plan, probe)
+}
+
+/// Build a full ASS subtitle document for the plan's captions from a per-source transcript
+/// map. Pure/unit-testable. Times are on the OUTPUT timeline and PlayResX/Y match the OUTPUT
+/// resolution so styling scales. Words from each source map only into that source's kept
+/// segments (see `group_caption_lines_multi`).
+pub(crate) fn build_ass_multi(transcripts: &TranscriptMap, plan: &EditPlan, probe: &VideoProbe) -> String {
     let (w, h) = output_resolution(plan, probe);
     let fs = (h as f64 / 12.0).round().max(12.0) as i64;
     let margin_v = (h as f64 * 0.08).round().max(10.0) as i64;
@@ -810,7 +911,7 @@ pub(crate) fn build_ass(transcript: &Transcript, plan: &EditPlan, probe: &VideoP
          Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     );
 
-    let lines = group_caption_lines(transcript, &effective_segments(plan, probe), plan.speed.unwrap_or(1.0));
+    let lines = group_caption_lines_multi(transcripts, &effective_segments(plan, probe), plan.speed.unwrap_or(1.0));
     for line in &lines {
         let text = if karaoke {
             let mut t = String::new();
@@ -845,10 +946,21 @@ fn subtitle_time(t: f64, vtt: bool) -> String {
     format!("{:02}:{:02}:{:02}{}{:03}", ms / 3_600_000, (ms % 3_600_000) / 60_000, (ms % 60_000) / 1000, sep, ms % 1000)
 }
 
-/// Build an SRT or VTT document from a transcript, optionally applying an edit plan's
-/// timeline mapping (empty/absent plan = source timeline). Pure/unit-testable.
+/// Single-source SRT/VTT export — convenience wrapper for `build_subtitles_multi`.
 pub(crate) fn build_subtitles(
     transcript: &Transcript,
+    format: &str,
+    plan: Option<&EditPlan>,
+    probe: &VideoProbe,
+) -> String {
+    build_subtitles_multi(&TranscriptMap::single(transcript.clone()), format, plan, probe)
+}
+
+/// Build an SRT or VTT document from a per-source transcript map, optionally applying an edit
+/// plan's timeline mapping (empty/absent plan = source timeline). Pure/unit-testable. Handles
+/// the multi-source case: each source's words map only into that source's kept segments.
+pub(crate) fn build_subtitles_multi(
+    transcripts: &TranscriptMap,
     format: &str,
     plan: Option<&EditPlan>,
     probe: &VideoProbe,
@@ -857,7 +969,7 @@ pub(crate) fn build_subtitles(
         Some(p) => (effective_segments(p, probe), p.speed.unwrap_or(1.0)),
         None => (vec![Segment::keep(0.0, probe.duration_s)], 1.0),
     };
-    let lines = group_caption_lines(transcript, &segments, speed);
+    let lines = group_caption_lines_multi(transcripts, &segments, speed);
     let vtt = format == "vtt";
     let mut out = String::new();
     if vtt {
@@ -1575,31 +1687,43 @@ fn cancel_render_prefix(prefix: &str) -> bool {
     killed
 }
 
-/// Parent-job-id set flagged for cancellation by `request_cancel_shorts`. The shorts loop
-/// checks `is_shorts_cancelled` between shorts (mirrors `AppState.stop_requests` for chat).
-fn shorts_cancels() -> &'static Mutex<std::collections::HashSet<String>> {
+/// Parent-job-id set flagged for cancellation by the multi-step pipelines (auto-shorts and
+/// compile). Each pipeline checks `is_pipeline_cancelled` between steps (mirrors
+/// `AppState.stop_requests` for chat) and clears its own id on exit.
+fn pipeline_cancels() -> &'static Mutex<std::collections::HashSet<String>> {
     static CANCELS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
     CANCELS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
-/// Flag a shorts job for cancellation AND kill its currently-rendering sub-render, so a cancel
-/// mid-render stops immediately rather than only at the next between-shorts boundary. Returns
-/// whether an active sub-render was killed.
-pub(crate) fn request_cancel_shorts(job_id: &str) -> bool {
-    if let Ok(mut s) = shorts_cancels().lock() {
+fn flag_pipeline_cancel(job_id: &str) {
+    if let Ok(mut s) = pipeline_cancels().lock() {
         s.insert(job_id.to_string());
     }
+}
+
+fn is_pipeline_cancelled(job_id: &str) -> bool {
+    pipeline_cancels().lock().map(|s| s.contains(job_id)).unwrap_or(false)
+}
+
+fn clear_pipeline_cancel(job_id: &str) {
+    if let Ok(mut s) = pipeline_cancels().lock() {
+        s.remove(job_id);
+    }
+}
+
+/// Flag a shorts job for cancellation AND kill its currently-rendering sub-render, so a cancel
+/// mid-render stops immediately rather than only at the next between-shorts boundary. Sub-render
+/// ids are `{job}-1..n`. Returns whether an active sub-render was killed.
+pub(crate) fn request_cancel_shorts(job_id: &str) -> bool {
+    flag_pipeline_cancel(job_id);
     cancel_render_prefix(&format!("{job_id}-"))
 }
 
-fn is_shorts_cancelled(job_id: &str) -> bool {
-    shorts_cancels().lock().map(|s| s.contains(job_id)).unwrap_or(false)
-}
-
-fn clear_shorts_cancel(job_id: &str) {
-    if let Ok(mut s) = shorts_cancels().lock() {
-        s.remove(job_id);
-    }
+/// Flag a compile job for cancellation AND kill its (single) active render, which is keyed by
+/// the compile job_id directly. Returns whether the render was killed.
+pub(crate) fn request_cancel_compile(job_id: &str) -> bool {
+    flag_pipeline_cancel(job_id);
+    cancel_render(job_id)
 }
 
 pub(crate) fn sanitize_stem(name: &str) -> String {
@@ -1690,7 +1814,7 @@ pub(crate) fn render_edit(
     job_id: &str,
     src: &Path,
     plan: &EditPlan,
-    transcript: Option<&Transcript>,
+    transcripts: &TranscriptMap,
     out_dir: &Path,
     prefer_hw_encode: bool,
 ) -> Result<PathBuf, String> {
@@ -1737,19 +1861,16 @@ pub(crate) fn render_edit(
     }
 
     let ass_file = if plan.captions {
-        match transcript {
-            Some(t) if !(t.words.is_empty() && t.segments.is_empty()) => {
-                let p = text_dir.join("captions.ass");
-                std::fs::write(&p, build_ass(t, &plan, &probe).as_bytes()).map_err(|e| e.to_string())?;
-                Some(p)
-            }
-            _ => {
-                let _ = std::fs::remove_dir_all(&text_dir);
-                return Err(
-                    "captions were requested but no transcript is available — transcribe the video first"
-                        .to_string(),
-                );
-            }
+        if transcripts.has_captions() {
+            let p = text_dir.join("captions.ass");
+            std::fs::write(&p, build_ass_multi(transcripts, &plan, &probe).as_bytes()).map_err(|e| e.to_string())?;
+            Some(p)
+        } else {
+            let _ = std::fs::remove_dir_all(&text_dir);
+            return Err(
+                "captions were requested but no transcript is available — transcribe the video first"
+                    .to_string(),
+            );
         }
     } else {
         None
@@ -1955,7 +2076,7 @@ pub(crate) async fn run_shorts_pipeline(
     captions: bool,
     skip_polish: bool,
 ) -> Result<Vec<ShortResult>, String> {
-    clear_shorts_cancel(job_id); // clear any stale flag from a previous job reusing this id
+    clear_pipeline_cancel(job_id); // clear any stale flag from a previous job reusing this id
     let count = count.clamp(1, 8) as usize;
 
     let src_owned = src.to_path_buf();
@@ -1984,8 +2105,8 @@ pub(crate) async fn run_shorts_pipeline(
     if transcript.segments.is_empty() {
         return Err("transcription produced no speech segments to build shorts from".to_string());
     }
-    if is_shorts_cancelled(job_id) {
-        clear_shorts_cancel(job_id);
+    if is_pipeline_cancelled(job_id) {
+        clear_pipeline_cancel(job_id);
         emit_stage(0, count, "", "done");
         return Ok(Vec::new());
     }
@@ -2001,7 +2122,7 @@ pub(crate) async fn run_shorts_pipeline(
     let mut last_err: Option<String> = None;
 
     for (i, spec) in specs.iter().enumerate() {
-        if is_shorts_cancelled(job_id) {
+        if is_pipeline_cancelled(job_id) {
             break;
         }
         emit_stage(i + 1, total, &spec.title, "rendering");
@@ -2024,7 +2145,8 @@ pub(crate) async fn run_shorts_pipeline(
         let out_dir_c = out_dir.clone();
         let src_c = src.to_path_buf();
         let render = tauri::async_runtime::spawn_blocking(move || {
-            render_edit(&app_c, &sub_job, &src_c, &plan, Some(&transcript_c), &out_dir_c, prefer_hw)
+            let tmap = TranscriptMap::single(transcript_c);
+            render_edit(&app_c, &sub_job, &src_c, &plan, &tmap, &out_dir_c, prefer_hw)
         })
         .await
         .map_err(|e| e.to_string());
@@ -2039,7 +2161,7 @@ pub(crate) async fn run_shorts_pipeline(
             Ok(Err(e)) | Err(e) => {
                 // A cancel SIGKILLs the sub-render, which surfaces as a render error — swallow it
                 // and stop the loop rather than reporting a spurious failure.
-                if is_shorts_cancelled(job_id) {
+                if is_pipeline_cancelled(job_id) {
                     break;
                 }
                 eprintln!("[shorts] render of '{}' failed: {e}", spec.title);
@@ -2048,7 +2170,7 @@ pub(crate) async fn run_shorts_pipeline(
         }
     }
 
-    clear_shorts_cancel(job_id);
+    clear_pipeline_cancel(job_id);
     emit_stage(results.len(), total, "", "done");
     let _ = app.emit("content-changed", ());
 
@@ -2059,6 +2181,316 @@ pub(crate) async fn run_shorts_pipeline(
         // No error and no results ⇒ cancelled before any short finished.
     }
     Ok(results)
+}
+
+// ---------- multi-clip compilation (combine several clips, keep the good parts) ----------
+
+/// One input clip fed to the compilation planner. Built by `run_compile_pipeline` after it
+/// transcribes + analyzes each clip. `path` is the absolute clip path (also the segment
+/// `source` the planner keys off of); `transcript_segments` is the segment-level transcript
+/// (empty if transcription failed — the clip still participates, with a note to the LLM).
+#[derive(Clone, Debug)]
+pub struct ClipInfo {
+    pub path: String,
+    pub duration_s: f64,
+    pub transcript_segments: Vec<TranscriptSegment>,
+    pub filler_count: usize,
+    /// Fraction of the clip that is detected silence/dead-air, 0.0–1.0.
+    pub silence_ratio: f64,
+}
+
+/// The LLM's plan for one compiled video. `segments` reference input clips by their absolute
+/// path via `Segment.source`: the planner emits an explicit `source` on EVERY segment (naming
+/// the clip it comes from). Before rendering, the pipeline rewrites segments whose source is
+/// the FIRST clip to `source: None` — that clip is the render's MAIN input (`inputs[0]`) and
+/// its dims/fps are the normalization reference; the rest stay as inserts.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct CompilationSpec {
+    pub title: String,
+    /// "takes" (retakes aligned into sections, best take per section) or "montage" (distinct
+    /// strong moments across clips). Reported by the model; also echoed to the caller.
+    pub mode_detected: String,
+    /// Ordered segments in final playback order. `source` = an input clip path.
+    pub segments: Vec<Segment>,
+    /// The model's short rationale (surfaced for transparency).
+    pub notes: String,
+}
+
+/// One rendered compilation returned to the caller.
+#[derive(Serialize, Clone, Debug)]
+pub struct CompileResult {
+    pub title: String,
+    pub mode_detected: String,
+    pub path: String,
+    pub duration_s: f64,
+    pub notes: String,
+}
+
+/// Pipeline stage event so the UI can show which phase a compile job is in.
+#[derive(Serialize, Clone)]
+struct CompileProgress {
+    job_id: String,
+    /// 1-based index of the clip currently being processed (0 during planning/rendering).
+    current: usize,
+    total: usize,
+    /// "transcribing" | "planning" | "rendering" | "done".
+    stage: String,
+}
+
+/// Validate + normalize an LLM-produced compilation spec against the input clips. Pure so it's
+/// unit-testable without an LLM. Rules:
+/// - every segment must carry a `source` that is EXACTLY one of the input clip paths (a segment
+///   with no/unknown source is dropped — we never guess which clip it meant);
+/// - each segment is clamped into `[0, that clip's duration]` and dropped if under 0.5s;
+/// - segments keep the model's given order (narrative/flow order matters — we do NOT sort);
+/// - at most 100 segments;
+/// - when a positive `target_s` is given, the total kept duration must land within 0.5×–2× of
+///   it (else the whole spec is rejected — a re-prompt is cheaper than a wrong-length render);
+/// - title trimmed to ≤80 chars; `mode_detected` normalized to "takes"/"montage" (default
+///   "montage" if the model returns something else).
+pub(crate) fn sanitize_compilation_spec(
+    mut spec: CompilationSpec,
+    clip_durations: &[(String, f64)],
+    target_s: Option<f64>,
+) -> Result<CompilationSpec, String> {
+    if clip_durations.is_empty() {
+        return Err("no input clips to compile".to_string());
+    }
+    let dur_of = |src: &str| -> Option<f64> {
+        clip_durations
+            .iter()
+            .find(|(p, _)| p.trim() == src.trim())
+            .map(|(_, d)| *d)
+    };
+
+    let mut segs: Vec<Segment> = Vec::new();
+    for s in &spec.segments {
+        let src = match &s.source {
+            Some(src) if !src.trim().is_empty() => src.trim().to_string(),
+            _ => continue, // no source ⇒ we can't tell which clip; drop it
+        };
+        let clip_dur = match dur_of(&src) {
+            Some(d) => d,
+            None => continue, // unknown clip path ⇒ drop (never a workspace escape / guess)
+        };
+        let start = s.start.max(0.0);
+        let end = s.end.min(clip_dur);
+        if end - start < 0.5 {
+            continue;
+        }
+        segs.push(Segment { start, end, source: Some(src) });
+        if segs.len() >= 100 {
+            break;
+        }
+    }
+    if segs.is_empty() {
+        return Err(
+            "no usable compilation segments after validation (every segment needs a valid clip \
+             source and a ≥0.5s range inside that clip)"
+                .to_string(),
+        );
+    }
+
+    if let Some(target) = target_s.filter(|t| *t > 0.0) {
+        let total: f64 = segs.iter().map(|s| s.end - s.start).sum();
+        let (lo, hi) = (0.5 * target, 2.0 * target);
+        if total < lo || total > hi {
+            return Err(format!(
+                "compilation total is {total:.0}s but should be within {lo:.0}–{hi:.0}s of the \
+                 {target:.0}s target — pick more/fewer or shorter/longer moments"
+            ));
+        }
+    }
+
+    spec.segments = segs;
+    spec.title = {
+        let t: String = spec.title.trim().chars().take(80).collect();
+        if t.is_empty() { "Compilation".to_string() } else { t }
+    };
+    spec.mode_detected = match spec.mode_detected.trim().to_lowercase().as_str() {
+        "takes" | "take" | "retakes" => "takes".to_string(),
+        _ => "montage".to_string(),
+    };
+    Ok(spec)
+}
+
+/// The full multi-clip compilation pipeline: transcribe + analyze every clip → LLM planning
+/// (retakes vs montage) → ONE stitched render into the Content library. Mirrors
+/// `run_shorts_pipeline`.
+///
+/// Emits `compile-progress` (`{job_id, current, total, stage}`) at each phase, and the single
+/// render's `video-render-progress` keyed by the compile `job_id` itself. Cancellation is
+/// cooperative: `request_cancel_compile(job_id)` flags the job (checked between clips + before
+/// the render) and SIGKILLs the active render. A clip that fails transcription still
+/// participates (empty transcript + a note to the planner).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_compile_pipeline(
+    app: &AppHandle,
+    state: &AppState,
+    paths: &[PathBuf],
+    brief: Option<&str>,
+    mode: &str,
+    target_duration_s: Option<f64>,
+    captions: bool,
+    skip_polish: bool,
+    job_id: &str,
+) -> Result<CompileResult, String> {
+    clear_pipeline_cancel(job_id); // clear any stale flag from a previous job reusing this id
+    if paths.len() < 2 {
+        return Err("compilation needs at least 2 clips".to_string());
+    }
+    if paths.len() > 10 {
+        return Err("compilation takes at most 10 clips".to_string());
+    }
+
+    let emit_stage = |current: usize, total: usize, stage: &str| {
+        let _ = app.emit(
+            "compile-progress",
+            CompileProgress {
+                job_id: job_id.to_string(),
+                current,
+                total,
+                stage: stage.to_string(),
+            },
+        );
+    };
+
+    // ---- per-clip: transcribe + analyze, building ClipInfo + a per-source transcript map ----
+    let total = paths.len();
+    let mut clips: Vec<ClipInfo> = Vec::new();
+    let mut transcripts = TranscriptMap::default();
+    for (i, path) in paths.iter().enumerate() {
+        if is_pipeline_cancelled(job_id) {
+            clear_pipeline_cancel(job_id);
+            emit_stage(0, total, "done");
+            return Err("compilation cancelled".to_string());
+        }
+        emit_stage(i + 1, total, "transcribing");
+        let path_str = path.to_string_lossy().to_string();
+        let probe = {
+            let p = path.clone();
+            tauri::async_runtime::spawn_blocking(move || probe_video(&p))
+                .await
+                .map_err(|e| e.to_string())??
+        };
+        // A clip that can't be transcribed still participates with an empty transcript.
+        let transcript = match transcribe_video(state, path).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[compile] transcription of '{path_str}' failed: {e}");
+                Transcript::default()
+            }
+        };
+        // First clip is the render's MAIN source (keyed None); the rest are inserts keyed by path.
+        if i == 0 {
+            transcripts.insert(None, transcript.clone());
+        } else {
+            transcripts.insert(Some(&path_str), transcript.clone());
+        }
+
+        let filler_count = detect_filler_words(&transcript).len();
+        let silence_ratio = {
+            let p = path.clone();
+            let sil = tauri::async_runtime::spawn_blocking(move || detect_silences(&p, -35.0, 0.6))
+                .await
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
+            let total_sil: f64 = sil.iter().map(|s| (s.end - s.start).max(0.0)).sum();
+            if probe.duration_s > 0.0 { (total_sil / probe.duration_s).clamp(0.0, 1.0) } else { 0.0 }
+        };
+        clips.push(ClipInfo {
+            path: path_str,
+            duration_s: probe.duration_s,
+            transcript_segments: transcript.segments,
+            filler_count,
+            silence_ratio,
+        });
+    }
+
+    if is_pipeline_cancelled(job_id) {
+        clear_pipeline_cancel(job_id);
+        emit_stage(0, total, "done");
+        return Err("compilation cancelled".to_string());
+    }
+
+    // ---- plan ----
+    emit_stage(0, total, "planning");
+    let spec = crate::llm::generate_compilation_specs(state, &clips, brief, mode, target_duration_s).await?;
+
+    if is_pipeline_cancelled(job_id) {
+        clear_pipeline_cancel(job_id);
+        emit_stage(0, total, "done");
+        return Err("compilation cancelled".to_string());
+    }
+
+    // ---- build ONE EditPlan ----
+    // The planner names an explicit clip `source` on every segment. The render's MAIN input is
+    // clip 0, so rewrite clip-0 segments to `source: None` (its captions are keyed None too);
+    // the rest stay as inserts (matched to their transcript by path in the transcript map).
+    let main_path = clips[0].path.clone();
+    let segments: Vec<Segment> = spec
+        .segments
+        .iter()
+        .map(|s| {
+            let is_main = s.source.as_deref().map(|p| p.trim() == main_path).unwrap_or(false);
+            Segment {
+                start: s.start,
+                end: s.end,
+                source: if is_main { None } else { s.source.clone() },
+            }
+        })
+        .collect();
+    // Only burn captions if at least one clip actually transcribed — otherwise a fully-silent
+    // set would hard-fail the render on "captions requested but no transcript". Degrade quietly.
+    let want_captions = captions && transcripts.has_captions();
+    let plan = EditPlan {
+        segments,
+        captions: want_captions,
+        caption_style: if want_captions { Some("karaoke".to_string()) } else { None },
+        normalize_audio: !skip_polish,
+        fade: if skip_polish { None } else { Some(0.3) },
+        output_name: Some(sanitize_stem(&spec.title)),
+        ..Default::default()
+    };
+    let expected_dur: f64 = spec.segments.iter().map(|s| (s.end - s.start).max(0.0)).sum();
+
+    // ---- render ----
+    emit_stage(0, total, "rendering");
+    let prefer_hw = hw_encode_preferred(state);
+    let out_dir = crate::tools::content_dir(app)?;
+    let main_src = PathBuf::from(&main_path);
+    let app_c = app.clone();
+    let job = job_id.to_string();
+    let out_dir_c = out_dir.clone();
+    let render = tauri::async_runtime::spawn_blocking(move || {
+        render_edit(&app_c, &job, &main_src, &plan, &transcripts, &out_dir_c, prefer_hw)
+    })
+    .await
+    .map_err(|e| e.to_string());
+
+    clear_pipeline_cancel(job_id);
+    let path = match render {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) | Err(e) => {
+            if is_pipeline_cancelled(job_id) {
+                emit_stage(0, total, "done");
+                return Err("compilation cancelled".to_string());
+            }
+            emit_stage(0, total, "done");
+            return Err(format!("compilation render failed: {e}"));
+        }
+    };
+
+    emit_stage(0, total, "done");
+    let _ = app.emit("content-changed", ());
+    Ok(CompileResult {
+        title: spec.title,
+        mode_detected: spec.mode_detected,
+        path: path.to_string_lossy().to_string(),
+        duration_s: expected_dur,
+        notes: spec.notes,
+    })
 }
 
 // ---------- thumbnails ----------
@@ -2564,6 +2996,84 @@ mod tests {
         // The image insert was scaled/cropped to the MAIN dims (640x360) for concat.
         assert_eq!((multi_probe.width, multi_probe.height), (640, 360));
         assert!(multi_probe.has_audio, "silent card + main audio → output keeps an audio track");
+
+        // Compile-style two-source render WITH per-source captions: main clip + a second real
+        // b-roll clip, each with its own transcript, and burned cross-source subtitles. Confirms
+        // ffmpeg accepts the multi-source subtitles= filter driven by build_ass_multi.
+        let clip_b = dir.join("clipB.mp4");
+        let cb_status = Command::new(ffmpeg_path().unwrap())
+            .args(["-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=6",
+                   "-f", "lavfi", "-i", "sine=frequency=660:duration=6",
+                   "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest"])
+            .arg(&clip_b)
+            .status()
+            .unwrap();
+        assert!(cb_status.success());
+        let clip_b_probe = probe_video(&clip_b).unwrap();
+
+        let compile_plan = EditPlan {
+            // MAIN 1..3 (2s), then clipB 0..2 (2s) → ~4s output.
+            segments: vec![
+                Segment::keep(1.0, 3.0),
+                Segment { start: 0.0, end: 2.0, source: Some(clip_b.to_string_lossy().to_string()) },
+            ],
+            captions: true,
+            caption_style: Some("karaoke".into()),
+            normalize_audio: true,
+            fade: Some(0.3),
+            ..Default::default()
+        };
+        let mut compile_tmap = TranscriptMap::default();
+        compile_tmap.insert(None, Transcript {
+            text: "main words here".into(),
+            segments: vec![TranscriptSegment { start: 0.0, end: 3.0, text: "main words here".into() }],
+            words: vec![
+                TranscriptWord { start: 1.2, end: 1.6, word: "main".into() },
+                TranscriptWord { start: 1.7, end: 2.2, word: "words".into() },
+            ],
+        });
+        compile_tmap.insert(Some(&clip_b.to_string_lossy().to_string()), Transcript {
+            text: "broll caption".into(),
+            segments: vec![TranscriptSegment { start: 0.0, end: 2.0, text: "broll caption".into() }],
+            words: vec![
+                TranscriptWord { start: 0.3, end: 0.7, word: "broll".into() },
+                TranscriptWord { start: 0.8, end: 1.3, word: "caption".into() },
+            ],
+        });
+        let compile_ass = dir.join("compile-captions.ass");
+        std::fs::write(&compile_ass, build_ass_multi(&compile_tmap, &compile_plan, &probe)).unwrap();
+        // Both sources' words appear (karaoke \k tags sit between them), and clipB's land past
+        // the main's 2s slot on the output: main line at output 0.2, clipB line at 2.3.
+        let ass_doc = std::fs::read_to_string(&compile_ass).unwrap();
+        assert!(ass_doc.contains("main") && ass_doc.contains("broll") && ass_doc.contains("caption"), "ass:\n{ass_doc}");
+        assert!(ass_doc.contains("Dialogue: 0,0:00:00.20,"), "main caption at output 0.2:\n{ass_doc}");
+        assert!(ass_doc.contains("Dialogue: 0,0:00:02.30,"), "clipB caption after main's slot:\n{ass_doc}");
+
+        let compile_inputs = vec![
+            SourceInput { path: src.clone(), probe: probe.clone(), is_image: false },
+            SourceInput { path: clip_b.clone(), probe: clip_b_probe, is_image: false },
+        ];
+        let compile_out = dir.join("compiled.mp4");
+        let compile_args = build_render_args(
+            &compile_inputs,
+            &compile_plan,
+            font_path().unwrap(),
+            &[],
+            Some(&compile_ass),
+            None,
+            VideoEncoder::Libx264,
+            &compile_out,
+        )
+        .unwrap();
+        let compile_result = Command::new(ffmpeg_path().unwrap()).args(&compile_args).output().unwrap();
+        assert!(
+            compile_result.status.success(),
+            "compile-style captioned two-source render failed:\n{}",
+            String::from_utf8_lossy(&compile_result.stderr)
+        );
+        let compile_probe = probe_video(&compile_out).unwrap();
+        assert!((compile_probe.duration_s - 4.0).abs() < 0.4, "expected ~4s, got {}", compile_probe.duration_s);
+        assert!(compile_probe.has_audio);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3675,12 +4185,229 @@ mod tests {
     #[test]
     fn shorts_cancel_flag_roundtrips() {
         let job = "test-shorts-cancel-job";
-        clear_shorts_cancel(job);
-        assert!(!is_shorts_cancelled(job));
+        clear_pipeline_cancel(job);
+        assert!(!is_pipeline_cancelled(job));
         // request_cancel_shorts sets the flag (and would kill any active sub-render — none here).
         request_cancel_shorts(job);
-        assert!(is_shorts_cancelled(job));
-        clear_shorts_cancel(job);
-        assert!(!is_shorts_cancelled(job), "flag cleared for reuse");
+        assert!(is_pipeline_cancelled(job));
+        clear_pipeline_cancel(job);
+        assert!(!is_pipeline_cancelled(job), "flag cleared for reuse");
+    }
+
+    #[test]
+    fn compile_cancel_flag_roundtrips() {
+        let job = "test-compile-cancel-job";
+        clear_pipeline_cancel(job);
+        assert!(!is_pipeline_cancelled(job));
+        // request_cancel_compile flags the job (and would kill the active render — none here).
+        request_cancel_compile(job);
+        assert!(is_pipeline_cancelled(job));
+        clear_pipeline_cancel(job);
+        assert!(!is_pipeline_cancelled(job), "flag cleared for reuse");
+    }
+
+    // ---- cross-source captions ----
+
+    /// Output order: MAIN[src 0..3] then clipB[src 0..2]. Pre-speed offsets: main→0, clipB→3.
+    fn two_source_segments() -> Vec<Segment> {
+        vec![
+            Segment::keep(0.0, 3.0),
+            Segment { start: 0.0, end: 2.0, source: Some("clipB.mp4".into()) },
+        ]
+    }
+
+    #[test]
+    fn map_interval_source_aware_offsets() {
+        let segs = two_source_segments();
+        // A MAIN word (source None) at 1.0–1.5 → output 1.0–1.5, in segment 0.
+        let (s, e, i) = map_interval_to_output_for_source(1.0, 1.5, &None, &segs, 1.0).unwrap();
+        assert_eq!(i, 0);
+        assert!((s - 1.0).abs() < 1e-9 && (e - 1.5).abs() < 1e-9);
+        // A clipB word at clipB-time 0.5–1.0 → output 3.5–4.0 (offset 3 + 0.5..1.0), in segment 1.
+        let bsrc = Some("clipB.mp4".to_string());
+        let (s, e, i) = map_interval_to_output_for_source(0.5, 1.0, &bsrc, &segs, 1.0).unwrap();
+        assert_eq!(i, 1);
+        assert!((s - 3.5).abs() < 1e-9, "clipB start after main's 3s, got {s}");
+        assert!((e - 4.0).abs() < 1e-9, "got {e}");
+    }
+
+    #[test]
+    fn map_interval_source_no_leak() {
+        let segs = two_source_segments();
+        let bsrc = Some("clipB.mp4".to_string());
+        // A clipB word at the SAME source time as a valid main word (2.5) does NOT get captured by
+        // main's segment — only clipB's segments are considered, and 2.5 is outside clipB's 0..2 →
+        // dropped entirely rather than leaking into the main slot.
+        assert!(map_interval_to_output_for_source(2.5, 2.8, &bsrc, &segs, 1.0).is_none());
+        // The same source time for a MAIN word maps into the main segment (output 2.5).
+        let (s, _e, i) = map_interval_to_output_for_source(2.5, 2.8, &None, &segs, 1.0).unwrap();
+        assert_eq!(i, 0);
+        assert!((s - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_ass_multi_places_each_source_in_its_slot() {
+        let probe = probe_16x9();
+        let plan = EditPlan { segments: two_source_segments(), captions: true, ..Default::default() };
+        let mut tmap = TranscriptMap::default();
+        tmap.insert(None, Transcript {
+            text: "alpha beta".into(),
+            segments: vec![TranscriptSegment { start: 0.0, end: 3.0, text: "alpha beta".into() }],
+            words: vec![
+                TranscriptWord { start: 0.5, end: 1.0, word: "alpha".into() },
+                TranscriptWord { start: 1.0, end: 1.5, word: "beta".into() },
+            ],
+        });
+        tmap.insert(Some("clipB.mp4"), Transcript {
+            text: "gamma delta".into(),
+            segments: vec![TranscriptSegment { start: 0.0, end: 2.0, text: "gamma delta".into() }],
+            words: vec![
+                TranscriptWord { start: 0.2, end: 0.6, word: "gamma".into() },
+                TranscriptWord { start: 0.6, end: 1.0, word: "delta".into() },
+            ],
+        });
+        let doc = build_ass_multi(&tmap, &plan, &probe);
+        assert!(doc.contains("alpha beta"), "main line:\n{doc}");
+        assert!(doc.contains("gamma delta"), "clipB line:\n{doc}");
+        // Main line starts at output 0.5; clipB line at output 3.2 (offset 3 + 0.2).
+        assert!(doc.contains("Dialogue: 0,0:00:00.50,"), "main line at 0.5:\n{doc}");
+        assert!(doc.contains("Dialogue: 0,0:00:03.20,"), "clipB line at 3.2:\n{doc}");
+    }
+
+    #[test]
+    fn build_subtitles_multi_with_speed() {
+        let probe = probe_16x9();
+        // 2x speed halves output times.
+        let plan = EditPlan { segments: two_source_segments(), speed: Some(2.0), ..Default::default() };
+        let mut tmap = TranscriptMap::default();
+        tmap.insert(None, Transcript {
+            text: "hi".into(),
+            segments: vec![TranscriptSegment { start: 0.0, end: 3.0, text: "hi".into() }],
+            words: vec![TranscriptWord { start: 0.5, end: 1.0, word: "hi".into() }],
+        });
+        tmap.insert(Some("clipB.mp4"), Transcript {
+            text: "yo".into(),
+            segments: vec![TranscriptSegment { start: 0.0, end: 2.0, text: "yo".into() }],
+            words: vec![TranscriptWord { start: 0.2, end: 0.6, word: "yo".into() }],
+        });
+        let srt = build_subtitles_multi(&tmap, "srt", Some(&plan), &probe);
+        // clipB word at 0.2 → (offset 3 + 0.2)/2 = 1.6s.
+        assert!(srt.contains("00:00:01,600 --> "), "clipB at out 1.6s under 2x:\n{srt}");
+        // main word at 0.5 → 0.25s.
+        assert!(srt.contains("00:00:00,250 --> "), "main at out 0.25s under 2x:\n{srt}");
+    }
+
+    #[test]
+    fn source_without_transcript_is_caption_less() {
+        let probe = probe_16x9();
+        let plan = EditPlan { segments: two_source_segments(), captions: true, ..Default::default() };
+        let mut tmap = TranscriptMap::default();
+        // Only MAIN has a transcript; clipB has none → clipB contributes no caption lines.
+        tmap.insert(None, transcript_fixture());
+        let doc = build_ass_multi(&tmap, &plan, &probe);
+        // Main words inside the kept 0..3 segment are captioned…
+        assert!(doc.contains("one two three"), "kept main words:\n{doc}");
+        // …but words outside it (four/five/six at src 4..5.5) are dropped, and there is nothing
+        // in clipB's slot (no transcript). No dialogue line starts at/after output 3.0s.
+        assert!(!doc.contains("four five six"), "words outside the kept main segment are dropped");
+        assert!(!doc.contains("Dialogue: 0,0:00:03"), "no clipB captions without a clipB transcript:\n{doc}");
+    }
+
+    #[test]
+    fn all_sourced_plan_captions_map_fine() {
+        // Every segment is an insert (zero `source: None`). The MAIN input is only a normalization
+        // reference; captions still map correctly for each insert source.
+        let probe = probe_16x9();
+        let segs = vec![
+            Segment { start: 0.0, end: 2.0, source: Some("a.mp4".into()) },
+            Segment { start: 0.0, end: 2.0, source: Some("b.mp4".into()) },
+        ];
+        let plan = EditPlan { segments: segs, captions: true, ..Default::default() };
+        let mut tmap = TranscriptMap::default();
+        tmap.insert(Some("a.mp4"), Transcript {
+            text: "aye".into(),
+            segments: vec![TranscriptSegment { start: 0.0, end: 2.0, text: "aye".into() }],
+            words: vec![TranscriptWord { start: 0.5, end: 1.0, word: "aye".into() }],
+        });
+        tmap.insert(Some("b.mp4"), Transcript {
+            text: "bee".into(),
+            segments: vec![TranscriptSegment { start: 0.0, end: 2.0, text: "bee".into() }],
+            words: vec![TranscriptWord { start: 0.5, end: 1.0, word: "bee".into() }],
+        });
+        let doc = build_ass_multi(&tmap, &plan, &probe);
+        assert!(doc.contains("aye") && doc.contains("bee"));
+        // a.mp4 word at 0.5 → out 0.5; b.mp4 word at 0.5 → offset 2 + 0.5 = 2.5.
+        assert!(doc.contains("Dialogue: 0,0:00:00.50,"), "a at 0.5:\n{doc}");
+        assert!(doc.contains("Dialogue: 0,0:00:02.50,"), "b at 2.5:\n{doc}");
+    }
+
+    // ---- compilation planner sanitizer ----
+
+    #[test]
+    fn sanitize_compilation_spec_valid_preserves_order() {
+        let clips = vec![("a.mp4".to_string(), 30.0), ("b.mp4".to_string(), 40.0)];
+        let spec = CompilationSpec {
+            title: "  My Reel  ".into(),
+            mode_detected: "MONTAGE".into(),
+            notes: "n".into(),
+            segments: vec![
+                Segment { start: 1.0, end: 6.0, source: Some("a.mp4".into()) },
+                Segment { start: 2.0, end: 9.0, source: Some("b.mp4".into()) },
+            ],
+        };
+        let out = sanitize_compilation_spec(spec, &clips, Some(12.0)).unwrap();
+        assert_eq!(out.title, "My Reel");
+        assert_eq!(out.mode_detected, "montage");
+        assert_eq!(out.segments.len(), 2);
+        // Order is NOT sorted — flow order the model chose is preserved.
+        assert_eq!(out.segments[0].source.as_deref(), Some("a.mp4"));
+        assert_eq!(out.segments[1].source.as_deref(), Some("b.mp4"));
+    }
+
+    #[test]
+    fn sanitize_compilation_spec_drops_unknown_tiny_and_clamps() {
+        let clips = vec![("a.mp4".to_string(), 10.0)];
+        let spec = CompilationSpec {
+            segments: vec![
+                Segment { start: 0.0, end: 0.2, source: Some("a.mp4".into()) },  // <0.5s → drop
+                Segment { start: 5.0, end: 99.0, source: Some("a.mp4".into()) }, // clamp end to 10
+                Segment { start: 1.0, end: 4.0, source: Some("ghost.mp4".into()) }, // unknown → drop
+                Segment { start: 1.0, end: 4.0, source: None },                 // no source → drop
+            ],
+            ..Default::default()
+        };
+        let out = sanitize_compilation_spec(spec, &clips, None).unwrap();
+        assert_eq!(out.segments.len(), 1);
+        assert_eq!(out.segments[0].source.as_deref(), Some("a.mp4"));
+        assert!((out.segments[0].end - 10.0).abs() < 1e-9, "end clamped to clip duration");
+        assert_eq!(out.mode_detected, "montage"); // default when model gave nothing
+        assert_eq!(out.title, "Compilation"); // default when blank
+    }
+
+    #[test]
+    fn sanitize_compilation_spec_rejects_out_of_window_total() {
+        let clips = vec![("a.mp4".to_string(), 100.0)];
+        let spec = CompilationSpec {
+            segments: vec![Segment { start: 0.0, end: 5.0, source: Some("a.mp4".into()) }],
+            ..Default::default()
+        };
+        // Target 60 → window 30–120s; a 5s total is below → rejected (triggers a re-prompt upstream).
+        assert!(sanitize_compilation_spec(spec, &clips, Some(60.0)).is_err());
+    }
+
+    #[test]
+    fn sanitize_compilation_spec_empty_errs_and_takes_normalizes() {
+        let clips = vec![("a.mp4".to_string(), 10.0)];
+        // All segments dropped ⇒ error.
+        let empty = CompilationSpec { segments: vec![], ..Default::default() };
+        assert!(sanitize_compilation_spec(empty, &clips, None).is_err());
+        // "Takes" (any case / synonym) normalizes to "takes".
+        let spec = CompilationSpec {
+            mode_detected: "Takes".into(),
+            segments: vec![Segment { start: 0.0, end: 5.0, source: Some("a.mp4".into()) }],
+            ..Default::default()
+        };
+        let out = sanitize_compilation_spec(spec, &clips, None).unwrap();
+        assert_eq!(out.mode_detected, "takes");
     }
 }

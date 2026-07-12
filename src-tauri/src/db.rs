@@ -472,6 +472,12 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             "image",
         ),
         (
+            "compile_videos",
+            "Compile Videos",
+            "Combine several clips into one video, keeping the good parts (best takes or a montage).",
+            "image",
+        ),
+        (
             "search_places",
             "Search Places",
             "Find places, businesses, and points of interest.",

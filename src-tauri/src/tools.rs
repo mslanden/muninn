@@ -2496,12 +2496,13 @@ pub(crate) async fn execute_agent_tool(
             let job_id = format!("agent-{session_id}");
             let app_clone = app.clone();
             let out = tauri::async_runtime::spawn_blocking(move || {
+                let transcripts = crate::video::TranscriptMap::from_single(transcript.as_ref());
                 crate::video::render_edit(
                     &app_clone,
                     &job_id,
                     &resolved,
                     &plan,
-                    transcript.as_ref(),
+                    &transcripts,
                     &out_dir,
                     prefer_hw_encode,
                 )
@@ -2548,6 +2549,55 @@ pub(crate) async fn execute_agent_tool(
                 out.push_str(&format!("- \"{}\" ({:.0}s) → {}\n", r.title, r.duration_s, r.path));
             }
             Ok(out.trim_end().to_string())
+        }
+        "compile_videos" => {
+            let raw_paths = arguments
+                .get("paths")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "missing paths (an array of 2–10 clip paths)".to_string())?;
+            if raw_paths.len() < 2 {
+                return Err("compile_videos needs at least 2 clips".to_string());
+            }
+            if raw_paths.len() > 10 {
+                return Err("compile_videos takes at most 10 clips".to_string());
+            }
+            // SAFETY BOUNDARY: every clip path an agent supplies is arbitrary, so EACH one MUST be
+            // resolved through the workspace scope (rejecting escapes) and rewritten to its
+            // canonical in-workspace path before it ever reaches the compile pipeline / renderer.
+            let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(raw_paths.len());
+            for p in raw_paths {
+                let p = p.as_str().ok_or_else(|| "each entry in paths must be a string".to_string())?;
+                let resolved =
+                    resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, p, false)?;
+                paths.push(resolved);
+            }
+            let brief = arguments.get("brief").and_then(Value::as_str);
+            let mode = arguments.get("mode").and_then(Value::as_str).unwrap_or("auto");
+            let target_duration_s = arguments.get("target_duration_s").and_then(Value::as_f64);
+            // Background/scheduled runs must work: this pipeline never calls ask_user — it only
+            // transcribes, plans, and renders, so it's safe unattended. Job id is per session.
+            let job_id = format!("agent-compile-{session_id}");
+            let result = crate::video::run_compile_pipeline(
+                app,
+                state,
+                &paths,
+                brief,
+                mode,
+                target_duration_s,
+                true,  // captions on by default
+                false, // keep the polish pass
+                &job_id,
+            )
+            .await?;
+            Ok(format!(
+                "Compiled {} clips into \"{}\" ({} mode, {:.0}s) → {}\n{}",
+                paths.len(),
+                result.title,
+                result.mode_detected,
+                result.duration_s,
+                result.path,
+                result.notes
+            ))
         }
         "search_places" => {
             let query = arguments

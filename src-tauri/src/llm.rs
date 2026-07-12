@@ -1666,6 +1666,183 @@ pub(crate) async fn generate_shorts_specs(
     Err(format!("Could not get a usable set of shorts from the model: {last_err}"))
 }
 
+/// Parse a compilation-spec JSON object from the model's reply (tolerating code fences and a
+/// little surrounding prose). Accepts either a bare object or one wrapped under a common key.
+fn parse_compilation_spec(text: &str) -> Result<crate::video::CompilationSpec, String> {
+    if let Some(obj) = extract_json_object(text) {
+        for key in ["compilation", "spec", "result", "plan"] {
+            if let Some(inner) = obj.get(key) {
+                if inner.is_object() {
+                    return serde_json::from_value(inner.clone())
+                        .map_err(|e| format!("compilation had the wrong shape: {e}"));
+                }
+            }
+        }
+        if obj.get("segments").is_some() {
+            return serde_json::from_value(obj).map_err(|e| format!("compilation had the wrong shape: {e}"));
+        }
+    }
+    Err(format!("could not parse compilation JSON. Model said:\n{}", text.trim()))
+}
+
+/// Plan a multi-clip compilation: pick which parts of which clips to keep and in what order,
+/// detecting retakes ("takes" — same content re-recorded, keep the best take per section) vs a
+/// montage ("montage" — distinct moments across clips, ordered for flow).
+///
+/// Feeds the LLM each clip numbered with its duration, segment-level transcript (budgeted so
+/// several long clips still fit the context), and filler/silence stats. `mode` is "auto"
+/// (detect + report in `mode_detected`), "takes", or "montage". Validates hard via
+/// `sanitize_compilation_spec` and re-prompts once with the validation error before giving up.
+pub(crate) async fn generate_compilation_specs(
+    state: &AppState,
+    clips: &[crate::video::ClipInfo],
+    brief: Option<&str>,
+    mode: &str,
+    target_duration_s: Option<f64>,
+) -> Result<crate::video::CompilationSpec, String> {
+    if clips.len() < 2 {
+        return Err("compilation needs at least 2 clips".to_string());
+    }
+    let mode = match mode.trim().to_lowercase().as_str() {
+        "takes" => "takes",
+        "montage" => "montage",
+        _ => "auto",
+    };
+    let target_s = target_duration_s.filter(|t| *t > 0.0);
+    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+
+    let clip_durations: Vec<(String, f64)> =
+        clips.iter().map(|c| (c.path.clone(), c.duration_s)).collect();
+
+    // Numbered clips: each with duration + filler/silence stats + its segment-level transcript,
+    // sharing a global char budget so a set of long clips still fits the context.
+    let mut clip_block = String::new();
+    let mut budget = 0usize;
+    let mut truncated = false;
+    for (i, c) in clips.iter().enumerate() {
+        let header = format!(
+            "\n=== Clip {n} — source: {src}\nduration: {dur:.1}s | fillers: {fill} | silence: {sil:.0}%\ntranscript (source seconds):\n",
+            n = i + 1,
+            src = c.path,
+            dur = c.duration_s,
+            fill = c.filler_count,
+            sil = c.silence_ratio * 100.0,
+        );
+        clip_block.push_str(&header);
+        if c.transcript_segments.is_empty() {
+            clip_block.push_str("(no transcript available for this clip — use its duration only)\n");
+            continue;
+        }
+        for seg in &c.transcript_segments {
+            let line = format!("[{:.1}-{:.1}] {}\n", seg.start, seg.end, seg.text.trim());
+            budget += line.len();
+            if budget > 48_000 {
+                clip_block.push_str("… (transcript truncated — plan from what's shown)\n");
+                truncated = true;
+                break;
+            }
+            clip_block.push_str(&line);
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    let brief_line = match brief.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => format!("\nUser brief (prioritize this): {b}\n"),
+        None => String::new(),
+    };
+    let target_line = match target_s {
+        Some(t) => format!(
+            "Target total duration ≈ {t:.0}s (the final compilation must be between {lo:.0}s and {hi:.0}s).\n",
+            t = t, lo = 0.5 * t, hi = 2.0 * t
+        ),
+        None => "No fixed target duration — keep it as long as the strong material warrants, no longer.\n".to_string(),
+    };
+    let mode_line = match mode {
+        "takes" => "MODE: takes. Treat the clips as retakes of the same material.\n".to_string(),
+        "montage" => "MODE: montage. Treat the clips as distinct content to weave together.\n".to_string(),
+        _ => "MODE: auto — YOU decide. If the clips heavily overlap in transcript (the same lines re-recorded), it's \"takes\"; if they cover distinct content, it's \"montage\". Report which in mode_detected.\n".to_string(),
+    };
+
+    let base_prompt = format!(
+        "You are an expert video editor assembling ONE finished video from {count} source clips.\n\
+        {mode_line}{target_line}{brief}\n\
+        The clips:\n{clips}\n\n\
+        How to choose:\n\
+        - TAKES: align the takes into sections (the same sentence/idea attempted more than once). For each \
+        section pick the SINGLE best take — complete sentences, fewest fillers/stutters, no long pauses. \
+        Assemble the chosen takes in natural narrative order. NEVER mix two takes mid-sentence.\n\
+        - MONTAGE: pick the strongest self-contained moments from across the clips honoring the brief and the \
+        target duration. Order them for flow — lead with the best hook.\n\
+        Universal rules:\n\
+        - Every segment MUST set \"source\" to one of the exact clip source paths shown above.\n\
+        - Segment start/end are SOURCE seconds within THAT clip ([0, its duration]). Snap to transcript \
+        segment boundaries; never start or end mid-sentence.\n\
+        - Segments play in the order you list them. Minimum 0.5s each; at most 100 segments.\n\n\
+        Return ONLY a JSON object of this shape:\n\
+        {{\"title\": \"≤80 char title\", \"mode_detected\": \"takes\" or \"montage\", \"notes\": \"1–2 sentences on what you kept and why\", \"segments\": [ {{\"source\": \"<exact clip path>\", \"start\": 3.0, \"end\": 12.5}} ]}}\n\
+        No markdown, no code fences, no commentary — the JSON object only.",
+        count = clips.len(),
+        mode_line = mode_line,
+        target_line = target_line,
+        brief = brief_line,
+        clips = clip_block,
+    );
+    let system = "You are a precise video editor. You reason about timestamps carefully and output strict JSON only.";
+
+    let mut attempt_prompt = base_prompt.clone();
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        let request_body = if is_anthropic {
+            json!({"model": model, "max_tokens": 4000, "stream": false, "system": system,
+                   "messages": [{"role": "user", "content": attempt_prompt}]})
+        } else {
+            json!({"model": model, "max_tokens": 4000, "stream": false,
+                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": attempt_prompt}]})
+        };
+        let resp = if is_anthropic {
+            state.http.post(&endpoint)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&request_body)
+                .send().await.map_err(|e| e.to_string())?
+        } else {
+            state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Compilation planning failed ({status}): {body}"));
+        }
+        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+        let text = if is_anthropic {
+            body.get("content").and_then(Value::as_array)
+                .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
+                .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
+        } else {
+            body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
+                .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
+        }
+        .unwrap_or_default();
+
+        match parse_compilation_spec(&text)
+            .and_then(|spec| crate::video::sanitize_compilation_spec(spec, &clip_durations, target_s))
+        {
+            Ok(spec) => return Ok(spec),
+            Err(e) => {
+                last_err = e;
+                if attempt == 0 {
+                    attempt_prompt = format!(
+                        "{base_prompt}\n\nYour previous answer was rejected: {last_err}\nReturn corrected JSON only."
+                    );
+                }
+            }
+        }
+    }
+    Err(format!("Could not get a usable compilation from the model: {last_err}"))
+}
+
 /// Backfill embeddings for entities that don't have one yet.
 /// Called once on startup to handle entities created before embeddings were added.
 pub(crate) async fn backfill_embeddings(state: &AppState) {
@@ -2471,6 +2648,26 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "brief": {"type": "string", "description": "Optional focus, e.g. 'focus on the pricing discussion' or 'pick the funniest moments'"}
                 },
                 "required": ["path"]
+            }),
+        ));
+    }
+    if enabled.contains("compile_videos") {
+        defs.push((
+            "compile_videos",
+            "Combine several video clips (2–10) into ONE finished video, keeping only the good parts, and render it into the Content library. Transcribes and analyzes every clip, then uses AI to either (retakes/\"takes\" mode) align re-recorded takes into sections and keep the single best take per section — cleanest delivery, fewest fillers/stutters, no long pauses — assembled in narrative order, or (\"montage\" mode) pick the strongest self-contained moments across the clips and order them for flow. Pass mode=\"auto\" (default) to let it detect retakes vs montage. Great for scheduled/background tasks that assemble a polished cut from raw takes or daily clips — it never prompts, so it works unattended. Returns the title, detected mode, and output path.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "2–10 clip file paths within the workspace, in any order (the planner decides the final ordering)."
+                    },
+                    "brief": {"type": "string", "description": "Optional focus, e.g. 'keep the best explanation of pricing' or 'make an upbeat highlight reel'."},
+                    "mode": {"type": "string", "enum": ["auto", "takes", "montage"], "description": "auto (detect retakes vs montage — default), takes (retakes of the same material — keep the best take per section), or montage (distinct moments woven together)."},
+                    "target_duration_s": {"type": "number", "description": "Optional target total duration in seconds. Mostly useful for montage mode."}
+                },
+                "required": ["paths"]
             }),
         ));
     }

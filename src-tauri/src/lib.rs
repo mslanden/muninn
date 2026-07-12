@@ -391,6 +391,8 @@ pub fn run() {
             commands::video_render,
             commands::video_generate_shorts,
             commands::video_cancel_shorts,
+            commands::video_compile,
+            commands::video_cancel_compile,
             commands::video_export_subtitles,
             commands::video_cancel_render,
             commands::video_save_plan,

@@ -183,7 +183,8 @@ pub async fn video_render(
     let out_dir = crate::tools::content_dir(&app)?;
     let app_clone = app.clone();
     let out = tauri::async_runtime::spawn_blocking(move || {
-        video::render_edit(&app_clone, &req.job_id, &src, &req.plan, transcript.as_ref(), &out_dir, prefer_hw_encode)
+        let transcripts = video::TranscriptMap::from_single(transcript.as_ref());
+        video::render_edit(&app_clone, &req.job_id, &src, &req.plan, &transcripts, &out_dir, prefer_hw_encode)
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -287,6 +288,61 @@ pub async fn video_generate_shorts(
 #[tauri::command]
 pub fn video_cancel_shorts(job_id: String) -> bool {
     video::request_cancel_shorts(&job_id)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoCompileRequest {
+    /// 2–10 clip paths to combine, in whatever order (the planner decides final ordering).
+    pub paths: Vec<String>,
+    /// Optional focus, e.g. "keep it upbeat" or "focus on the demo".
+    pub brief: Option<String>,
+    /// "auto" (detect retakes vs montage — default), "takes", or "montage".
+    pub mode: Option<String>,
+    /// Optional target total duration (seconds).
+    pub target_duration_s: Option<f64>,
+    /// Burn karaoke captions into the compilation (default true).
+    pub captions: Option<bool>,
+    /// Skip the normalize-audio + fade polish pass.
+    pub skip_polish: Option<bool>,
+    /// Correlates `compile-progress` + `video-render-progress` events and cancellation.
+    pub job_id: String,
+}
+
+/// Multi-clip compilation: transcribe + analyze several clips, have the LLM keep the good parts
+/// (best take per section for retakes, strongest moments for a montage), and render ONE stitched
+/// video into the Content library. Long-running; emits `compile-progress` for the pipeline stage
+/// and `video-render-progress` (keyed by `job_id`) for the render. Cancel with `video_cancel_compile`.
+#[tauri::command]
+pub async fn video_compile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: VideoCompileRequest,
+) -> Result<video::CompileResult, String> {
+    if req.paths.len() < 2 {
+        return Err("pick at least 2 clips to compile".to_string());
+    }
+    if req.paths.len() > 10 {
+        return Err("compilation takes at most 10 clips".to_string());
+    }
+    let paths: Vec<PathBuf> = req.paths.iter().map(PathBuf::from).collect();
+    video::run_compile_pipeline(
+        &app,
+        &state,
+        &paths,
+        req.brief.as_deref(),
+        req.mode.as_deref().unwrap_or("auto"),
+        req.target_duration_s,
+        req.captions.unwrap_or(true),
+        req.skip_polish.unwrap_or(false),
+        &req.job_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn video_cancel_compile(job_id: String) -> bool {
+    video::request_cancel_compile(&job_id)
 }
 
 #[derive(Deserialize)]

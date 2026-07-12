@@ -543,6 +543,32 @@ function renderVideoSection(el, id) {
     </div>
     <div class="studio-shorts-out" data-vd-shorts-out="${id}"></div>
 
+    <h4 class="studio-h" style="margin-top:8px;">Compile clips</h4>
+    <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+      <button class="form-btn" data-vd-cm-add="${id}">Add clips…</button>
+      <span class="muted" data-vd-cm-hint="${id}" style="font-size:11px;"></span>
+    </div>
+    <div class="studio-compile-list" data-vd-cm-list="${id}"></div>
+    <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+      <select data-vd-cm-mode="${id}" style="width:auto;">
+        <option value="auto">Auto-detect</option>
+        <option value="takes">Best takes (same content)</option>
+        <option value="montage">Montage (different content)</option>
+      </select>
+      <input type="text" placeholder="e.g. 2-minute recap, prioritize the demo" data-vd-cm-brief="${id}" style="flex:1; min-width:160px;" />
+      <input type="number" min="1" step="1" placeholder="target secs" data-vd-cm-target="${id}" style="width:90px;" />
+      <label class="studio-chip"><input type="checkbox" data-vd-cm-captions="${id}" checked /> Captions</label>
+    </div>
+    <div class="form-row" style="gap:6px; align-items:center;">
+      <button class="form-btn" data-vd-cm-go="${id}" disabled title="Pick 2–10 clips to compile">Compile</button>
+      <button class="hint-chip" data-vd-cm-cancel="${id}" style="display:none;">Cancel</button>
+      <span class="muted" data-vd-cm-status="${id}" style="font-size:10px;"></span>
+    </div>
+    <div class="studio-progress" data-vd-cm-progwrap="${id}" style="display:none;">
+      <div class="studio-progress-bar" data-vd-cm-prog="${id}"></div>
+    </div>
+    <div class="studio-compile-out" data-vd-cm-out="${id}"></div>
+
     <h4 class="studio-h" style="margin-top:8px;">Edit</h4>
     <div class="form-row" style="gap:6px;">
       <textarea class="studio-topic" rows="2" style="flex:1;"
@@ -588,6 +614,19 @@ function renderVideoSection(el, id) {
   const shortsProgBar = el.querySelector(`[data-vd-shorts-prog="${id}"]`);
   const shortsStatusEl = el.querySelector(`[data-vd-shorts-status="${id}"]`);
   const shortsOutEl = el.querySelector(`[data-vd-shorts-out="${id}"]`);
+  const compileAddBtn = el.querySelector(`[data-vd-cm-add="${id}"]`);
+  const compileHintEl = el.querySelector(`[data-vd-cm-hint="${id}"]`);
+  const compileListEl = el.querySelector(`[data-vd-cm-list="${id}"]`);
+  const compileModeEl = el.querySelector(`[data-vd-cm-mode="${id}"]`);
+  const compileBriefEl = el.querySelector(`[data-vd-cm-brief="${id}"]`);
+  const compileTargetEl = el.querySelector(`[data-vd-cm-target="${id}"]`);
+  const compileCaptionsEl = el.querySelector(`[data-vd-cm-captions="${id}"]`);
+  const compileGoBtn = el.querySelector(`[data-vd-cm-go="${id}"]`);
+  const compileCancelBtn = el.querySelector(`[data-vd-cm-cancel="${id}"]`);
+  const compileStatusEl = el.querySelector(`[data-vd-cm-status="${id}"]`);
+  const compileProgWrap = el.querySelector(`[data-vd-cm-progwrap="${id}"]`);
+  const compileProgBar = el.querySelector(`[data-vd-cm-prog="${id}"]`);
+  const compileOutEl = el.querySelector(`[data-vd-cm-out="${id}"]`);
 
   let srcPath = null;
   let probe = null;
@@ -595,6 +634,9 @@ function renderVideoSection(el, id) {
   let thumbs = [];
   let currentJobId = null;
   let shortsJobId = null;
+  let compileJobId = null;
+  let compileClips = []; // [{ path, duration: null|number }] — duration fills in async via video_probe
+  let compileRunning = false;
   // Default shape for `plan` — used to reset on a new file pick, to apply an AI/saved plan
   // on top of, and to detect whether the user has made any edit yet (drives refinement mode
   // and the "restored previous edit" note). A fresh object each call so callers get their own
@@ -706,6 +748,11 @@ function renderVideoSection(el, id) {
     } else if (shortsJobId && typeof p.job_id === "string" && p.job_id.startsWith(`${shortsJobId}-`)) {
       // Per-short sub-render (job id `{shortsJobId}-{n}`) drives the shorts progress bar.
       shortsProgBar.style.width = `${Math.max(1, p.pct || 0)}%`;
+    } else if (compileJobId && p.job_id === compileJobId) {
+      // The single stitched render is keyed by the compile job id itself.
+      compileProgWrap.style.display = "";
+      compileProgBar.style.width = `${Math.max(1, p.pct || 0)}%`;
+      compileStatusEl.textContent = `Rendering… ${Math.floor(p.pct || 0)}%`;
     }
   });
   const shortsProgUn = listen("shorts-progress", (e) => {
@@ -723,18 +770,28 @@ function renderVideoSection(el, id) {
       shortsProgWrap.style.display = "none";
     }
   });
-  videoUnlisteners.set(id, [renderProgUn, shortsProgUn]);
+  const compileProgUn = listen("compile-progress", (e) => {
+    const p = e.payload || {};
+    if (!compileJobId || p.job_id !== compileJobId) return;
+    if (p.stage === "transcribing") {
+      compileStatusEl.textContent = `Transcribing clip ${p.current}/${p.total}…`;
+    } else if (p.stage === "planning") {
+      compileStatusEl.textContent = "Picking the best parts…";
+    } else if (p.stage === "rendering") {
+      compileStatusEl.textContent = "Rendering…";
+      compileProgWrap.style.display = "";
+      compileProgBar.style.width = "1%";
+    } else if (p.stage === "done") {
+      compileProgWrap.style.display = "none";
+    }
+  });
+  videoUnlisteners.set(id, [renderProgUn, shortsProgUn, compileProgUn]);
 
-  pickBtn.addEventListener("click", async () => {
-    let selected;
-    try {
-      selected = await openDialog({
-        multiple: false,
-        filters: [{ name: "Video", extensions: ["mp4", "mov", "m4v", "avi", "mkv", "webm"] }],
-      });
-    } catch (e) { logError("video pick", e); return; }
-    if (!selected) return;
-    srcPath = typeof selected === "string" ? selected : selected.path;
+  // Load a video file into the editor (probe, thumbnails, restore a saved plan) — the single
+  // path both the main "Choose video…" picker and the compile result's "Open in editor" use, so
+  // they can never drift apart.
+  async function loadVideoFile(path) {
+    srcPath = path;
     probe = null;
     analysis = null;
     thumbs = [];
@@ -783,6 +840,18 @@ function renderVideoSection(el, id) {
       infoEl.textContent = String(e);
       srcPath = null;
     }
+  }
+
+  pickBtn.addEventListener("click", async () => {
+    let selected;
+    try {
+      selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "Video", extensions: ["mp4", "mov", "m4v", "avi", "mkv", "webm"] }],
+      });
+    } catch (e) { logError("video pick", e); return; }
+    if (!selected) return;
+    await loadVideoFile(typeof selected === "string" ? selected : selected.path);
   });
 
   analyzeBtn.addEventListener("click", async () => {
@@ -1185,6 +1254,139 @@ function renderVideoSection(el, id) {
     if (!shortsJobId) return;
     try { await invoke("video_cancel_shorts", { jobId: shortsJobId }); } catch {}
     shortsStatusEl.textContent = "Cancelling…";
+  });
+
+  // ---- Compile clips: combine 2–10 clips into one stitched video ----
+
+  // Fire-and-forget duration lookup for a newly added clip; mutates the entry in place and
+  // redraws once it resolves so the list shows "…" until then.
+  function probeClipDuration(entry) {
+    invoke("video_probe", { path: entry.path }).then(p => {
+      entry.duration = p && typeof p.duration_s === "number" ? p.duration_s : null;
+      drawCompileList();
+    }).catch(() => { entry.duration = null; drawCompileList(); });
+  }
+
+  function drawCompileList() {
+    const n = compileClips.length;
+    compileHintEl.textContent = n
+      ? `${n} clip${n === 1 ? "" : "s"} selected (2–10) — output resolution follows "${escapeHtml(compileClips[0].path.split("/").pop())}"`
+      : "Pick 2–10 clips to combine.";
+    compileAddBtn.disabled = compileRunning || n >= 10;
+    compileGoBtn.disabled = compileRunning || n < 2 || n > 10;
+    compileListEl.innerHTML = compileClips.map((c, i) => `
+      <div class="studio-compile-item">
+        <span class="studio-compile-idx">${i + 1}</span>
+        <span class="studio-compile-name" title="${escapeHtml(c.path)}">${escapeHtml(c.path.split("/").pop())}</span>
+        <span class="muted studio-compile-dur">${c.duration == null ? "…" : `${fmtT(c.duration)}s`}</span>
+        <button data-vd-cm-up="${i}" ${i === 0 || compileRunning ? "disabled" : ""} title="Move up">↑</button>
+        <button data-vd-cm-down="${i}" ${i === compileClips.length - 1 || compileRunning ? "disabled" : ""} title="Move down">↓</button>
+        <button data-vd-cm-rm="${i}" ${compileRunning ? "disabled" : ""} title="Remove">×</button>
+      </div>
+    `).join("");
+    compileListEl.querySelectorAll("[data-vd-cm-up]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const i = parseInt(btn.dataset.vdCmUp, 10);
+        if (i > 0) { [compileClips[i - 1], compileClips[i]] = [compileClips[i], compileClips[i - 1]]; drawCompileList(); }
+      });
+    });
+    compileListEl.querySelectorAll("[data-vd-cm-down]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const i = parseInt(btn.dataset.vdCmDown, 10);
+        if (i < compileClips.length - 1) { [compileClips[i + 1], compileClips[i]] = [compileClips[i], compileClips[i + 1]]; drawCompileList(); }
+      });
+    });
+    compileListEl.querySelectorAll("[data-vd-cm-rm]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        compileClips.splice(parseInt(btn.dataset.vdCmRm, 10), 1);
+        drawCompileList();
+      });
+    });
+  }
+  drawCompileList();
+
+  compileAddBtn.addEventListener("click", async () => {
+    let selected;
+    try {
+      selected = await openDialog({
+        multiple: true,
+        filters: [{ name: "Video", extensions: ["mp4", "mov", "m4v", "avi", "mkv", "webm"] }],
+      });
+    } catch (e) { logError("compile clips pick", e); return; }
+    if (!selected) return;
+    const paths = Array.isArray(selected)
+      ? selected.map(s => typeof s === "string" ? s : s.path)
+      : [typeof selected === "string" ? selected : selected.path];
+    const room = Math.max(0, 10 - compileClips.length);
+    const toAdd = paths.slice(0, room);
+    for (const p of toAdd) {
+      const entry = { path: p, duration: null };
+      compileClips.push(entry);
+      probeClipDuration(entry);
+    }
+    compileStatusEl.textContent = paths.length > toAdd.length ? "Only added up to the 10-clip max." : "";
+    drawCompileList();
+  });
+
+  function renderCompileResult(r) {
+    const modeLabel = r.mode_detected === "takes" ? "best takes" : "montage";
+    compileOutEl.innerHTML = `
+      <div class="studio-compile-result">
+        <div class="studio-compile-result-meta">
+          <strong>${escapeHtml(r.title)}</strong>
+          <span class="studio-compile-badge">${escapeHtml(modeLabel)}</span>
+          <span class="muted" style="font-size:10px;"> · ${fmtT(r.duration_s)}s</span>
+        </div>
+        ${r.notes ? `<div class="muted" style="font-size:10px;">${escapeHtml(r.notes)}</div>` : ""}
+        <video controls preload="none" src="${convertFileSrc(r.path)}" class="studio-video-preview"></video>
+        <div class="studio-actions" style="margin-top:4px;">
+          <button class="hint-chip" data-vd-cm-open>Open in editor</button>
+        </div>
+      </div>
+    `;
+    compileOutEl.querySelector("[data-vd-cm-open]").addEventListener("click", () => { loadVideoFile(r.path); });
+  }
+
+  compileGoBtn.addEventListener("click", async () => {
+    if (compileClips.length < 2 || compileClips.length > 10) return;
+    compileJobId = `studio-compile-${id}-${Date.now()}`;
+    compileRunning = true;
+    compileCancelBtn.style.display = "";
+    compileOutEl.innerHTML = "";
+    compileStatusEl.textContent = "Starting…";
+    compileProgWrap.style.display = "none";
+    compileProgBar.style.width = "0%";
+    drawCompileList();
+    const target = parseFloat(compileTargetEl.value);
+    try {
+      const result = await invoke("video_compile", {
+        req: {
+          paths: compileClips.map(c => c.path),
+          brief: compileBriefEl.value.trim() || null,
+          mode: compileModeEl.value,
+          targetDurationS: isNaN(target) || target <= 0 ? null : target,
+          captions: compileCaptionsEl.checked,
+          jobId: compileJobId,
+        },
+      });
+      compileStatusEl.textContent = "Done — saved to Content ✓";
+      renderCompileResult(result);
+    } catch (e) {
+      logError("video_compile", e);
+      compileStatusEl.textContent = String(e);
+    } finally {
+      compileRunning = false;
+      compileJobId = null;
+      compileCancelBtn.style.display = "none";
+      compileProgWrap.style.display = "none";
+      drawCompileList();
+    }
+  });
+
+  compileCancelBtn.addEventListener("click", async () => {
+    if (!compileJobId) return;
+    try { await invoke("video_cancel_compile", { jobId: compileJobId }); } catch {}
+    compileStatusEl.textContent = "Cancelling…";
   });
 }
 
