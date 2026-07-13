@@ -352,7 +352,8 @@ async fn dispatch_chat_turn(
     scope: Option<&WorkspaceScope>,
 ) -> Result<(String, Vec<serde_json::Value>), String> {
     if let Some(agent_id) = agent_id {
-        run_agent(app, state, session_id, agent_id, history).await
+        // Chat-invoked agents keep the pre-existing behavior: unscoped, interactive.
+        run_agent(app, state, session_id, agent_id, history, None, true).await
     } else if provider == "minimax" || model.starts_with("MiniMax-") {
         // MiniMax fast path — unchanged.
         chat_with_minimax_anthropic(app, state, session_id, model, history, scope, true).await

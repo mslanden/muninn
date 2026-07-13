@@ -2046,7 +2046,7 @@ error, tell the user to grant Automation access in System Settings.",
     // Tasks need more context than a single bullet — append a dedicated section
     // whenever any task tool is enabled. Keep this in sync with
     // build_project_system_prompt.
-    let any_task_tool = ["create_task", "list_tasks", "update_task", "delete_task"]
+    let any_task_tool = ["create_task", "list_tasks", "update_task", "delete_task", "run_task"]
         .iter()
         .any(|t| enabled.contains(*t));
     if any_task_tool {
@@ -2063,7 +2063,15 @@ Tasks are automations, not to-dos. Don't create one for \"remind me to call mom\
 handle on its own — daily digests, periodic checks, cron-style jobs. Schedule \
 strings: 'every 30m', 'daily at 09:00', 'every monday at 10:00', 'hourly'; \
 omit schedule for a one-shot delayed run. Call list_tasks before edit/delete \
-to get the id.",
+to get the id.\n\n\
+run_task fires a task immediately, regardless of its schedule. A task with no \
+schedule and no next_run is manual/chain-only: it never fires on its own — it \
+runs only via run_task or when chained from another task's chain_next. A failed \
+one-shot (errored run with no schedule to rejoin) gets status 'failed'; re-fire \
+it with run_task after fixing the cause.\n\n\
+Set `project_path` (an existing absolute folder) on a task to scope its run's \
+file/shell tools to that project; without it the task runs in the default \
+workspace root.",
         );
     }
 
@@ -2354,7 +2362,7 @@ call may trigger a macOS Automation prompt.",
     }
 
     // Keep this block in sync with build_system_prompt_with_context.
-    let any_task_tool = ["create_task", "list_tasks", "update_task", "delete_task"]
+    let any_task_tool = ["create_task", "list_tasks", "update_task", "delete_task", "run_task"]
         .iter()
         .any(|t| enabled.contains(*t));
     if any_task_tool {
@@ -2371,7 +2379,15 @@ Tasks are automations, not to-dos. Don't create one for \"remind me to call mom\
 handle on its own — daily digests, periodic checks, cron-style jobs. Schedule \
 strings: 'every 30m', 'daily at 09:00', 'every monday at 10:00', 'hourly'; \
 omit schedule for a one-shot delayed run. Call list_tasks before edit/delete \
-to get the id.",
+to get the id.\n\n\
+run_task fires a task immediately, regardless of its schedule. A task with no \
+schedule and no next_run is manual/chain-only: it never fires on its own — it \
+runs only via run_task or when chained from another task's chain_next. A failed \
+one-shot (errored run with no schedule to rejoin) gets status 'failed'; re-fire \
+it with run_task after fixing the cause.\n\n\
+Set `project_path` (an existing absolute folder) on a task to scope its run's \
+file/shell tools to that project; without it the task runs in the default \
+workspace root.",
         );
     }
 
@@ -2832,7 +2848,8 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "schedule": {"type": "string", "description": "Recurrence string: 'every 30m', 'daily at 09:00', 'every friday at 17:00', 'hourly'. Omit for a one-shot run."},
                     "next_run": {"type": "string", "description": "ISO timestamp for first run (YYYY-MM-DDTHH:MM:SS). Optional; computed from schedule if omitted."},
                     "chain_next": {"type": "array", "items": {"type": "integer"}, "description": "Optional task ids to run after this one finishes successfully. Each downstream task fires on the next scheduler tick with this task's full output prepended to its prompt. Build workflows by creating the downstream tasks first (no schedule), then referencing their ids here."},
-                    "conditions": {"type": "string", "description": "Optional natural-language gate. When this task is fired by an upstream task in a chain, it runs only if this condition holds for the upstream output — e.g. 'only if there are unread emails'. Ignored for the task's own scheduled runs."}
+                    "conditions": {"type": "string", "description": "Optional natural-language gate. When this task is fired by an upstream task in a chain, it runs only if this condition holds for the upstream output — e.g. 'only if there are unread emails'. Ignored for the task's own scheduled runs."},
+                    "project_path": {"type": "string", "description": "Optional absolute folder path; the task run's file/shell tools are scoped to this folder (its workspace). Must be an existing directory. Omit to run in the default workspace root."}
                 },
                 "required": ["name", "description"]
             }),
@@ -2841,11 +2858,11 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("list_tasks") {
         defs.push((
             "list_tasks",
-            "List tasks with id, name, description, schedule, next_run, status, and last result. Use before updating or deleting so you have the task id.",
+            "List tasks with id, name, description, schedule, next_run, status, and last result. Use before updating, deleting, or running so you have the task id.",
             json!({
                 "type": "object",
                 "properties": {
-                    "status": {"type": "string", "description": "Optional filter: scheduled, running, or completed"}
+                    "status": {"type": "string", "description": "Optional filter: scheduled, running, completed, paused, or failed"}
                 }
             }),
         ));
@@ -2864,7 +2881,8 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "next_run": {"type": "string"},
                     "chain_next": {"type": "array", "items": {"type": "integer"}, "description": "Task ids to run after this one succeeds (replaces the existing chain). Pass an empty array to clear."},
                     "conditions": {"type": "string", "description": "Natural-language gate for chain-triggered runs (replaces existing). Pass an empty string to clear."},
-                    "status": {"type": "string", "description": "scheduled, running, or completed"}
+                    "project_path": {"type": "string", "description": "Absolute folder path to scope the task run's file/shell tools to (must be an existing directory). Pass an empty string to clear (run in the default workspace root)."},
+                    "status": {"type": "string", "description": "scheduled, completed, or paused (running/failed are engine-managed and can't be set)"}
                 },
                 "required": ["id"]
             }),
@@ -2878,6 +2896,19 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                 "type": "object",
                 "properties": {
                     "id": {"type": "integer", "description": "Task id"}
+                },
+                "required": ["id"]
+            }),
+        ));
+    }
+    if enabled.contains("run_task") {
+        defs.push((
+            "run_task",
+            "Fire a task immediately, regardless of its schedule. The run starts in the background and this call returns right away — it does NOT wait for the run to finish. Use to trigger a manual/chain-only task (no schedule) or to re-fire a 'failed' one-shot. Errors if the task doesn't exist or is already running.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "Task id (from list_tasks)"}
                 },
                 "required": ["id"]
             }),
@@ -3857,6 +3888,8 @@ pub(crate) async fn run_agent(
     session_id: &str,
     agent_id: &str,
     history: &[HistoryMessage],
+    scope: Option<&WorkspaceScope>,
+    interactive: bool,
 ) -> Result<(String, Vec<Value>), String> {
     let agent = load_agent_by_id(state, agent_id)?;
     if !agent.enabled {
@@ -3902,11 +3935,12 @@ pub(crate) async fn run_agent(
         Provider::from_provider_name(state, &provider_name)?
     };
 
-    // Custom agents are user-invoked via slash commands — always interactive, and not
-    // project-scoped (scope: None matches the previous per-provider agent runners).
+    // Chat-invoked agents pass scope: None, interactive: true (the previous hardcoded
+    // behavior). Scheduled task runs pass the task's workspace scope and
+    // interactive: false so dangerous commands are hard-blocked with no user to ask.
     run_tool_loop(
         app, state, session_id, &provider, &model, &agent_system,
-        history, &allowed_tools, None, true, Some(&agent.name),
+        history, &allowed_tools, scope, interactive, Some(&agent.name),
     )
     .await
 }

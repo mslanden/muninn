@@ -1,12 +1,24 @@
 //! Scheduled task CRUD; execution lives in scheduler.rs.
 
-use rusqlite::params;
-use tauri::State;
+use rusqlite::{params, OptionalExtension};
+use tauri::{Emitter, State};
 
 
 use crate::AppState;
 use crate::db::*;
 use crate::models::*;
+
+/// Statuses a user (or agent) may set directly. 'running' and 'failed' are
+/// engine-managed: 'running' is only set by the atomic claim in
+/// `scheduler::execute_task`, 'failed' only by an errored schedule-less run.
+pub(crate) fn validate_user_task_status(status: &str) -> Result<String, String> {
+    let normalized = status.trim().to_lowercase();
+    if ["scheduled", "completed", "paused"].contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err("status must be scheduled, completed, or paused (running/failed are engine-managed)".to_string())
+    }
+}
 
 #[tauri::command]
 pub fn get_tasks(state: State<AppState>) -> Result<Vec<TaskRecord>, String> {
@@ -17,6 +29,7 @@ pub fn get_tasks(state: State<AppState>) -> Result<Vec<TaskRecord>, String> {
                 SELECT id, name, description, schedule, schedule_config, next_run, status,
                        completed_at, result, run_count, triggered_by,
                        chain_next, conditions, condition_status,
+                       project_path, agent_id,
                        created_at, updated_at
                 FROM tasks
                 ORDER BY id DESC
@@ -40,8 +53,10 @@ pub fn get_tasks(state: State<AppState>) -> Result<Vec<TaskRecord>, String> {
                     chain_next: row.get(11)?,
                     conditions: row.get(12)?,
                     condition_status: row.get(13)?,
-                    created_at: row.get(14)?,
-                    updated_at: row.get(15)?,
+                    project_path: row.get(14)?,
+                    agent_id: row.get(15)?,
+                    created_at: row.get(16)?,
+                    updated_at: row.get(17)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -78,11 +93,14 @@ pub fn add_task(state: State<AppState>, req: TaskCreateRequest) -> Result<bool, 
         }
     }
 
+    let project_path = req.project_path.unwrap_or_default().trim().to_string();
+    let agent_id = req.agent_id.unwrap_or_default().trim().to_string();
+
     with_db(&state, |db| {
         db.execute(
             r#"
-            INSERT INTO tasks (name, description, schedule, schedule_config, next_run, chain_next, conditions, status, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'scheduled', CURRENT_TIMESTAMP)
+            INSERT INTO tasks (name, description, schedule, schedule_config, next_run, chain_next, conditions, project_path, agent_id, status, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'scheduled', CURRENT_TIMESTAMP)
             "#,
             params![
                 name,
@@ -91,7 +109,9 @@ pub fn add_task(state: State<AppState>, req: TaskCreateRequest) -> Result<bool, 
                 schedule_config,
                 next_run,
                 req.chain_next.unwrap_or_default(),
-                req.conditions.unwrap_or_default()
+                req.conditions.unwrap_or_default(),
+                project_path,
+                agent_id
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -124,6 +144,9 @@ pub fn update_task(state: State<AppState>, req: TaskUpdateRequest) -> Result<boo
         }
     }
 
+    let project_path = req.project_path.unwrap_or_default().trim().to_string();
+    let agent_id = req.agent_id.unwrap_or_default().trim().to_string();
+
     with_db(&state, |db| {
         let changed = db
             .execute(
@@ -136,6 +159,8 @@ pub fn update_task(state: State<AppState>, req: TaskUpdateRequest) -> Result<boo
                     next_run = ?6,
                     chain_next = ?7,
                     conditions = ?8,
+                    project_path = ?9,
+                    agent_id = ?10,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?1
                 "#,
@@ -147,7 +172,9 @@ pub fn update_task(state: State<AppState>, req: TaskUpdateRequest) -> Result<boo
                     schedule_config,
                     next_run,
                     req.chain_next.unwrap_or_default(),
-                    req.conditions.unwrap_or_default()
+                    req.conditions.unwrap_or_default(),
+                    project_path,
+                    agent_id
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -156,25 +183,91 @@ pub fn update_task(state: State<AppState>, req: TaskUpdateRequest) -> Result<boo
 }
 
 #[tauri::command]
-pub fn set_task_status(state: State<AppState>, req: TaskStatusRequest) -> Result<bool, String> {
-    let normalized = req.status.trim().to_lowercase();
-    if !["scheduled", "running", "completed"].contains(&normalized.as_str()) {
-        return Err("status must be scheduled, running, or completed".to_string());
+pub fn set_task_status(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    req: TaskStatusRequest,
+) -> Result<bool, String> {
+    let normalized = validate_user_task_status(&req.status)?;
+
+    let changed = with_db(&state, |db| {
+        let row: Option<(String, String, String)> = db
+            .query_row(
+                "SELECT schedule, schedule_config, next_run FROM tasks WHERE id = ?1",
+                params![req.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let (schedule, schedule_config, mut next_run) = match row {
+            Some(t) => t,
+            None => return Ok(0),
+        };
+
+        // Resuming (paused/failed/completed → scheduled) with no next_run would leave the
+        // task permanently un-runnable; recompute from schedule_config (preferred) or schedule.
+        if normalized == "scheduled" && next_run.trim().is_empty() {
+            let now = chrono::Local::now().naive_local();
+            next_run = if !schedule_config.trim().is_empty() {
+                crate::scheduler::next_run_from_schedule_config(&schedule_config, now)
+            } else if !schedule.trim().is_empty() {
+                crate::scheduler::next_run_from_schedule(&schedule, now)
+            } else {
+                None
+            }
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_default();
+        }
+
+        db.execute(
+            r#"
+            UPDATE tasks
+            SET status = ?2, next_run = ?3, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?1
+            "#,
+            params![req.id, normalized, next_run],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+
+    let _ = app.emit("tasks-changed", ());
+    Ok(changed > 0)
+}
+
+/// Fire a task immediately, regardless of its schedule. Errors if the task
+/// doesn't exist or is already running; otherwise spawns the run in the
+/// background and returns right away (the UI tracks progress via the
+/// `tasks-changed` events the run emits). The recorded task_run has
+/// trigger_kind = "manual". Note: like scheduled runs, a successful manual run
+/// of a schedule-less task marks it 'completed' (re-fire it with run_task /
+/// Run now whenever needed).
+#[tauri::command]
+pub fn run_task_now(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    req: TaskIdRequest,
+) -> Result<bool, String> {
+    let status: Option<String> = with_db(&state, |db| {
+        db.query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            params![req.id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    })?;
+    let status = status.ok_or_else(|| format!("no task with id {}", req.id))?;
+    if status == "running" {
+        return Err("task is already running".to_string());
     }
 
-    with_db(&state, |db| {
-        let changed = db
-            .execute(
-                r#"
-                UPDATE tasks
-                SET status = ?2, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?1
-                "#,
-                params![req.id, normalized],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(changed > 0)
-    })
+    let id = req.id;
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = crate::scheduler::execute_task(app, id, true).await {
+            eprintln!("[Tasks] manual run of task {} not started: {}", id, e);
+        }
+    });
+    Ok(true)
 }
 
 #[tauri::command]
@@ -224,4 +317,22 @@ pub fn remove_task(state: State<AppState>, req: TaskIdRequest) -> Result<bool, S
             .map_err(|e| e.to_string())?;
         Ok(changed > 0)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_settable_statuses_are_validated() {
+        // User-settable states pass (and normalize).
+        assert_eq!(validate_user_task_status("scheduled").unwrap(), "scheduled");
+        assert_eq!(validate_user_task_status("  Completed ").unwrap(), "completed");
+        assert_eq!(validate_user_task_status("PAUSED").unwrap(), "paused");
+        // Engine-managed states are rejected.
+        assert!(validate_user_task_status("running").is_err());
+        assert!(validate_user_task_status("failed").is_err());
+        assert!(validate_user_task_status("bogus").is_err());
+        assert!(validate_user_task_status("").is_err());
+    }
 }

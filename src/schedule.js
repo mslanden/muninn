@@ -1,7 +1,15 @@
-import { field } from "./utils.js";
-
 // ========== SCHEDULE WIDGET ==========
-export function renderScheduleWidget(container, initialData) {
+// Local date string YYYY-MM-DD (not UTC — schedules are local-time).
+function todayLocalDate() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// options.allowOnce: when true, show a Recurring/Once toggle; in Once mode
+// getData() returns { once: true, at: "<datetime-local value>" }. Defaults to
+// false so existing consumers (feeds) keep the recurring-only behavior.
+export function renderScheduleWidget(container, initialData, options = {}) {
+  const allowOnce = !!options.allowOnce;
   const DAYS = [
     { key: "mon", label: "Mon", full: "Monday" },
     { key: "tue", label: "Tue", full: "Tuesday" },
@@ -13,6 +21,8 @@ export function renderScheduleWidget(container, initialData) {
   ];
 
   const state = {
+    mode: "recurring", // "recurring" | "once"
+    onceAt: "",
     startDate: "",
     endDate: "",
     days: {}
@@ -20,20 +30,32 @@ export function renderScheduleWidget(container, initialData) {
 
   container.innerHTML = `
     <div class="schedule-widget">
-      <div class="schedule-dates">
-        <div class="schedule-date-field">
-          <label class="schedule-label">Start date</label>
-          <input type="date" class="feeds-input schedule-start" />
+      ${allowOnce ? `
+      <div class="schedule-mode-toggle">
+        <button type="button" class="schedule-widget-mode active" data-sched-mode="recurring">Recurring</button>
+        <button type="button" class="schedule-widget-mode" data-sched-mode="once">Once</button>
+      </div>` : ""}
+      <div class="schedule-recurring">
+        <div class="schedule-dates">
+          <div class="schedule-date-field">
+            <label class="schedule-label">Start date</label>
+            <input type="date" class="feeds-input schedule-start" />
+          </div>
+          <div class="schedule-date-field">
+            <label class="schedule-label">End date <span class="schedule-opt">(optional)</span></label>
+            <input type="date" class="feeds-input schedule-end" />
+          </div>
         </div>
-        <div class="schedule-date-field">
-          <label class="schedule-label">End date <span class="schedule-opt">(optional)</span></label>
-          <input type="date" class="feeds-input schedule-end" />
+        <div class="schedule-days">
+          ${DAYS.map(d => `<label class="schedule-day-btn" data-day="${d.key}"><input type="checkbox" data-day-check="${d.key}" /><span>${d.label}</span></label>`).join("")}
         </div>
+        <div class="schedule-day-configs"></div>
       </div>
-      <div class="schedule-days">
-        ${DAYS.map(d => `<label class="schedule-day-btn" data-day="${d.key}"><input type="checkbox" data-day-check="${d.key}" /><span>${d.label}</span></label>`).join("")}
-      </div>
-      <div class="schedule-day-configs"></div>
+      ${allowOnce ? `
+      <div class="schedule-once" style="display:none">
+        <label class="schedule-label">Run at</label>
+        <input type="datetime-local" class="feeds-input schedule-once-at" />
+      </div>` : ""}
     </div>
   `;
 
@@ -41,9 +63,28 @@ export function renderScheduleWidget(container, initialData) {
   const endInput = container.querySelector(".schedule-end");
   const configsContainer = container.querySelector(".schedule-day-configs");
   const dayBtns = container.querySelectorAll(".schedule-day-btn");
+  const recurringSection = container.querySelector(".schedule-recurring");
+  const onceSection = container.querySelector(".schedule-once");
+  const onceInput = container.querySelector(".schedule-once-at");
+  const modeBtns = container.querySelectorAll(".schedule-widget-mode");
 
   startInput.addEventListener("change", () => { state.startDate = startInput.value; });
   endInput.addEventListener("change", () => { state.endDate = endInput.value; });
+  if (onceInput) onceInput.addEventListener("change", () => { state.onceAt = onceInput.value; });
+
+  function applyMode() {
+    if (!allowOnce) { state.mode = "recurring"; return; }
+    recurringSection.style.display = state.mode === "once" ? "none" : "";
+    if (onceSection) onceSection.style.display = state.mode === "once" ? "flex" : "none";
+    modeBtns.forEach(b => b.classList.toggle("active", b.dataset.schedMode === state.mode));
+  }
+
+  modeBtns.forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.mode = btn.dataset.schedMode === "once" ? "once" : "recurring";
+      applyMode();
+    });
+  });
 
   function rebuildDayConfigs() {
     configsContainer.innerHTML = "";
@@ -121,6 +162,12 @@ export function renderScheduleWidget(container, initialData) {
       if (checkbox.checked) {
         state.days[key] = { mode: "times", times: ["09:00"], intervalMins: 60 };
         btn.classList.add("active");
+        // Start-date trap: checking a day with no start date would produce a
+        // schedule the backend silently never runs. Default to today.
+        if (!state.startDate) {
+          state.startDate = todayLocalDate();
+          startInput.value = state.startDate;
+        }
       } else {
         delete state.days[key];
         btn.classList.remove("active");
@@ -131,6 +178,15 @@ export function renderScheduleWidget(container, initialData) {
 
   function setData(data) {
     if (!data) return;
+    if (data.once) {
+      state.mode = "once";
+      state.onceAt = data.at || "";
+      if (onceInput) onceInput.value = state.onceAt;
+      applyMode();
+      return;
+    }
+    state.mode = "recurring";
+    applyMode();
     state.startDate = data.startDate || "";
     state.endDate = data.endDate || "";
     startInput.value = state.startDate;
@@ -154,10 +210,16 @@ export function renderScheduleWidget(container, initialData) {
   }
 
   function getData() {
+    if (allowOnce && state.mode === "once") {
+      if (!state.onceAt) return null;
+      return { once: true, at: state.onceAt };
+    }
     if (!state.startDate && Object.keys(state.days).length === 0) return null;
     const days = {};
+    let anyDay = false;
     for (const d of DAYS) {
       if (state.days[d.key]) {
+        anyDay = true;
         const cfg = state.days[d.key];
         if (cfg.mode === "times") {
           days[d.key] = { mode: "times", times: [...(cfg.times || ["09:00"])] };
@@ -168,15 +230,22 @@ export function renderScheduleWidget(container, initialData) {
         days[d.key] = null;
       }
     }
+    // Never emit an empty startDate with days selected — the backend would
+    // silently never schedule the task.
+    const startDate = state.startDate || (anyDay ? todayLocalDate() : "");
     return {
       version: 1,
-      startDate: state.startDate,
+      startDate,
       endDate: state.endDate || null,
       days
     };
   }
 
   function clear() {
+    state.mode = "recurring";
+    state.onceAt = "";
+    if (onceInput) onceInput.value = "";
+    applyMode();
     state.startDate = "";
     state.endDate = "";
     state.days = {};

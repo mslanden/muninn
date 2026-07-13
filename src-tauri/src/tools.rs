@@ -2692,6 +2692,7 @@ pub(crate) async fn execute_agent_tool(
         "list_tasks" => list_tasks_tool(state, arguments),
         "update_task" => update_task_tool(app, state, arguments),
         "delete_task" => delete_task_tool(app, state, arguments),
+        "run_task" => run_task_tool(app, state, arguments),
         "list_inbox" => {
             let limit = arguments
                 .get("limit")
@@ -2850,7 +2851,7 @@ fn truncate_tool_output(s: &str, max_bytes: usize) -> String {
 // --- Task management tools (create/list/update/delete) ---
 
 fn format_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
-    Ok(serde_json::json!({
+    let mut task = serde_json::json!({
         "id": row.get::<_, i64>(0)?,
         "name": row.get::<_, String>(1)?,
         "description": row.get::<_, String>(2)?,
@@ -2863,7 +2864,40 @@ fn format_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "run_count": row.get::<_, i64>(9)?,
         "created_at": row.get::<_, String>(10)?,
         "updated_at": row.get::<_, String>(11)?,
-    }))
+    });
+    // Workspace/agent targeting: only shown when set, to keep the common case terse.
+    let project_path: String = row.get(12)?;
+    if !project_path.is_empty() {
+        task["project_path"] = serde_json::json!(project_path);
+    }
+    let agent_id: String = row.get(13)?;
+    if !agent_id.is_empty() {
+        task["agent_id"] = serde_json::json!(agent_id);
+    }
+    Ok(task)
+}
+
+/// Validate an optional `project_path` tool argument. Returns `None` when the caller
+/// didn't supply the key (leave existing value), `Some("")` for an explicit clear, and
+/// `Some(path)` for a validated non-empty path — which must be an existing absolute
+/// directory (the same thing `WorkspaceScope::from_path` will demand at run time, so
+/// a bad path fails at create/update instead of silently producing failing runs).
+fn validate_task_project_path(args: &Value) -> Result<Option<String>, String> {
+    let raw = match args.get("project_path").and_then(Value::as_str) {
+        None => return Ok(None),
+        Some(s) => s.trim(),
+    };
+    if raw.is_empty() {
+        return Ok(Some(String::new()));
+    }
+    let path = std::path::Path::new(raw);
+    if !path.is_absolute() {
+        return Err(format!("project_path must be an absolute folder path (got '{}')", raw));
+    }
+    if !path.is_dir() {
+        return Err(format!("project_path does not exist or is not a directory: {}", raw));
+    }
+    Ok(Some(raw.to_string()))
 }
 
 fn compute_next_run(schedule: &str, schedule_config: &str) -> String {
@@ -2928,31 +2962,52 @@ pub(crate) fn create_task_tool(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // A schedule string that doesn't parse would silently create a dead task
+    // (empty next_run, never fires) — reject it with the supported formats.
+    if !schedule.trim().is_empty() && compute_next_run(&schedule, "").is_empty() {
+        return Err(format!(
+            "unparseable schedule '{}'. Supported formats: 'every 30s' / 'every 5m' / 'every 2h' / 'every 1d', \
+             'daily at HH:MM', 'every <weekday> at HH:MM' (e.g. 'every monday at 10:00'), 'hourly', 'daily'. \
+             Omit schedule entirely for a one-shot (set next_run) or a manual/chain-only task.",
+            schedule
+        ));
+    }
     if next_run.trim().is_empty() {
         next_run = compute_next_run(&schedule, "");
     }
     let chain_next = chain_next_json(args.get("chain_next"));
     let conditions = args.get("conditions").and_then(Value::as_str).unwrap_or("").to_string();
+    let project_path = validate_task_project_path(args)?.unwrap_or_default();
 
     let id: i64 = with_db(state, |db| {
         db.execute(
-            r#"INSERT INTO tasks (name, description, schedule, schedule_config, next_run, chain_next, conditions, status, updated_at)
-               VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, 'scheduled', CURRENT_TIMESTAMP)"#,
-            rusqlite::params![name, description, schedule, next_run, chain_next, conditions],
+            r#"INSERT INTO tasks (name, description, schedule, schedule_config, next_run, chain_next, conditions, project_path, status, updated_at)
+               VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, 'scheduled', CURRENT_TIMESTAMP)"#,
+            rusqlite::params![name, description, schedule, next_run, chain_next, conditions, project_path],
         )
         .map_err(|e| e.to_string())?;
         Ok(db.last_insert_rowid())
     })?;
     let _ = app.emit("tasks-changed", ());
 
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "ok": true,
         "id": id,
         "name": name,
         "schedule": schedule,
         "next_run": next_run,
-    })
-    .to_string())
+    });
+    if !project_path.is_empty() {
+        out["project_path"] = serde_json::json!(project_path);
+    }
+    // No schedule and no next_run is legitimate (chain children, manual tasks) —
+    // but flag it so the model knows the task won't fire on its own.
+    if schedule.trim().is_empty() && next_run.trim().is_empty() {
+        out["note"] = serde_json::json!(
+            "no schedule — this task will only run when chained from another task or triggered manually via run_task"
+        );
+    }
+    Ok(out.to_string())
 }
 
 pub(crate) fn list_tasks_tool(state: &AppState, args: &Value) -> Result<String, String> {
@@ -2966,11 +3021,11 @@ pub(crate) fn list_tasks_tool(state: &AppState, args: &Value) -> Result<String, 
     let tasks: Vec<Value> = with_db(state, |db| {
         let sql = if filter.is_some() {
             r#"SELECT id, name, description, schedule, schedule_config, next_run, status,
-                      completed_at, result, run_count, created_at, updated_at
+                      completed_at, result, run_count, created_at, updated_at, project_path, agent_id
                FROM tasks WHERE status = ?1 ORDER BY id DESC"#
         } else {
             r#"SELECT id, name, description, schedule, schedule_config, next_run, status,
-                      completed_at, result, run_count, created_at, updated_at
+                      completed_at, result, run_count, created_at, updated_at, project_path, agent_id
                FROM tasks ORDER BY id DESC"#
         };
         let mut stmt = db.prepare(sql).map_err(|e| e.to_string())?;
@@ -3001,23 +3056,42 @@ pub(crate) fn update_task_tool(
         .and_then(Value::as_i64)
         .ok_or_else(|| "missing task id".to_string())?;
 
-    // Validate status value if supplied.
+    // Validate status value if supplied. 'running' and 'failed' are engine-managed
+    // (set by the atomic claim / an errored schedule-less run) and can't be set here.
     let new_status = args
         .get("status")
         .and_then(Value::as_str)
         .map(str::trim)
         .map(str::to_lowercase);
     if let Some(s) = &new_status {
-        if !s.is_empty() && !["scheduled", "running", "completed"].contains(&s.as_str()) {
-            return Err("status must be scheduled, running, or completed".to_string());
+        if !s.is_empty() && !["scheduled", "completed", "paused"].contains(&s.as_str()) {
+            return Err("status must be scheduled, completed, or paused (running/failed are engine-managed)".to_string());
         }
     }
 
+    // A changed schedule string that doesn't parse would leave a dead task — reject it.
+    if let Some(s) = args.get("schedule").and_then(Value::as_str) {
+        if !s.trim().is_empty()
+            && crate::scheduler::next_run_from_schedule(s, chrono::Local::now().naive_local()).is_none()
+        {
+            return Err(format!(
+                "unparseable schedule '{}'. Supported formats: 'every 30s' / 'every 5m' / 'every 2h' / 'every 1d', \
+                 'daily at HH:MM', 'every <weekday> at HH:MM' (e.g. 'every monday at 10:00'), 'hourly', 'daily'. \
+                 Pass an empty string to clear the schedule (manual/chain-only task).",
+                s
+            ));
+        }
+    }
+
+    // Validate (and normalize) a supplied project_path before touching the row.
+    let project_path_arg = validate_task_project_path(args)?;
+
     let changed = with_db(state, |db| {
         // Load existing so we only overwrite the fields the caller supplied.
-        let existing: Option<(String, String, String, String, String, String, String, String)> = db
+        #[allow(clippy::type_complexity)]
+        let existing: Option<(String, String, String, String, String, String, String, String, String)> = db
             .query_row(
-                "SELECT name, description, schedule, schedule_config, next_run, status, chain_next, conditions FROM tasks WHERE id = ?1",
+                "SELECT name, description, schedule, schedule_config, next_run, status, chain_next, conditions, project_path FROM tasks WHERE id = ?1",
                 rusqlite::params![id],
                 |row| {
                     Ok((
@@ -3029,12 +3103,13 @@ pub(crate) fn update_task_tool(
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 },
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        let (name0, desc0, sched0, sconf0, next0, status0, chain0, cond0) = match existing {
+        let (name0, desc0, sched0, sconf0, next0, status0, chain0, cond0, pp0) = match existing {
             Some(t) => t,
             None => return Ok(0),
         };
@@ -3074,6 +3149,13 @@ pub(crate) fn update_task_tool(
             .filter(|s| !s.is_empty())
             .map(String::from)
             .unwrap_or(status0);
+        // Resuming to 'scheduled' with an empty next_run would leave the task
+        // permanently un-runnable — recompute it from the schedule if possible.
+        let next_run = if status == "scheduled" && next_run.trim().is_empty() {
+            compute_next_run(&schedule, &schedule_config)
+        } else {
+            next_run
+        };
         // chain_next: replace when supplied (incl. empty array to clear), else keep existing.
         let chain_next = if args.get("chain_next").is_some() {
             chain_next_json(args.get("chain_next"))
@@ -3085,14 +3167,17 @@ pub(crate) fn update_task_tool(
             Some(s) => s.to_string(),
             None => cond0,
         };
+        // project_path: replace when supplied (validated above; empty string clears), else keep.
+        let project_path = project_path_arg.unwrap_or(pp0);
 
         let changed = db
             .execute(
                 r#"UPDATE tasks
                    SET name = ?2, description = ?3, schedule = ?4, schedule_config = ?5,
-                       next_run = ?6, status = ?7, chain_next = ?8, conditions = ?9, updated_at = CURRENT_TIMESTAMP
+                       next_run = ?6, status = ?7, chain_next = ?8, conditions = ?9,
+                       project_path = ?10, updated_at = CURRENT_TIMESTAMP
                    WHERE id = ?1"#,
-                rusqlite::params![id, name, description, schedule, schedule_config, next_run, status, chain_next, conditions],
+                rusqlite::params![id, name, description, schedule, schedule_config, next_run, status, chain_next, conditions, project_path],
             )
             .map_err(|e| e.to_string())?;
         Ok(changed)
@@ -3103,6 +3188,42 @@ pub(crate) fn update_task_tool(
     }
     let _ = app.emit("tasks-changed", ());
     Ok(serde_json::json!({"ok": true, "id": id}).to_string())
+}
+
+/// Fire a task immediately in the background. The spawned run does its own
+/// atomic claim (status → 'running'), so a concurrent scheduler tick can't
+/// double-run it; we only pre-validate existence / not-already-running here so
+/// the model gets a useful error instead of a silent no-op.
+pub(crate) fn run_task_tool(
+    app: &AppHandle,
+    state: &AppState,
+    args: &Value,
+) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "missing task id".to_string())?;
+    let status: Option<String> = with_db(state, |db| {
+        db.query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    })?;
+    let status = status.ok_or_else(|| format!("no task with id {}", id))?;
+    if status == "running" {
+        return Err(format!("task {} is already running", id));
+    }
+
+    let task_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = crate::scheduler::execute_task(task_app, id, true).await {
+            eprintln!("[Tasks] run_task tool: task {} not started: {}", id, e);
+        }
+    });
+    Ok(serde_json::json!({"ok": true, "id": id, "started": true}).to_string())
 }
 
 pub(crate) fn delete_task_tool(

@@ -2768,6 +2768,7 @@ body.sidebar-collapsed .sidebar-panel-wrap {
 .task-status.scheduled { border-color: rgba(96, 165, 250, 0.3); color: var(--blue); }
 .task-status.running { border-color: rgba(74, 222, 128, 0.3); color: var(--live); }
 .task-status.completed { border-color: var(--border); color: var(--muted); }
+.task-status.paused { border-color: rgba(251, 191, 36, 0.3); color: var(--warn); }
 .task-status.failed { border-color: rgba(239, 68, 68, 0.3); color: var(--red); }
 
 .task-desc { font-size: 11px; color: var(--muted); line-height: 1.5; margin-bottom: 8px; }
@@ -2785,6 +2786,25 @@ body.sidebar-collapsed .sidebar-panel-wrap {
 .task-schedule-dot { width: 4px; height: 4px; border-radius: 50%; }
 .task-schedule-dot.active { background: var(--live); }
 .task-schedule-dot.idle { background: var(--dim); }
+
+.task-dead-badge {
+  margin-top: 6px;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+}
+.task-dead-badge.warn { color: var(--warn); }
+.task-dead-badge.neutral { color: var(--dim); }
+
+.task-fail-result {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 2px;
+  font-size: 10px;
+  color: var(--red);
+  line-height: 1.5;
+  word-break: break-word;
+}
 
 .task-chain-badge {
   margin-top: 6px;
@@ -2876,16 +2896,15 @@ body.sidebar-collapsed .sidebar-panel-wrap {
   align-items: center;
 }
 
-.task-status-select {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 9px;
-  letter-spacing: 1px;
-  padding: 3px 6px;
-  border: 1px solid var(--border);
-  border-radius: 2px;
-  background: var(--surface);
-  color: var(--muted);
-  cursor: pointer;
+.task-run-error {
+  font-size: 10px;
+  color: var(--red);
+  letter-spacing: 0.3px;
+}
+
+.task-action-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .task-action-btn {
@@ -2915,6 +2934,34 @@ body.sidebar-collapsed .sidebar-panel-wrap {
 }
 
 .task-form.visible { display: flex; }
+
+.task-form-hint {
+  color: var(--dim);
+  font-size: 10px;
+}
+
+.task-workspace-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.task-workspace-row input {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+}
+.task-workspace-row .task-action-btn { flex: none; }
+
+.task-workspace-badge,
+.task-agent-badge {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 0.3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ========== TOOLS TILE ========== */
 .tools-search {
@@ -3915,6 +3962,35 @@ p.status-msg {
   flex-direction: column;
   gap: 8px;
   padding: 8px 0 4px;
+}
+.schedule-mode-toggle {
+  display: flex;
+  gap: 4px;
+}
+.schedule-widget-mode {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+.schedule-widget-mode:hover { border-color: var(--border-hover); color: var(--text); }
+.schedule-widget-mode.active { border-color: var(--accent); color: var(--text); }
+.schedule-recurring {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.schedule-once {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
 .schedule-dates {
   display: flex;

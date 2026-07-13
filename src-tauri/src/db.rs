@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -171,9 +171,23 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 7)?;
     }
 
+    if version < 8 {
+        // Per-task workspace + custom-agent targeting: a task can pin its run to a
+        // project folder (file/shell tools scoped there) and/or a custom agent
+        // (system prompt + tool allowlist). Empty = current default behavior.
+        let statements = [
+            "ALTER TABLE tasks ADD COLUMN project_path TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tasks ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''",
+        ];
+        for sql in statements {
+            exec_migration(conn, sql)?;
+        }
+        set_schema_version(conn, 8)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 7, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 8, "add a migration block for the new version");
 
     Ok(())
 }
@@ -237,6 +251,8 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           next_run TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL DEFAULT 'scheduled',
           pending_input TEXT NOT NULL DEFAULT '',
+          project_path TEXT NOT NULL DEFAULT '',
+          agent_id TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -559,6 +575,12 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             "delete_task",
             "Delete Task",
             "Delete a task by id.",
+            "clock",
+        ),
+        (
+            "run_task",
+            "Run Task",
+            "Fire a task immediately, regardless of its schedule.",
             "clock",
         ),
         (
@@ -1188,10 +1210,11 @@ mod tests {
     #[test]
     fn legacy_v4_database_gains_deferred_commands_on_migrate() {
         let conn = Connection::open_in_memory().unwrap();
-        // Simulate a DB at schema v4 (no deferred_commands table). A real v4 DB has a
-        // sessions table (later migrations ALTER it), so create a minimal one here.
+        // Simulate a DB at schema v4 (no deferred_commands table). A real v4 DB has
+        // sessions and tasks tables (later migrations ALTER them), so create minimal ones.
         conn.execute_batch(
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
              PRAGMA user_version = 4;",
         )
         .unwrap();
@@ -1216,11 +1239,64 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v7_database_gains_task_project_path_and_agent_id_on_migrate() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a DB at schema v7: tasks table without the two new columns.
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               name TEXT NOT NULL,
+               description TEXT NOT NULL DEFAULT '',
+               schedule TEXT NOT NULL DEFAULT '',
+               next_run TEXT NOT NULL DEFAULT '',
+               status TEXT NOT NULL DEFAULT 'scheduled',
+               pending_input TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO tasks (name) VALUES ('pre-existing')", [])
+            .unwrap();
+
+        run_migrations(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Existing rows default to empty (default behavior); new values persist.
+        let (pp, aid): (String, String) = conn
+            .query_row(
+                "SELECT project_path, agent_id FROM tasks WHERE name = 'pre-existing'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pp, "");
+        assert_eq!(aid, "");
+        conn.execute(
+            "INSERT INTO tasks (name, project_path, agent_id) VALUES ('scoped', '/tmp/proj', 'default-research-agent')",
+            [],
+        )
+        .unwrap();
+        let (pp, aid): (String, String) = conn
+            .query_row(
+                "SELECT project_path, agent_id FROM tasks WHERE name = 'scoped'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pp, "/tmp/proj");
+        assert_eq!(aid, "default-research-agent");
+    }
+
+    #[test]
     fn legacy_v6_database_gains_video_plans_on_migrate() {
         let conn = Connection::open_in_memory().unwrap();
-        // Simulate a DB at schema v6 (no video_plans table yet).
+        // Simulate a DB at schema v6 (no video_plans table yet). A real v6 DB has a
+        // tasks table (the v8 migration ALTERs it), so create a minimal one here.
         conn.execute_batch(
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
              PRAGMA user_version = 6;",
         )
         .unwrap();

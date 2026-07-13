@@ -207,6 +207,10 @@ pub struct TaskRecord {
     pub chain_next: String,
     pub conditions: String,
     pub condition_status: String,
+    /// Absolute folder the task's file/shell tools are scoped to ('' = default workspace).
+    pub project_path: String,
+    /// Custom agent to run the task with ('' = plain provider chat).
+    pub agent_id: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -423,6 +427,10 @@ pub struct TaskCreateRequest {
     pub chain_next: Option<String>,
     /// Natural-language gate: when chain-triggered, only run if this holds for the input.
     pub conditions: Option<String>,
+    /// Absolute folder to scope the run's file/shell tools to (empty = default workspace).
+    pub project_path: Option<String>,
+    /// Custom agent (agents.agent_id) to run the task with (empty = plain provider chat).
+    pub agent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -438,6 +446,10 @@ pub struct TaskUpdateRequest {
     pub chain_next: Option<String>,
     /// Natural-language gate: when chain-triggered, only run if this holds for the input.
     pub conditions: Option<String>,
+    /// Absolute folder to scope the run's file/shell tools to (empty = default workspace).
+    pub project_path: Option<String>,
+    /// Custom agent (agents.agent_id) to run the task with (empty = plain provider chat).
+    pub agent_id: Option<String>,
 }
 
 #[derive(Deserialize)]

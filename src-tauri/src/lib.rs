@@ -318,6 +318,7 @@ pub fn run() {
             commands::add_task,
             commands::update_task,
             commands::set_task_status,
+            commands::run_task_now,
             commands::get_task_runs,
             commands::remove_task,
             commands::get_agents,
