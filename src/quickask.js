@@ -87,7 +87,7 @@ export async function bootQuickAsk() {
         sessionId: SESSION_ID,
         message,
         provider: "minimax",
-        model: settings["llm/model"] || "MiniMax-M2.7",
+        model: settings["llm/model"] || "MiniMax-M3",
       };
       await invoke("chat", { req });
       if (text) answer.innerHTML = renderMarkdown(text);

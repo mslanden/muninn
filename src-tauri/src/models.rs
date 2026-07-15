@@ -57,6 +57,17 @@ impl HistoryMessage {
 
 /// A single entry in an agent's ephemeral to-do list. Written by the agent via the
 /// `write_todos` tool; stored in-memory per session (not persisted across app restart).
+/// One model returned by a provider's `/models` listing endpoint (`fetch_models`).
+/// `label` is a human-friendly display name when the provider supplies one; `type_`
+/// distinguishes chat/image/embedding models (only some providers report it).
+#[derive(Serialize, Clone, Debug)]
+pub struct ModelInfo {
+    pub id: String,
+    pub label: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TodoItem {

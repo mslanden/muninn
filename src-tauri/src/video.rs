@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 
-use crate::db::{first_non_empty_setting, get_app_setting_value};
+use crate::db::get_app_setting_value;
 use crate::AppState;
 
 // ---------- binary discovery ----------
@@ -2653,19 +2653,9 @@ pub(crate) async fn transcribe_video(state: &AppState, src: &Path) -> Result<Tra
 /// Cloud whisper on an extracted audio file (Groq's whisper-large-v3-turbo when a Groq
 /// key is configured, else OpenAI whisper-1 — same key precedence as `transcribe_wav`).
 async fn transcribe_cloud(state: &AppState, audio: &Path) -> Result<Transcript, String> {
-    let (api_key, model, endpoint) =
-        if let Some(key) = first_non_empty_setting(state, &["llm/groq_api_key"])
-            .map_err(|e| e.to_string())?
-            .or_else(|| std::env::var("GROQ_API_KEY").ok())
-        {
-            (key, "whisper-large-v3-turbo", "https://api.groq.com/openai/v1/audio/transcriptions")
-        } else if let Some(key) = get_app_setting_value(state, "llm/openai_api_key")?
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        {
-            (key, "whisper-1", "https://api.openai.com/v1/audio/transcriptions")
-        } else {
-            return Err("No transcription API key configured. Set llm/groq_api_key (or llm/openai_api_key) in settings, or enable on-device transcription.".to_string());
-        };
+    // Provider precedence is governed by the `stt/provider` setting (auto/groq/openai),
+    // shared with `transcribe_wav` so both cloud paths agree.
+    let (api_key, model, endpoint) = crate::llm::resolve_stt(state)?;
 
     let audio_bytes = std::fs::read(audio).map_err(|e| e.to_string())?;
     if audio_bytes.len() > 24 * 1024 * 1024 {

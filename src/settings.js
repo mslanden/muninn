@@ -43,11 +43,20 @@ export function renderSettingsTile(tileObj, body) {
             <option value="fireworks">Fireworks</option>
             <option value="openrouter">OpenRouter</option>
             <option value="cohere">Cohere</option>
+            <option value="meta">Meta (Muse Spark)</option>
+            <option value="custom">Custom (OpenAI-compatible)</option>
           </select>
-          <input type="text" placeholder="Model name (e.g. MiniMax-M3)" data-s-model="${tileObj.id}" style="flex:1;" />
+          <input type="text" placeholder="Model name (e.g. MiniMax-M3)" list="s-model-list-${tileObj.id}" data-s-model="${tileObj.id}" style="flex:1;" />
+          <button class="form-btn" data-s-fetch-models="${tileObj.id}">Fetch models</button>
         </div>
+        <datalist id="s-model-list-${tileObj.id}" data-s-model-list="${tileObj.id}"></datalist>
+        <input type="text" placeholder="http://localhost:11434/v1" data-s-custombase="${tileObj.id}" style="margin-bottom:4px; display:none;" />
         <input type="password" placeholder="API key for the selected provider" data-s-provkey="${tileObj.id}" style="margin-bottom:4px;" />
         <span class="muted" data-s-prov-hint="${tileObj.id}" style="font-size:10px;"></span>
+        <div class="form-row" style="margin-top:6px; align-items:center;">
+          <button class="form-btn" data-s-test-llm="${tileObj.id}">Test</button>
+          <span class="muted" data-s-model-status="${tileObj.id}" style="font-size:10px;"></span>
+        </div>
         <div class="form-row" style="margin-top:8px;">
           <input type="number" min="1" step="1024" placeholder="Max response tokens (e.g. 40960)" data-s-maxtokens="${tileObj.id}" style="flex:1;" />
         </div>
@@ -55,17 +64,34 @@ export function renderSettingsTile(tileObj, body) {
       </div>
       <div class="settings-group">
         <h3>API Keys</h3>
-        <input type="password" placeholder="OpenAI API key" data-s-openai="${tileObj.id}" style="margin-bottom:6px;" />
-        <input type="password" placeholder="MiniMax API key" data-s-minimax="${tileObj.id}" style="margin-bottom:6px;" />
-        <input type="password" placeholder="Groq API key (voice transcription)" data-s-groq="${tileObj.id}" style="margin-bottom:6px;" />
+        <span class="muted" style="font-size:10px;">LLM provider keys are set in the Model section above.</span>
+        <input type="password" placeholder="Groq API key (voice transcription)" data-s-groq="${tileObj.id}" style="margin-bottom:6px; margin-top:6px;" />
         <input type="password" placeholder="Web search API key" data-s-search="${tileObj.id}" style="margin-bottom:6px;" />
         <input type="password" placeholder="Together AI key (images)" data-s-together="${tileObj.id}" style="margin-bottom:6px;" />
         <input type="password" placeholder="Mapbox API key (maps)" data-s-mapbox="${tileObj.id}" style="margin-bottom:6px;" />
       </div>
       <div class="settings-group">
-        <h3>Text to Speech</h3>
-        <input type="text" placeholder="MiniMax Voice ID (e.g. English_Graceful_Lady)" data-s-voiceid="${tileObj.id}" style="margin-bottom:6px;" />
-        <span class="muted" style="font-size:10px;">Uses MiniMax T2A. Leave blank for default voice.</span>
+        <h3>Voice</h3>
+        <div class="form-row" style="margin-bottom:6px;">
+          <select data-s-ttsprov="${tileObj.id}">
+            <option value="minimax">MiniMax</option>
+            <option value="fishspeech">FishSpeech</option>
+          </select>
+          <input type="text" placeholder="speech-2.8-hd" data-s-ttsmodel="${tileObj.id}" style="flex:1;" />
+        </div>
+        <div class="form-row" style="margin-bottom:6px; align-items:center;">
+          <input type="text" placeholder="Voice ID (e.g. English_Graceful_Lady)" data-s-voiceid="${tileObj.id}" style="flex:1;" />
+          <button class="form-btn" data-s-tts-preview="${tileObj.id}" title="Preview voice">▶</button>
+        </div>
+        <span class="muted" data-s-tts-status="${tileObj.id}" style="font-size:10px;"></span>
+        <div class="form-row" style="margin-top:6px;">
+          <select data-s-sttprov="${tileObj.id}" style="flex:1;">
+            <option value="auto">Automatic (Groq → OpenAI)</option>
+            <option value="groq">Groq</option>
+            <option value="openai">OpenAI</option>
+          </select>
+        </div>
+        <span class="muted" style="font-size:10px;">Speech-to-text transcription provider for voice input.</span>
       </div>
       <div class="settings-group">
         <h3>Image Generation</h3>
@@ -220,9 +246,10 @@ export function renderSettingsTile(tileObj, body) {
   const providerSelect = body.querySelector(`[data-s-provider="${tileObj.id}"]`);
   const provKeyInput = body.querySelector(`[data-s-provkey="${tileObj.id}"]`);
   const provHint = body.querySelector(`[data-s-prov-hint="${tileObj.id}"]`);
+  const customBaseInput = body.querySelector(`[data-s-custombase="${tileObj.id}"]`);
+  const modelDatalist = body.querySelector(`[data-s-model-list="${tileObj.id}"]`);
+  const modelStatusEl = body.querySelector(`[data-s-model-status="${tileObj.id}"]`);
   const maxTokensInput = body.querySelector(`[data-s-maxtokens="${tileObj.id}"]`);
-  const openaiInput = body.querySelector(`[data-s-openai="${tileObj.id}"]`);
-  const minimaxInput = body.querySelector(`[data-s-minimax="${tileObj.id}"]`);
   const groqInput = body.querySelector(`[data-s-groq="${tileObj.id}"]`);
   const searchInput = body.querySelector(`[data-s-search="${tileObj.id}"]`);
   const togetherInput = body.querySelector(`[data-s-together="${tileObj.id}"]`);
@@ -231,6 +258,10 @@ export function renderSettingsTile(tileObj, body) {
   const imgModelSelect = body.querySelector(`[data-s-imgmodel="${tileObj.id}"]`);
   const wsInput = body.querySelector(`[data-s-workspace="${tileObj.id}"]`);
   const voiceidInput = body.querySelector(`[data-s-voiceid="${tileObj.id}"]`);
+  const ttsProvSelect = body.querySelector(`[data-s-ttsprov="${tileObj.id}"]`);
+  const ttsModelInput = body.querySelector(`[data-s-ttsmodel="${tileObj.id}"]`);
+  const ttsStatusEl = body.querySelector(`[data-s-tts-status="${tileObj.id}"]`);
+  const sttProvSelect = body.querySelector(`[data-s-sttprov="${tileObj.id}"]`);
   const autostartInput = body.querySelector(`[data-s-autostart="${tileObj.id}"]`);
   const notifyInput = body.querySelector(`[data-s-notify="${tileObj.id}"]`);
   const qaShortcutInput = body.querySelector(`[data-s-qashortcut="${tileObj.id}"]`);
@@ -400,6 +431,21 @@ export function renderSettingsTile(tileObj, body) {
     return `llm/${provider}_api_key`;
   }
 
+  // Suggested model placeholder per provider (shown when the model field is empty).
+  const MODEL_PLACEHOLDERS = {
+    minimax: "MiniMax-M3",
+    meta: "muse-spark-1.1",
+    openai: "gpt-4.1-mini",
+    anthropic: "claude-sonnet-4-5",
+    groq: "llama-3.3-70b-versatile",
+    google: "gemini-2.5-pro",
+    xai: "grok-3",
+    custom: "e.g. llama3.1",
+  };
+  function modelPlaceholder(prov) {
+    return MODEL_PLACEHOLDERS[prov] ? `Model name (e.g. ${MODEL_PLACEHOLDERS[prov]})` : "Model name";
+  }
+
   // Reflect, for the selected provider, whether a key is already saved.
   function updateProviderHint() {
     const prov = providerSelect.value;
@@ -408,15 +454,27 @@ export function renderSettingsTile(tileObj, body) {
     provKeyInput.placeholder = saved
       ? `${prov} key (saved — leave blank to keep)`
       : `API key for ${prov}`;
+    customBaseInput.style.display = prov === "custom" ? "" : "none";
     if (prov === "minimax") {
       provHint.textContent = "Your current setup. Anthropic-compatible MiniMax endpoint.";
+    } else if (prov === "meta") {
+      provHint.textContent = "muse-spark-1.1 — $1.25/M in, $4.25/M out";
+    } else if (prov === "custom") {
+      provHint.textContent = "Local or self-hosted OpenAI-compatible server; API key optional.";
     } else {
       provHint.textContent = saved ? "" : `No ${prov} key saved yet — enter one to use this provider.`;
     }
   }
 
   providerSelect.addEventListener("change", () => {
+    const prov = providerSelect.value;
     provKeyInput.value = "";
+    // Per-provider model memory: restore a remembered model, else clear and hint.
+    const remembered = ui.loadedSettings && ui.loadedSettings["llm/model/" + prov];
+    modelSelect.value = remembered || "";
+    modelSelect.placeholder = modelPlaceholder(prov);
+    modelDatalist.innerHTML = "";
+    modelStatusEl.textContent = "";
     updateProviderHint();
   });
 
@@ -431,23 +489,26 @@ export function renderSettingsTile(tileObj, body) {
     const currentModel = s["llm/model"] || "MiniMax-M3";
     modelSelect.value = currentModel;
     providerSelect.value = s["llm/provider"] || "minimax";
+    modelSelect.placeholder = modelPlaceholder(providerSelect.value);
     provKeyInput.value = "";
+    customBaseInput.value = s["llm/custom_base_url"] || "";
+    modelDatalist.innerHTML = "";
+    modelStatusEl.textContent = "";
     maxTokensInput.value = s["llm/max_tokens"] || "";
     updateProviderHint();
 
-    openaiInput.value = "";
-    minimaxInput.value = "";
     groqInput.value = "";
     searchInput.value = "";
     togetherInput.value = "";
     mapboxInput.value = "";
-    openaiInput.placeholder = s["llm/openai_api_key"] ? "OpenAI key (saved)" : "OpenAI API key";
-    minimaxInput.placeholder = s["llm/minimax_api_key"] ? "MiniMax key (saved)" : "MiniMax API key";
     groqInput.placeholder = s["llm/groq_api_key"] ? "Groq key (saved)" : "Groq API key (voice transcription)";
     searchInput.placeholder = s["search/brave_api_key"] ? "Search key (saved)" : "Web search key";
     togetherInput.placeholder = s["imagegen/together_api_key"] ? "Together key (saved)" : "Together AI key";
     mapboxInput.placeholder = s["maps/mapbox_api_key"] ? "Mapbox key (saved)" : "Mapbox API key (maps)";
     voiceidInput.value = s["tts/voice_id"] || "";
+    ttsProvSelect.value = s["tts/provider"] || "minimax";
+    ttsModelInput.value = s["tts/model"] || "";
+    sttProvSelect.value = s["stt/provider"] || "auto";
     imgProvSelect.value = s["imagegen/provider"] || "";
 
     const currentImgModel = s["imagegen/model"] || "";
@@ -487,9 +548,15 @@ export function renderSettingsTile(tileObj, body) {
       "user/location": locationInput.value.trim(),
       "llm/provider": providerSelect.value,
       "llm/model": modelSelect.value.trim(),
+      "llm/custom_base_url": customBaseInput.value.trim(),
+      "tts/provider": ttsProvSelect.value,
+      "tts/model": ttsModelInput.value.trim(),
+      "stt/provider": sttProvSelect.value,
       "imagegen/provider": imgProvSelect.value.trim(),
       "imagegen/model": imgModelSelect.value.trim()
     };
+    // Per-provider model memory: remember the active model under the selected provider.
+    updates["llm/model/" + providerSelect.value] = modelSelect.value.trim();
     // Max response tokens: store a positive integer, or "" to fall back to the default.
     const maxTokensRaw = maxTokensInput.value.trim();
     if (maxTokensRaw === "" || /^\d+$/.test(maxTokensRaw) && parseInt(maxTokensRaw, 10) > 0) {
@@ -501,8 +568,6 @@ export function renderSettingsTile(tileObj, body) {
     }
     // Generic provider key → the selected provider's key setting (only when entered).
     if (provKeyInput.value.trim()) updates[providerKeyName(providerSelect.value)] = provKeyInput.value.trim();
-    if (openaiInput.value.trim()) updates["llm/openai_api_key"] = openaiInput.value.trim();
-    if (minimaxInput.value.trim()) updates["llm/minimax_api_key"] = minimaxInput.value.trim();
     if (groqInput.value.trim()) updates["llm/groq_api_key"] = groqInput.value.trim();
     if (searchInput.value.trim()) updates["search/brave_api_key"] = searchInput.value.trim();
     if (togetherInput.value.trim()) updates["imagegen/together_api_key"] = togetherInput.value.trim();
@@ -569,6 +634,85 @@ export function renderSettingsTile(tileObj, body) {
     await loadS();
   });
 
+  // ---------- Text-model fetch / test ----------
+  // MiniMax has no public models API — offer a curated list instead.
+  const MINIMAX_TEXT_MODELS = ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-Text-01"];
+
+  function fillModelDatalist(models) {
+    modelDatalist.innerHTML = "";
+    for (const m of models) {
+      const opt = document.createElement("option");
+      opt.value = m.id; // .value assignment is safe — not an innerHTML sink
+      if (m.label && m.label !== m.id) opt.label = m.label;
+      modelDatalist.appendChild(opt);
+    }
+  }
+
+  body.querySelector(`[data-s-fetch-models="${tileObj.id}"]`).addEventListener("click", async () => {
+    const prov = providerSelect.value;
+    if (prov === "minimax") {
+      fillModelDatalist(MINIMAX_TEXT_MODELS.map(id => ({ id })));
+      modelStatusEl.textContent = `${MINIMAX_TEXT_MODELS.length} models loaded`;
+      return;
+    }
+    modelStatusEl.textContent = "Fetching…";
+    try {
+      const models = await invoke("fetch_models", { provider: prov });
+      // Drop image/embedding models when the provider reports a type; otherwise keep all.
+      const hasTypes = models.some(m => m.type);
+      const chat = hasTypes ? models.filter(m => m.type !== "image" && m.type !== "embedding") : models;
+      fillModelDatalist(chat.map(m => ({ id: m.id, label: m.label })));
+      modelStatusEl.textContent = `${chat.length} models loaded`;
+    } catch (e) {
+      modelStatusEl.textContent = String(e);
+    }
+  });
+
+  const testLlmBtn = body.querySelector(`[data-s-test-llm="${tileObj.id}"]`);
+  testLlmBtn.addEventListener("click", async () => {
+    const prov = providerSelect.value;
+    const model = modelSelect.value.trim();
+    if (!model) { modelStatusEl.textContent = "Enter a model name first"; return; }
+    // Unsaved keys aren't visible to the backend — prompt to Save so the test is meaningful.
+    if (provKeyInput.value.trim()) {
+      modelStatusEl.textContent = "Save first — the entered key isn't used until saved.";
+      return;
+    }
+    testLlmBtn.disabled = true;
+    modelStatusEl.textContent = "Testing…";
+    try {
+      modelStatusEl.textContent = await invoke("test_llm_connection", { provider: prov, model });
+    } catch (e) {
+      modelStatusEl.textContent = String(e);
+    } finally {
+      testLlmBtn.disabled = false;
+    }
+  });
+
+  // ---------- Voice preview ----------
+  const ttsPreviewBtn = body.querySelector(`[data-s-tts-preview="${tileObj.id}"]`);
+  ttsPreviewBtn.addEventListener("click", async () => {
+    ttsPreviewBtn.disabled = true;
+    ttsStatusEl.textContent = "Loading voice…";
+    try {
+      const resp = await invoke("tts_speak", { req: { text: "Hi, this is your Muninn voice.", provider: ttsProvSelect.value } });
+      if (!resp.audioBase64) { ttsStatusEl.textContent = "No audio returned"; return; }
+      const blob = new Blob(
+        [Uint8Array.from(atob(resp.audioBase64), c => c.charCodeAt(0))],
+        { type: resp.contentType || "audio/mp3" }
+      );
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.onended = () => URL.revokeObjectURL(url);
+      audio.play();
+      ttsStatusEl.textContent = "";
+    } catch (e) {
+      ttsStatusEl.textContent = String(e);
+    } finally {
+      ttsPreviewBtn.disabled = false;
+    }
+  });
+
   // Known image models per provider (for providers without a fetch API)
   const KNOWN_IMG_MODELS = {
     minimax: [{ id: "image-01", label: "image-01" }, { id: "image-01-live", label: "image-01-live" }],
@@ -616,13 +760,16 @@ export function renderSettingsTile(tileObj, body) {
     imgStatusEl.textContent = "Fetching...";
     try {
       const models = await invoke("fetch_models", { provider: prov });
-      // Filter to image-related models by type or name
-      const imgModels = models.filter(m => {
-        if (m.type === "image") return true;
-        const id = (m.id || "").toLowerCase();
-        return id.includes("image") || id.includes("flux") || id.includes("dall") ||
-               id.includes("stable") || id.includes("sdxl") || id.includes("qwen-image");
-      });
+      // When the provider reports a type, trust it (keep only image models).
+      // Otherwise fall back to a name-substring heuristic.
+      const hasTypes = models.some(m => m.type);
+      const imgModels = hasTypes
+        ? models.filter(m => m.type === "image")
+        : models.filter(m => {
+            const id = (m.id || "").toLowerCase();
+            return id.includes("image") || id.includes("flux") || id.includes("dall") ||
+                   id.includes("stable") || id.includes("sdxl") || id.includes("qwen-image");
+          });
       const useModels = imgModels.length > 0 ? imgModels : models;
       populateImgModels(useModels, true);
       imgStatusEl.textContent = `${useModels.length} models loaded`;

@@ -508,8 +508,8 @@ async function showWorkspacePopover(anchor) {
 }
 
 const MODEL_PRESETS = [
-  { provider: "minimax", model: "MiniMax-M2.7", label: "MiniMax M2.7" },
   { provider: "minimax", model: "MiniMax-M3", label: "MiniMax M3" },
+  { provider: "meta", model: "muse-spark-1.1", label: "Muse Spark 1.1" },
   { provider: "openai", model: "gpt-4.1", label: "GPT-4.1" },
   { provider: "openai", model: "gpt-4o", label: "GPT-4o" },
   { provider: "anthropic", model: "claude-sonnet-4-5", label: "Claude Sonnet 4.5" },

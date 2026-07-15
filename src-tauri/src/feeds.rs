@@ -260,7 +260,7 @@ pub(crate) async fn run_agentic_loop(
 
     for _round in 0..max_rounds {
         let request_body = json!({
-            "model": "MiniMax-M2.7",
+            "model": "MiniMax-M3",
             "max_tokens": 4096,
             "system": system,
             "messages": messages,
@@ -338,7 +338,7 @@ pub(crate) async fn run_agentic_loop(
         }));
 
         let request_body = json!({
-            "model": "MiniMax-M2.7",
+            "model": "MiniMax-M3",
             "max_tokens": 4096,
             "system": system,
             "messages": messages,

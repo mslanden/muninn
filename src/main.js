@@ -87,8 +87,8 @@ async function bootMain() {
 
   try { ui.loadedSettings = await invoke("get_app_settings"); } catch { ui.loadedSettings = {}; }
   ui.mapboxToken = ui.loadedSettings["maps/mapbox_api_key"] || null;
-  sidebarModel.textContent = ui.loadedSettings["llm/model"] || "MiniMax-M2.7";
-  sidebarModel.title = ui.loadedSettings["llm/model"] || "MiniMax-M2.7";
+  sidebarModel.textContent = ui.loadedSettings["llm/model"] || "MiniMax-M3";
+  sidebarModel.title = ui.loadedSettings["llm/model"] || "MiniMax-M3";
 
   try {
     const pathInfo = await invoke("get_workspace_root");

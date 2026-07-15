@@ -336,7 +336,7 @@ pub(crate) fn resolve_llm_config(state: &AppState) -> Result<LlmCallConfig, Stri
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| {
             if provider == "minimax" {
-                "MiniMax-M2.7".to_string()
+                "MiniMax-M3".to_string()
             } else {
                 "gpt-4.1-mini".to_string()
             }
@@ -359,13 +359,10 @@ pub(crate) fn resolve_llm_config(state: &AppState) -> Result<LlmCallConfig, Stri
 /// one place covers both. `minimax`/`anthropic` use the Anthropic messages wire format;
 /// every other provider uses the OpenAI chat-completions format. Returns `Err` if the
 /// matching API key is not configured.
-fn resolve_provider_wire(state: &AppState, provider: &str) -> Result<(bool, String, String), String> {
-    let (api_key_opt, endpoint, is_anthropic) = if provider == "minimax" {
-        let key = first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("MINIMAX_API_KEY").ok())
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
+pub(crate) fn resolve_provider_wire(state: &AppState, provider: &str) -> Result<(bool, String, String), String> {
+    let api_key = resolve_provider_key(state, provider)?;
+
+    let (endpoint, is_anthropic) = if provider == "minimax" {
         let base = std::env::var("MINIMAX_ANTHROPIC_BASE_URL")
             .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
         let ep = if base.ends_with("/v1/messages") {
@@ -373,19 +370,17 @@ fn resolve_provider_wire(state: &AppState, provider: &str) -> Result<(bool, Stri
         } else {
             format!("{}/v1/messages", base.trim_end_matches('/'))
         };
-        (key, ep, true)
+        (ep, true)
     } else if provider == "anthropic" {
-        let key = first_non_empty_setting(state, &["llm/anthropic_api_key"])
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
-        (key, "https://api.anthropic.com/v1/messages".to_string(), true)
+        ("https://api.anthropic.com/v1/messages".to_string(), true)
+    } else if provider == "custom" {
+        // Local/self-hosted OpenAI-compatible server. The base URL is required; the
+        // key was already resolved (falls back to the "local" dummy when unset).
+        let base = get_app_setting_value(state, "llm/custom_base_url")?
+            .filter(|b| !b.trim().is_empty())
+            .ok_or_else(|| "No custom base URL configured".to_string())?;
+        (format!("{}/chat/completions", base.trim_end_matches('/')), false)
     } else {
-        let key_setting = format!("llm/{}_api_key", provider);
-        let key = first_non_empty_setting(state, &[&key_setting, "llm/openai_api_key"])
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
         let ep = match provider {
             "openai" => "https://api.openai.com/v1/chat/completions".to_string(),
             "together" => "https://api.together.xyz/v1/chat/completions".to_string(),
@@ -397,16 +392,101 @@ fn resolve_provider_wire(state: &AppState, provider: &str) -> Result<(bool, Stri
             "cohere" => "https://api.cohere.com/compatibility/v1/chat/completions".to_string(),
             "fireworks" => "https://api.fireworks.ai/inference/v1/chat/completions".to_string(),
             "openrouter" => "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            // Meta Model API (OpenAI-compatible). Key comes from llm/meta_api_key via the
+            // generic branch in resolve_provider_key.
+            "meta" => "https://api.meta.ai/v1/chat/completions".to_string(),
             _ => "https://api.openai.com/v1/chat/completions".to_string(),
         };
-        (key, ep, false)
+        (ep, false)
     };
 
-    let api_key = api_key_opt
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| format!("No API key configured for provider '{}'", provider))?;
-
     Ok((is_anthropic, endpoint, api_key))
+}
+
+/// Resolve just the API key for a provider, using the same setting-key precedence and
+/// env fallbacks as `resolve_provider_wire`. Used by the models-listing command (which
+/// hits a different endpoint than chat) and shared by `resolve_provider_wire`. The
+/// `custom` provider falls back to the literal dummy key "local" so local servers
+/// (Ollama/LM Studio) that need no auth still work; every other provider errors when no
+/// key is configured. Never returns the key to the webview — callers use it only to sign
+/// outbound requests.
+pub(crate) fn resolve_provider_key(state: &AppState, provider: &str) -> Result<String, String> {
+    let key_opt = if provider == "minimax" {
+        first_non_empty_setting(state, &["llm/minimax_api_key", "llm/anthropic_api_key"])?
+            .or_else(|| std::env::var("MINIMAX_API_KEY").ok())
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+    } else if provider == "anthropic" {
+        first_non_empty_setting(state, &["llm/anthropic_api_key"])?
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+    } else if provider == "custom" {
+        let key = first_non_empty_setting(state, &["llm/custom_api_key"])?
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| "local".to_string());
+        return Ok(key);
+    } else {
+        let key_setting = format!("llm/{}_api_key", provider);
+        first_non_empty_setting(state, &[&key_setting, "llm/openai_api_key"])?
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+    };
+
+    key_opt
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| format!("No API key configured for provider '{}'", provider))
+}
+
+/// Resolve which cloud speech-to-text provider to use, honoring the `stt/provider`
+/// setting: "auto" (default) prefers Groq's whisper-large-v3-turbo when a Groq key is
+/// configured and otherwise falls back to OpenAI whisper-1; "groq"/"openai" force the
+/// choice (erroring if that provider's key is missing). Returns `(api_key, model,
+/// transcriptions_endpoint)`. Shared by `transcribe_wav` and the video cloud fallback so
+/// both paths agree.
+pub(crate) fn resolve_stt(
+    state: &AppState,
+) -> Result<(String, &'static str, &'static str), String> {
+    const GROQ: (&str, &str) = (
+        "whisper-large-v3-turbo",
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+    );
+    const OPENAI: (&str, &str) = (
+        "whisper-1",
+        "https://api.openai.com/v1/audio/transcriptions",
+    );
+
+    let pref = get_app_setting_value(state, "stt/provider")?
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "auto".to_string());
+
+    let groq_key = first_non_empty_setting(state, &["llm/groq_api_key"])?
+        .or_else(|| std::env::var("GROQ_API_KEY").ok())
+        .filter(|k| !k.is_empty());
+    let openai_key = get_app_setting_value(state, "llm/openai_api_key")?
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .filter(|k| !k.is_empty());
+
+    match pref.as_str() {
+        "groq" => {
+            let key = groq_key.ok_or_else(|| {
+                "stt/provider is 'groq' but no Groq API key is configured (set llm/groq_api_key).".to_string()
+            })?;
+            Ok((key, GROQ.0, GROQ.1))
+        }
+        "openai" => {
+            let key = openai_key.ok_or_else(|| {
+                "stt/provider is 'openai' but no OpenAI API key is configured (set llm/openai_api_key).".to_string()
+            })?;
+            Ok((key, OPENAI.0, OPENAI.1))
+        }
+        // "auto" (and any unrecognized value): prefer Groq, else OpenAI.
+        _ => {
+            if let Some(key) = groq_key {
+                Ok((key, GROQ.0, GROQ.1))
+            } else if let Some(key) = openai_key {
+                Ok((key, OPENAI.0, OPENAI.1))
+            } else {
+                Err("No transcription API key configured. Set llm/groq_api_key (or llm/openai_api_key) in settings.".to_string())
+            }
+        }
+    }
 }
 
 /// Compact an entity summary that has grown too long.
@@ -3923,7 +4003,7 @@ pub(crate) async fn run_agent(
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| {
             if provider_name == "minimax" {
-                "MiniMax-M2.7".to_string()
+                "MiniMax-M3".to_string()
             } else {
                 "gpt-4.1-mini".to_string()
             }
@@ -3990,7 +4070,7 @@ pub(crate) async fn run_project_init(
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| {
             if provider_name == "minimax" {
-                "MiniMax-M2.7".to_string()
+                "MiniMax-M3".to_string()
             } else {
                 "gpt-4.1-mini".to_string()
             }

@@ -660,7 +660,7 @@ pub async fn execute_task(app: AppHandle, task_id: i64, manual: bool) -> Result<
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| {
             if provider == "minimax" {
-                "MiniMax-M2.7".to_string()
+                "MiniMax-M3".to_string()
             } else {
                 "gpt-4.1-mini".to_string()
             }

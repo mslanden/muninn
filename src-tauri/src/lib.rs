@@ -328,6 +328,8 @@ pub fn run() {
             commands::remove_agent,
             commands::get_app_settings,
             commands::set_app_settings,
+            commands::fetch_models,
+            commands::test_llm_connection,
             commands::get_memory_profile,
             commands::set_memory_profile,
             commands::get_entities,

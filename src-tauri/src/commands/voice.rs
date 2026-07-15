@@ -52,7 +52,17 @@ pub async fn tts_speak(
     state: State<'_, AppState>,
     req: TtsRequest,
 ) -> Result<TtsResponse, String> {
-    match req.provider.as_str() {
+    // The provider is normally supplied by the caller, but when it's empty we fall back to
+    // the `tts/provider` setting (default "minimax", or "fishspeech" for the local server).
+    let provider = if req.provider.trim().is_empty() {
+        first_non_empty_setting(&state, &["tts/provider"])
+            .map_err(|e| e.to_string())?
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| "minimax".to_string())
+    } else {
+        req.provider.clone()
+    };
+    match provider.as_str() {
         "kokoro" => {
             let body = serde_json::json!({
                 "model": "kokoro",
@@ -121,8 +131,13 @@ pub async fn tts_speak(
                 .map_err(|e| e.to_string())?
                 .unwrap_or_else(|| "English_Graceful_Lady".to_string());
 
+            let tts_model = first_non_empty_setting(&state, &["tts/model"])
+                .map_err(|e| e.to_string())?
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| "speech-2.8-hd".to_string());
+
             let body = serde_json::json!({
-                "model": "speech-2.8-hd",
+                "model": tts_model,
                 "text": req.text,
                 "stream": false,
                 "language_boost": "auto",
@@ -215,19 +230,8 @@ pub async fn transcribe_wav(
     state: State<'_, AppState>,
     wav_base64: String,
 ) -> Result<TranscribeResponse, String> {
-    // Prefer Groq's whisper-large-v3-turbo (cheap, has a free tier). Fall back to
-    // OpenAI's whisper-1 if only an OpenAI key is configured.
-    let (api_key, model, endpoint) =
-        if let Some(key) = first_non_empty_setting(&state, &["llm/groq_api_key"])
-            .map_err(|e| e.to_string())?
-            .or_else(|| std::env::var("GROQ_API_KEY").ok())
-        {
-            (key, "whisper-large-v3-turbo".to_string(), "https://api.groq.com/openai/v1/audio/transcriptions".to_string())
-        } else {
-            let key = get_app_setting_value(&state, "llm/openai_api_key")?
-                .ok_or_else(|| "No transcription API key configured. Set llm/groq_api_key (or llm/openai_api_key) in settings.".to_string())?;
-            (key, "whisper-1".to_string(), "https://api.openai.com/v1/audio/transcriptions".to_string())
-        };
+    // Provider precedence is governed by the `stt/provider` setting (auto/groq/openai).
+    let (api_key, model, endpoint) = crate::llm::resolve_stt(&state)?;
 
     let audio_bytes = B64.decode(&wav_base64).map_err(|e| format!("base64 decode error: {e}"))?;
 
@@ -242,7 +246,7 @@ pub async fn transcribe_wav(
 
     let resp = state
         .http
-        .post(&endpoint)
+        .post(endpoint)
         .bearer_auth(&api_key)
         .multipart(form)
         .send()
