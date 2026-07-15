@@ -30,7 +30,7 @@ export function renderSettingsTile(tileObj, body) {
       <div class="settings-group">
         <h3>Model</h3>
         <div class="form-row" style="margin-bottom:6px;">
-          <select data-s-provider="${tileObj.id}">
+          <select data-s-provider="${tileObj.id}" style="flex:1; min-width:0;">
             <option value="minimax">MiniMax (Anthropic-compatible)</option>
             <option value="openai">OpenAI</option>
             <option value="anthropic">Anthropic</option>
@@ -46,7 +46,7 @@ export function renderSettingsTile(tileObj, body) {
             <option value="meta">Meta (Muse Spark)</option>
             <option value="custom">Custom (OpenAI-compatible)</option>
           </select>
-          <input type="text" placeholder="Model name (e.g. MiniMax-M3)" list="s-model-list-${tileObj.id}" data-s-model="${tileObj.id}" style="flex:1;" />
+          <input type="text" placeholder="Model name (e.g. MiniMax-M3)" list="s-model-list-${tileObj.id}" data-s-model="${tileObj.id}" style="flex:1.3; min-width:120px;" />
           <button class="form-btn" data-s-fetch-models="${tileObj.id}">Fetch models</button>
         </div>
         <datalist id="s-model-list-${tileObj.id}" data-s-model-list="${tileObj.id}"></datalist>
@@ -73,11 +73,11 @@ export function renderSettingsTile(tileObj, body) {
       <div class="settings-group">
         <h3>Voice</h3>
         <div class="form-row" style="margin-bottom:6px;">
-          <select data-s-ttsprov="${tileObj.id}">
+          <select data-s-ttsprov="${tileObj.id}" style="flex:1; min-width:0;">
             <option value="minimax">MiniMax</option>
             <option value="fishspeech">FishSpeech</option>
           </select>
-          <input type="text" placeholder="speech-2.8-hd" data-s-ttsmodel="${tileObj.id}" style="flex:1;" />
+          <input type="text" placeholder="speech-2.8-hd" data-s-ttsmodel="${tileObj.id}" style="flex:2; min-width:0;" />
         </div>
         <div class="form-row" style="margin-bottom:6px; align-items:center;">
           <input type="text" placeholder="Voice ID (e.g. English_Graceful_Lady)" data-s-voiceid="${tileObj.id}" style="flex:1;" />
@@ -486,9 +486,14 @@ export function renderSettingsTile(tileObj, body) {
     aboutInput.value = s["user/about"] || "";
     locationInput.value = s["user/location"] || "";
 
-    const currentModel = s["llm/model"] || "MiniMax-M3";
-    modelSelect.value = currentModel;
     providerSelect.value = s["llm/provider"] || "minimax";
+    // Prefer the per-provider remembered model; fall back to the global llm/model only
+    // when no per-provider entry exists yet (pre-upgrade settings), and to the MiniMax
+    // default only on a fresh install. An empty remembered model stays empty — the
+    // placeholder guides the user rather than resurrecting another provider's model.
+    const remembered = s["llm/model/" + providerSelect.value];
+    const currentModel = remembered !== undefined ? remembered : (s["llm/model"] ?? "MiniMax-M3");
+    modelSelect.value = currentModel;
     modelSelect.placeholder = modelPlaceholder(providerSelect.value);
     provKeyInput.value = "";
     customBaseInput.value = s["llm/custom_base_url"] || "";
@@ -514,8 +519,8 @@ export function renderSettingsTile(tileObj, body) {
     const currentImgModel = s["imagegen/model"] || "";
     ensureOption(imgModelSelect, currentImgModel);
 
-    sidebarModel.textContent = currentModel;
-    sidebarModel.title = currentModel;
+    sidebarModel.textContent = currentModel || "default model";
+    sidebarModel.title = currentModel || "provider default";
 
     try { autostartInput.checked = await isAutostartEnabled(); } catch {}
 
@@ -628,8 +633,8 @@ export function renderSettingsTile(tileObj, body) {
       statusEl.textContent = "Saved";
     }
     ui.loadedSettings = { ...ui.loadedSettings, ...updates };
-    sidebarModel.textContent = updates["llm/model"];
-    sidebarModel.title = updates["llm/model"];
+    sidebarModel.textContent = updates["llm/model"] || "default model";
+    sidebarModel.title = updates["llm/model"] || "provider default";
     setTimeout(() => { statusEl.textContent = ""; }, 2000);
     await loadS();
   });
@@ -646,6 +651,8 @@ export function renderSettingsTile(tileObj, body) {
       if (m.label && m.label !== m.id) opt.label = m.label;
       modelDatalist.appendChild(opt);
     }
+    // Empty input + fresh list: pre-fill the first model so Fetch → Test just works.
+    if (!modelSelect.value.trim() && models.length) modelSelect.value = models[0].id;
   }
 
   body.querySelector(`[data-s-fetch-models="${tileObj.id}"]`).addEventListener("click", async () => {
