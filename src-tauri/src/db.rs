@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -185,9 +185,35 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 8)?;
     }
 
+    if version < 9 {
+        // Agents now default to the full toolset (empty allowlist = all enabled tools).
+        // Widen the seeded Research Agent's original narrow list — but only if it still
+        // has the exact seeded value, so a user-customized allowlist is left alone.
+        // Tolerate a missing agents table: init_db's CREATEs normally run first, but the
+        // legacy-DB migration tests call run_migrations on minimal schemas without it.
+        let has_agents: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='agents'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if has_agents.is_some() {
+            conn.execute(
+                r#"UPDATE agents SET allowed_tools_json = '[]'
+                   WHERE agent_id = 'default-research-agent'
+                     AND allowed_tools_json = '["run_command","read_file","search_files"]'"#,
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        set_schema_version(conn, 9)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 8, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 9, "add a migration block for the new version");
 
     Ok(())
 }
@@ -714,10 +740,10 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             'Research Agent',
             'Autonomous research agent that investigates topics using available tools.',
             'research',
-            'You are a focused research agent. When given a query, systematically investigate it by reading files, running commands, and searching the codebase. Summarize your findings clearly and concisely. Break complex questions into steps and use tools to gather evidence before answering.',
+            'You are a focused research agent. When given a query, systematically investigate it by reading files, running commands, and searching the codebase and the web. Summarize your findings clearly and concisely. Break complex questions into steps and use tools to gather evidence before answering.',
             5,
             1,
-            '["run_command","read_file","search_files"]',
+            '[]',
             CURRENT_TIMESTAMP
         )
         ON CONFLICT(agent_id) DO NOTHING

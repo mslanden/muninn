@@ -3019,14 +3019,14 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("create_agent") {
         defs.push((
             "create_agent",
-            "Create a reusable custom agent: a named persona with its own system prompt and tool allowlist. Use for specialist roles you (or scheduled tasks) will invoke repeatedly — e.g. a code reviewer, a news summarizer. After creating, invoke it with call_agent or attach it to a task via agent_id.",
+            "Create a reusable custom agent: a named persona with its own system prompt. Use for specialist roles you (or scheduled tasks) will invoke repeatedly — e.g. a code reviewer, a news summarizer. By default the agent gets the full toolset. After creating, invoke it with call_agent or attach it to a task via agent_id.",
             json!({
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Unique agent name, e.g. 'Code Reviewer'."},
                     "system_prompt": {"type": "string", "description": "The agent's role and working instructions. Written as a system prompt: who it is, how it should approach tasks, what its output should look like."},
                     "description": {"type": "string", "description": "One-line summary shown in the Agents panel."},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool ids this agent may use (validated against the tools registry). Omit or pass [] to allow all enabled tools. Prefer a minimal list — e.g. a summarizer needs web_search/web_fetch, not run_command."},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "OMIT this (the default) so the agent can use all enabled tools — a missing tool breaks the agent, and the system prompt already shapes its behavior. Only pass a list when the user explicitly asks to restrict the agent; ids are validated against the tools registry."},
                     "max_iterations": {"type": "integer", "description": "Iteration budget hint (1-100, default 5)."},
                     "slash_command": {"type": "string", "description": "Optional slash command (without the /) to invoke it from chat."}
                 },
