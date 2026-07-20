@@ -16,41 +16,30 @@
       <div class="titlebar" data-tauri-drag-region></div>
 
       <aside class="sidebar">
-        <!-- Persistent icon rail: tabs + settings + collapse -->
-        <div class="sidebar-rail">
-          <button class="rail-btn rail-brand" id="rail-brand" title="Muninn" aria-label="Muninn">
-            <span class="rail-mark">M</span>
-          </button>
-          <div id="sidebar-tabs" class="sidebar-tabs"></div>
-          <div class="rail-spacer"></div>
-          <button class="rail-btn" id="nav-settings" title="Settings" aria-label="Settings">
-            <span class="nav-dot off"></span>
-          </button>
-          <button class="rail-btn" id="sidebar-collapse-btn" title="Collapse sidebar" aria-label="Collapse sidebar"></button>
-        </div>
-
-        <!-- Expandable panel (sessions / apps) -->
         <div class="sidebar-panel-wrap">
-          <div class="sidebar-brand">
-            <span class="sidebar-logo">MUNINN</span>
-            <span class="sidebar-version">v0.1</span>
+          <!-- Single header row: brand mark, view tabs, settings, collapse -->
+          <div class="sidebar-head">
+            <button class="head-brand" id="rail-brand" title="Muninn" aria-label="Muninn">
+              <span class="rail-mark">M</span>
+            </button>
+            <div id="sidebar-tabs" class="sidebar-tabs"></div>
+            <div class="head-spacer"></div>
+            <button class="head-btn" id="nav-settings" title="Settings" aria-label="Settings"></button>
+            <button class="head-btn" id="sidebar-collapse-btn" title="Collapse sidebar" aria-label="Collapse sidebar"></button>
           </div>
 
           <div id="sidebar-panels" class="sidebar-panels">
             <!-- Chat panel -->
             <div class="sidebar-panel" data-panel="chat">
-              <div class="sidebar-nav" style="padding-top: 4px;">
-                <button class="nav-item" id="new-chat-btn" title="New Chat">
-                  <span class="nav-dot off"></span>
-                  + New Chat
-                </button>
+              <div class="sidebar-topline">
+                <button class="new-chat-btn" id="new-chat-btn" title="New Chat">+ New Chat</button>
               </div>
               <div class="session-search">
                 <input type="text" id="session-search-input" placeholder="Search chats…" autocomplete="off" spellcheck="false" />
               </div>
-              <div id="session-list" class="session-list"></div>
-              <div class="sidebar-agents">
-                <div class="sidebar-section-label">Agents</div>
+              <!-- Sessions and agents share one scroll area so no section pins dead space -->
+              <div class="sidebar-scroll">
+                <div id="session-list" class="session-list"></div>
                 <div id="sidebar-agents-list" class="sidebar-agents-list"></div>
               </div>
             </div>
@@ -63,10 +52,14 @@
 
           <div class="sidebar-footer">
             <button type="button" class="footer-switch" id="sidebar-workspace" title="Switch workspace">~/</button>
-            <button type="button" class="footer-switch" id="sidebar-model" title="Switch model">connecting...</button>
+            <span class="footer-dot">·</span>
+            <button type="button" class="footer-switch footer-model" id="sidebar-model" title="Switch model">connecting...</button>
           </div>
         </div>
       </aside>
+
+      <!-- Floating expand handle, visible only while the sidebar is collapsed -->
+      <button id="sidebar-expand-fab" class="sidebar-expand-fab" title="Expand sidebar" aria-label="Expand sidebar"><span class="rail-mark">M</span></button>
 
       <div id="workspace" class="workspace"></div>
 

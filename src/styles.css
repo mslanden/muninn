@@ -314,43 +314,41 @@ body::before {
 }
 
 body.sidebar-collapsed .shell {
-  /* Workspace is full-bleed; the icon rail floats under the tile header so the
-     header rule can run beneath the traffic lights with no vertical divider
-     cutting through that band. */
+  /* Workspace is full-bleed; a small floating handle (bottom-left) re-expands. */
   --sidebar-width: 0px;
   grid-template-columns: 1fr;
 }
 
-body.sidebar-collapsed .sidebar {
-  position: absolute;
-  left: 0;
-  top: 40px; /* sit under .tile-header */
-  bottom: 0;
-  width: 52px;
-  padding-top: 0;
-  z-index: 20;
-  border-right: 1px solid var(--border);
+body.sidebar-collapsed .sidebar { display: none; }
+
+/* Floating expand handle — exists in the DOM always, shown only while collapsed. */
+.sidebar-expand-fab { display: none; }
+
+body.sidebar-collapsed .sidebar-expand-fab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: fixed;
+  left: 10px;
+  bottom: 10px;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
   background: var(--card);
+  cursor: pointer;
+  z-index: 30;
+  transition: all 160ms ease;
 }
 
-body.sidebar-collapsed .sidebar-rail {
-  height: 100%;
+body.sidebar-collapsed .sidebar-expand-fab:hover {
+  border-color: var(--accent);
+  background: var(--overlay-light);
 }
 
-/* Single chat (usual collapsed view): header spans under the traffic lights
-   and title shifts left; body/composer clear the floating rail. */
+/* Single chat collapsed: header spans under the traffic lights, title shifts right. */
 body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
   padding-left: 78px;
-}
-
-body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-body,
-body.sidebar-collapsed .workspace[data-tile-count="1"] .composer {
-  margin-left: 52px;
-}
-
-/* Multi-tile collapsed: keep content clear of the rail without full-bleed headers. */
-body.sidebar-collapsed .workspace:not([data-tile-count="1"]) {
-  padding-left: 52px;
 }
 
 /* ========== SIDEBAR ========== */
@@ -358,103 +356,137 @@ body.sidebar-collapsed .workspace:not([data-tile-count="1"]) {
   background: var(--card);
   border-right: 1px solid var(--border);
   display: flex;
-  flex-direction: row;
-  padding-top: 48px;
+  flex-direction: column;
+  padding-top: 44px; /* clear the traffic lights */
   user-select: none;
   overflow: hidden;
   min-width: 0;
 }
 
-/* Persistent icon rail */
-.sidebar-rail {
-  width: 52px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 0 10px;
-  border-right: 1px solid var(--border);
-}
-
-.rail-spacer { flex: 1; }
-
-.rail-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 36px;
-  height: 36px;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--dim);
-  cursor: pointer;
-  transition: all 160ms ease;
-  position: relative;
-}
-
-.rail-btn:hover { color: var(--accent); background: var(--overlay-light); }
-.rail-btn.active,
-.rail-btn.open {
-  color: var(--text);
-  background: var(--overlay-medium);
-  border-color: var(--border);
-}
-
-.rail-brand .rail-mark {
+.rail-mark {
   font-family: 'Orbitron', sans-serif;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0;
   color: var(--text);
 }
 
-.rail-btn .nav-dot {
-  width: 7px;
-  height: 7px;
-}
-
-.sidebar-tabs {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 0;
-}
-
-/* Expandable panel beside the rail */
 .sidebar-panel-wrap {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
-body.sidebar-collapsed .sidebar-panel-wrap {
-  display: none;
-}
-
-.sidebar-brand {
-  padding: 4px 14px 12px;
+/* Header row: brand mark, view tabs, settings, collapse */
+.sidebar-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  padding: 0 8px 8px;
+  flex-shrink: 0;
 }
 
-.sidebar-logo {
-  font-family: 'Orbitron', sans-serif;
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: 4px;
-  color: var(--text);
+.head-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 160ms ease;
 }
 
-.sidebar-version {
-  font-size: 9px;
+.head-brand:hover { background: var(--overlay-light); }
+
+.head-spacer { flex: 1; }
+
+.head-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
   color: var(--dim);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 160ms ease;
+}
+
+.head-btn:hover { color: var(--accent); background: var(--overlay-light); }
+.head-btn.open { color: var(--text); background: var(--overlay-medium); }
+
+/* Segmented view switcher */
+.sidebar-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.seg-btn {
+  padding: 3px 9px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
   letter-spacing: 1px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 160ms ease;
+}
+
+.seg-btn:hover { color: var(--accent); }
+.seg-btn.active { color: var(--text); background: var(--overlay-medium); }
+
+/* New chat + shared scroll area */
+.sidebar-topline {
+  padding: 0 8px;
+  flex-shrink: 0;
+}
+
+.new-chat-btn {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  cursor: pointer;
+  text-align: center;
+  transition: all 160ms ease;
+}
+
+.new-chat-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--overlay-light);
+}
+
+.sidebar-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .sidebar-label,
@@ -544,20 +576,13 @@ body.sidebar-collapsed .sidebar-panel-wrap {
 
 .sidebar-panel[hidden] { display: none; }
 
-/* Agents under Chat */
-.sidebar-agents {
-  flex-shrink: 0;
-  border-top: 1px solid var(--border);
-  max-height: 160px;
-  overflow-y: auto;
-  padding-bottom: 6px;
-}
-
+/* Agents under Chat (shares the session scroll area — no pinned dead space) */
 .sidebar-agents-list {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  padding: 0 8px;
+  padding: 0 8px 10px;
+  flex-shrink: 0;
 }
 
 .agent-shortcut {
@@ -603,21 +628,47 @@ body.sidebar-collapsed .sidebar-panel-wrap {
 
 .session-search input::placeholder { color: var(--dim); }
 
-/* ----- Session list ----- */
+/* ----- Session list (scrolling handled by .sidebar-scroll) ----- */
 .session-list {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 2px 8px 8px;
+  padding: 2px 8px 4px;
+  flex-shrink: 0;
 }
 
+/* Collapsible group header */
 .session-section {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  font: inherit;
   font-size: 9px;
-  font-weight: 500;
+  font-weight: 600;
   letter-spacing: 2px;
   text-transform: uppercase;
   color: var(--dim);
   padding: 10px 4px 4px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.session-section:hover .section-text { color: var(--muted); }
+.session-section.static { cursor: default; }
+
+.section-caret {
+  display: flex;
+  align-items: center;
+  transition: transform 160ms ease;
+}
+
+.session-section.collapsed .section-caret { transform: rotate(-90deg); }
+
+.section-count {
+  margin-left: auto;
+  color: var(--dim);
+  font-size: 9px;
+  letter-spacing: 0;
 }
 
 .session-empty {
@@ -641,15 +692,19 @@ body.sidebar-collapsed .sidebar-panel-wrap {
 .session-item.open { background: var(--overlay-medium); }
 .session-item.active { background: var(--overlay-toggle); }
 
+/* Single-line row: title left, time/project right; hover swaps meta for actions. */
 .session-main {
   flex: 1;
   min-width: 0;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
 }
 
 .session-label {
+  flex: 1;
+  min-width: 0;
   font-size: 11.5px;
   color: var(--text);
   white-space: nowrap;
@@ -663,8 +718,10 @@ body.sidebar-collapsed .sidebar-panel-wrap {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-width: 0;
+  flex-shrink: 0;
 }
+
+.session-item:hover .session-meta { display: none; }
 
 .session-time {
   font-size: 9px;
@@ -730,16 +787,29 @@ body.sidebar-collapsed .sidebar-panel-wrap {
 .session-item:not(:hover) .session-item-actions:has(.session-pin.pinned) .session-act:not(.session-pin) { display: none; }
 
 .sidebar-footer {
-  padding: 10px 12px;
+  padding: 8px 10px;
   border-top: 1px solid var(--border);
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  flex-direction: row;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.footer-dot {
+  color: var(--dim);
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.footer-model {
+  flex: 1;
+  text-align: right;
 }
 
 .footer-switch {
   display: block;
-  width: 100%;
+  min-width: 0;
   padding: 5px 6px;
   border: 1px solid transparent;
   border-radius: 3px;

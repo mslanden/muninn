@@ -81,10 +81,10 @@ function renderTabs() {
   sidebarTabs.innerHTML = "";
   for (const tab of TABS) {
     const btn = document.createElement("button");
-    btn.className = `rail-btn sidebar-tab${tab.id === active ? " active" : ""}`;
+    btn.className = `seg-btn${tab.id === active ? " active" : ""}`;
     btn.title = tab.label;
     btn.setAttribute("aria-label", tab.label);
-    btn.innerHTML = icon(tab.ic, 16);
+    btn.textContent = tab.label;
     btn.addEventListener("click", () => setActiveTab(tab.id));
     sidebarTabs.appendChild(btn);
   }
@@ -98,23 +98,36 @@ function isCollapsed() {
 function setCollapsed(collapsed) {
   localStorage.setItem(COLLAPSE_KEY, collapsed ? "1" : "0");
   document.body.classList.toggle("sidebar-collapsed", collapsed);
-  if (sidebarCollapseBtn) {
-    sidebarCollapseBtn.title = collapsed ? "Expand sidebar" : "Collapse sidebar";
-    sidebarCollapseBtn.setAttribute("aria-label", sidebarCollapseBtn.title);
-    sidebarCollapseBtn.innerHTML = icon(collapsed ? "chevron-right" : "chevron-left", 15);
-  }
 }
 
 function wireCollapse() {
   if (sidebarCollapseBtn) {
+    sidebarCollapseBtn.innerHTML = icon("chevron-left", 15);
     sidebarCollapseBtn.addEventListener("click", () => setCollapsed(!isCollapsed()));
   }
+  // Floating handle shown (via CSS) only while collapsed — the panel, including its
+  // collapse button, is hidden then.
+  const fab = document.getElementById("sidebar-expand-fab");
+  if (fab) fab.addEventListener("click", () => setCollapsed(false));
   if (railBrandBtn) {
     railBrandBtn.addEventListener("click", () => {
       if (isCollapsed()) setCollapsed(false);
       setActiveTab("chat");
     });
   }
+}
+
+// ==================== COLLAPSIBLE SECTIONS ====================
+const SEC_KEY = (id) => `muninn.sidebar-sec.${id}`;
+
+function isSecCollapsed(id) {
+  return localStorage.getItem(SEC_KEY(id)) === "1";
+}
+
+function toggleSection(id) {
+  localStorage.setItem(SEC_KEY(id), isSecCollapsed(id) ? "0" : "1");
+  refreshSessionList();
+  refreshAgentsList();
 }
 
 // ==================== APPS PANEL ====================
@@ -169,6 +182,9 @@ export async function refreshAgentsList() {
 
   const enabled = agents.filter((a) => field(a, "enabled", "enabled"));
   sidebarAgentsList.innerHTML = "";
+
+  sidebarAgentsList.appendChild(sectionHeader("agents", "Agents", enabled.length));
+  if (isSecCollapsed("agents")) return;
 
   // Manage link always present.
   const manage = document.createElement("button");
@@ -350,12 +366,43 @@ function startRename(row, sid, currentLabel) {
   input.addEventListener("blur", () => { if (renaming === sid) commit(); });
 }
 
-function sectionHeader(text) {
-  const h = document.createElement("div");
-  h.className = "session-section";
-  h.textContent = text;
+function sectionHeader(id, text, count) {
+  const h = document.createElement("button");
+  h.type = "button";
+  h.className = `session-section${isSecCollapsed(id) ? " collapsed" : ""}`;
+  h.innerHTML = `
+    <span class="section-caret">${icon("chevron-down", 10)}</span>
+    <span class="section-text">${escapeHtml(text)}</span>
+    ${Number.isFinite(count) && count > 0 ? `<span class="section-count">${count}</span>` : ""}
+  `;
+  h.addEventListener("click", () => toggleSection(id));
   return h;
 }
+
+/** Bucket a session by its last activity for the grouped Recent list. */
+function groupOf(s) {
+  const raw =
+    field(s, "lastMessageAt", "last_message_at") || field(s, "createdAt", "created_at") || "";
+  const d = new Date(String(raw).replace(" ", "T"));
+  if (isNaN(d.getTime())) return "earlier";
+  const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startYesterday = new Date(startToday);
+  startYesterday.setDate(startYesterday.getDate() - 1);
+  const startWeek = new Date(startToday);
+  startWeek.setDate(startWeek.getDate() - 6);
+  if (d >= startToday) return "today";
+  if (d >= startYesterday) return "yesterday";
+  if (d >= startWeek) return "week";
+  return "earlier";
+}
+
+const RECENT_GROUPS = [
+  ["today", "Today"],
+  ["yesterday", "Yesterday"],
+  ["week", "This Week"],
+  ["earlier", "Earlier"],
+];
 
 let sessionListSeq = 0;
 export async function refreshSessionList() {
@@ -388,12 +435,32 @@ export async function refreshSessionList() {
   }
 
   if (pinned.length) {
-    sessionList.appendChild(sectionHeader("Pinned"));
-    pinned.forEach((s, i) => sessionList.appendChild(sessionRow(s, i)));
+    sessionList.appendChild(sectionHeader("pinned", "Pinned", pinned.length));
+    if (!isSecCollapsed("pinned")) {
+      pinned.forEach((s, i) => sessionList.appendChild(sessionRow(s, i)));
+    }
   }
-  if (recent.length) {
-    sessionList.appendChild(sectionHeader("Recent"));
-    recent.forEach((s, i) => sessionList.appendChild(sessionRow(s, i)));
+
+  // While searching, results already match a query — date buckets just add noise.
+  if (searchQuery) {
+    if (recent.length) {
+      const h = document.createElement("div");
+      h.className = "session-section static";
+      h.innerHTML = `<span class="section-text">Results</span><span class="section-count">${recent.length}</span>`;
+      sessionList.appendChild(h);
+      recent.forEach((s, i) => sessionList.appendChild(sessionRow(s, i)));
+    }
+    return;
+  }
+
+  const buckets = new Map(RECENT_GROUPS.map(([id]) => [id, []]));
+  for (const s of recent) buckets.get(groupOf(s)).push(s);
+  for (const [id, label] of RECENT_GROUPS) {
+    const items = buckets.get(id);
+    if (!items.length) continue;
+    sessionList.appendChild(sectionHeader(id, label, items.length));
+    if (isSecCollapsed(id)) continue;
+    items.forEach((s, i) => sessionList.appendChild(sessionRow(s, i)));
   }
 }
 
@@ -605,12 +672,11 @@ export function updateSidebar() {
   const settingsOpen = getTilesByType("settings").length > 0;
   if (navSettingsBtn) {
     navSettingsBtn.classList.toggle("open", settingsOpen);
-    const dot = navSettingsBtn.querySelector(".nav-dot");
-    if (dot) dot.className = `nav-dot ${settingsOpen ? "purple" : "off"}`;
   }
 }
 
 export function initSidebar() {
+  if (navSettingsBtn) navSettingsBtn.innerHTML = icon("settings", 15);
   wireSearch();
   wireCollapse();
   wireFooterSwitchers();

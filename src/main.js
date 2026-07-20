@@ -47,6 +47,9 @@ async function bootPopout() {
   const shell = document.querySelector(".shell");
   if (sidebar) sidebar.style.display = "none";
   if (shell) shell.style.gridTemplateColumns = "1fr";
+  // No sidebar in pop-outs — never show the collapsed-state expand handle either.
+  const fab = document.getElementById("sidebar-expand-fab");
+  if (fab) fab.style.display = "none";
 
   await setupEventListeners();
   try { ui.loadedSettings = await invoke("get_app_settings"); } catch { ui.loadedSettings = {}; }
