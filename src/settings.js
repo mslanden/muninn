@@ -61,6 +61,30 @@ export function renderSettingsTile(tileObj, body) {
           <input type="number" min="1" step="1024" placeholder="Max response tokens (e.g. 40960)" data-s-maxtokens="${tileObj.id}" style="flex:1;" />
         </div>
         <span class="muted" style="font-size:10px;">Output-token ceiling per response. Too low truncates long file writes mid-call. Blank = 40960.</span>
+        <div class="form-row" style="margin-top:8px;">
+          <select data-s-fbprovider="${tileObj.id}" style="flex:1; min-width:0;">
+            <option value="">No fallback provider</option>
+            <option value="minimax">MiniMax (Anthropic-compatible)</option>
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="groq">Groq</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="xai">xAI (Grok)</option>
+            <option value="google">Google (Gemini)</option>
+            <option value="mistral">Mistral</option>
+            <option value="together">Together</option>
+            <option value="fireworks">Fireworks</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="cohere">Cohere</option>
+            <option value="meta">Meta (Muse Spark)</option>
+            <option value="custom">Custom (OpenAI-compatible)</option>
+          </select>
+          <input type="text" placeholder="Fallback model" data-s-fbmodel="${tileObj.id}" style="flex:1.3; min-width:120px;" />
+        </div>
+        <span class="muted" style="font-size:10px;">Retried automatically when the primary model's first request fails. Blank model = the fallback provider's remembered model.</span>
+        <label class="checkbox-inline" style="margin-top:6px;">
+          <input type="checkbox" data-s-keyfallback="${tileObj.id}" /> Allow the OpenAI key as a stand-in for providers without their own key
+        </label>
       </div>
       <div class="settings-group">
         <h3>API Keys</h3>
@@ -265,6 +289,9 @@ export function renderSettingsTile(tileObj, body) {
   const autostartInput = body.querySelector(`[data-s-autostart="${tileObj.id}"]`);
   const notifyInput = body.querySelector(`[data-s-notify="${tileObj.id}"]`);
   const qaShortcutInput = body.querySelector(`[data-s-qashortcut="${tileObj.id}"]`);
+  const fbProviderSelect = body.querySelector(`[data-s-fbprovider="${tileObj.id}"]`);
+  const fbModelInput = body.querySelector(`[data-s-fbmodel="${tileObj.id}"]`);
+  const keyFallbackInput = body.querySelector(`[data-s-keyfallback="${tileObj.id}"]`);
   const autoVerifyInput = body.querySelector(`[data-s-autoverify="${tileObj.id}"]`);
   const localTranscribeInput = body.querySelector(`[data-s-localtranscribe="${tileObj.id}"]`);
   const hwEncodeInput = body.querySelector(`[data-s-hwencode="${tileObj.id}"]`);
@@ -500,6 +527,9 @@ export function renderSettingsTile(tileObj, body) {
     modelDatalist.innerHTML = "";
     modelStatusEl.textContent = "";
     maxTokensInput.value = s["llm/max_tokens"] || "";
+    fbProviderSelect.value = s["llm/fallback_provider"] || "";
+    fbModelInput.value = s["llm/fallback_model"] || "";
+    keyFallbackInput.checked = s["llm/key_fallback"] !== "0"; // default ON when unset
     updateProviderHint();
 
     groqInput.value = "";
@@ -554,6 +584,9 @@ export function renderSettingsTile(tileObj, body) {
       "llm/provider": providerSelect.value,
       "llm/model": modelSelect.value.trim(),
       "llm/custom_base_url": customBaseInput.value.trim(),
+      "llm/fallback_provider": fbProviderSelect.value,
+      "llm/fallback_model": fbModelInput.value.trim(),
+      "llm/key_fallback": keyFallbackInput.checked ? "1" : "0",
       "tts/provider": ttsProvSelect.value,
       "tts/model": ttsModelInput.value.trim(),
       "stt/provider": sttProvSelect.value,

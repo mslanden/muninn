@@ -2052,6 +2052,16 @@ pub(crate) async fn execute_agent_tool(
         "references" | "refs" => "find_references",
         "http" | "http_fetch" => "http_request",
         "test" | "tests" => "run_tests",
+        "agents" | "get_agents" => "list_agents",
+        "add_agent" | "new_agent" => "create_agent",
+        "edit_agent" => "update_agent",
+        "remove_agent" => "delete_agent",
+        "run_agent" | "delegate" | "use_agent" | "invoke_agent" => "call_agent",
+        "get_setting" | "list_settings" | "read_settings" => "get_settings",
+        "update_setting" | "change_setting" | "set_settings" => "set_setting",
+        "theme" | "change_theme" => "set_theme",
+        "models" | "fetch_models" => "list_models",
+        "test_connection" | "test_model" => "test_llm_connection",
         other => other,
     };
 
@@ -2693,6 +2703,23 @@ pub(crate) async fn execute_agent_tool(
         "update_task" => update_task_tool(app, state, arguments),
         "delete_task" => delete_task_tool(app, state, arguments),
         "run_task" => run_task_tool(app, state, arguments),
+        "list_agents" => list_agents_tool(state),
+        "create_agent" => create_agent_tool(app, state, arguments),
+        "update_agent" => update_agent_tool(app, state, arguments),
+        "delete_agent" => delete_agent_tool(app, state, arguments),
+        "call_agent" => {
+            call_agent_tool(app, state, session_id, arguments, &effective_scope).await
+        }
+        "get_settings" => crate::config_tools::get_settings_tool(state),
+        "set_setting" => {
+            crate::config_tools::set_setting_tool(app, state, session_id, arguments, interactive)
+                .await
+        }
+        "set_theme" => crate::config_tools::set_theme_tool(app, arguments),
+        "list_models" => crate::config_tools::list_models_tool(state, arguments).await,
+        "test_llm_connection" => {
+            crate::config_tools::test_llm_connection_tool(state, arguments).await
+        }
         "list_inbox" => {
             let limit = arguments
                 .get("limit")
@@ -2978,12 +3005,13 @@ pub(crate) fn create_task_tool(
     let chain_next = chain_next_json(args.get("chain_next"));
     let conditions = args.get("conditions").and_then(Value::as_str).unwrap_or("").to_string();
     let project_path = validate_task_project_path(args)?.unwrap_or_default();
+    let agent_id = validate_task_agent_id(state, args)?.unwrap_or_default();
 
     let id: i64 = with_db(state, |db| {
         db.execute(
-            r#"INSERT INTO tasks (name, description, schedule, schedule_config, next_run, chain_next, conditions, project_path, status, updated_at)
-               VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, 'scheduled', CURRENT_TIMESTAMP)"#,
-            rusqlite::params![name, description, schedule, next_run, chain_next, conditions, project_path],
+            r#"INSERT INTO tasks (name, description, schedule, schedule_config, next_run, chain_next, conditions, project_path, agent_id, status, updated_at)
+               VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, 'scheduled', CURRENT_TIMESTAMP)"#,
+            rusqlite::params![name, description, schedule, next_run, chain_next, conditions, project_path, agent_id],
         )
         .map_err(|e| e.to_string())?;
         Ok(db.last_insert_rowid())
@@ -2999,6 +3027,9 @@ pub(crate) fn create_task_tool(
     });
     if !project_path.is_empty() {
         out["project_path"] = serde_json::json!(project_path);
+    }
+    if !agent_id.is_empty() {
+        out["agent_id"] = serde_json::json!(agent_id);
     }
     // No schedule and no next_run is legitimate (chain children, manual tasks) —
     // but flag it so the model knows the task won't fire on its own.
@@ -3083,15 +3114,16 @@ pub(crate) fn update_task_tool(
         }
     }
 
-    // Validate (and normalize) a supplied project_path before touching the row.
+    // Validate (and normalize) a supplied project_path / agent_id before touching the row.
     let project_path_arg = validate_task_project_path(args)?;
+    let agent_id_arg = validate_task_agent_id(state, args)?;
 
     let changed = with_db(state, |db| {
         // Load existing so we only overwrite the fields the caller supplied.
         #[allow(clippy::type_complexity)]
-        let existing: Option<(String, String, String, String, String, String, String, String, String)> = db
+        let existing: Option<(String, String, String, String, String, String, String, String, String, String)> = db
             .query_row(
-                "SELECT name, description, schedule, schedule_config, next_run, status, chain_next, conditions, project_path FROM tasks WHERE id = ?1",
+                "SELECT name, description, schedule, schedule_config, next_run, status, chain_next, conditions, project_path, agent_id FROM tasks WHERE id = ?1",
                 rusqlite::params![id],
                 |row| {
                     Ok((
@@ -3104,12 +3136,13 @@ pub(crate) fn update_task_tool(
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
                         row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
                     ))
                 },
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        let (name0, desc0, sched0, sconf0, next0, status0, chain0, cond0, pp0) = match existing {
+        let (name0, desc0, sched0, sconf0, next0, status0, chain0, cond0, pp0, aid0) = match existing {
             Some(t) => t,
             None => return Ok(0),
         };
@@ -3169,15 +3202,17 @@ pub(crate) fn update_task_tool(
         };
         // project_path: replace when supplied (validated above; empty string clears), else keep.
         let project_path = project_path_arg.unwrap_or(pp0);
+        // agent_id: replace when supplied (validated above; empty string clears), else keep.
+        let agent_id = agent_id_arg.unwrap_or(aid0);
 
         let changed = db
             .execute(
                 r#"UPDATE tasks
                    SET name = ?2, description = ?3, schedule = ?4, schedule_config = ?5,
                        next_run = ?6, status = ?7, chain_next = ?8, conditions = ?9,
-                       project_path = ?10, updated_at = CURRENT_TIMESTAMP
+                       project_path = ?10, agent_id = ?11, updated_at = CURRENT_TIMESTAMP
                    WHERE id = ?1"#,
-                rusqlite::params![id, name, description, schedule, schedule_config, next_run, status, chain_next, conditions, project_path],
+                rusqlite::params![id, name, description, schedule, schedule_config, next_run, status, chain_next, conditions, project_path, agent_id],
             )
             .map_err(|e| e.to_string())?;
         Ok(changed)
@@ -3244,6 +3279,398 @@ pub(crate) fn delete_task_tool(
     }
     let _ = app.emit("tasks-changed", ());
     Ok(serde_json::json!({"ok": true, "id": id, "deleted": changed}).to_string())
+}
+
+// --- Agent management tools (list/create/update/delete/call) ---
+
+/// Resolve an agent reference: exact agent_id first, then case-insensitive unique name
+/// match. A name shared by several agents errors rather than guessing.
+fn resolve_agent_ref(state: &AppState, agent_ref: &str) -> Result<crate::models::AgentRecord, String> {
+    if let Ok(agent) = crate::llm::load_agent_by_id(state, agent_ref) {
+        return Ok(agent);
+    }
+    let wanted = agent_ref.trim().to_lowercase();
+    let mut matches: Vec<crate::models::AgentRecord> = list_agent_records(state)?
+        .into_iter()
+        .filter(|a| a.name.trim().to_lowercase() == wanted)
+        .collect();
+    match matches.len() {
+        0 => Err(format!(
+            "no agent with id or name '{}'. Use list_agents to see what exists.",
+            agent_ref
+        )),
+        1 => Ok(matches.remove(0)),
+        n => Err(format!(
+            "{} agents are named '{}' — refer to one by agent_id instead (see list_agents).",
+            n, agent_ref
+        )),
+    }
+}
+
+fn list_agent_records(state: &AppState) -> Result<Vec<crate::models::AgentRecord>, String> {
+    with_db(state, |db| {
+        let mut stmt = db
+            .prepare(
+                "SELECT agent_id, name, description, slash_command, system_prompt, max_iterations,
+                        enabled, allowed_tools_json, created_at, updated_at
+                 FROM agents ORDER BY datetime(updated_at) DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::models::AgentRecord {
+                    agent_id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    slash_command: row.get(3)?,
+                    system_prompt: row.get(4)?,
+                    max_iterations: row.get(5)?,
+                    enabled: row.get::<_, i64>(6)? == 1,
+                    allowed_tools_json: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    })
+}
+
+/// Validate an optional `allowed_tools` argument against the tools registry. Returns
+/// `None` when the key wasn't supplied, otherwise the validated JSON-array string to
+/// store ("[]" = all enabled tools). Unknown tool ids error so a typo can't produce an
+/// agent whose tools silently don't exist.
+fn validate_agent_allowed_tools(state: &AppState, args: &Value) -> Result<Option<String>, String> {
+    let Some(raw) = args.get("allowed_tools") else {
+        return Ok(None);
+    };
+    let names: Vec<String> = serde_json::from_value(raw.clone())
+        .map_err(|_| "allowed_tools must be an array of tool-id strings".to_string())?;
+    let known: HashSet<String> = with_db(state, |db| {
+        let mut stmt = db.prepare("SELECT tool_id FROM tools").map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashSet<_>, _>>().map_err(|e| e.to_string())
+    })?;
+    let mut cleaned = Vec::new();
+    for name in names {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if !known.contains(&name) {
+            let mut valid: Vec<&String> = known.iter().collect();
+            valid.sort();
+            return Err(format!(
+                "unknown tool '{}' in allowed_tools. Valid tool ids: {}",
+                name,
+                valid.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        cleaned.push(name);
+    }
+    serde_json::to_string(&cleaned).map(Some).map_err(|e| e.to_string())
+}
+
+fn agent_summary_json(a: &crate::models::AgentRecord) -> Value {
+    let allowed: Vec<String> = serde_json::from_str(&a.allowed_tools_json).unwrap_or_default();
+    serde_json::json!({
+        "agent_id": a.agent_id,
+        "name": a.name,
+        "description": a.description,
+        "slash_command": a.slash_command,
+        "enabled": a.enabled,
+        "max_iterations": a.max_iterations,
+        "allowed_tools": if allowed.is_empty() { serde_json::json!("(all enabled tools)") } else { serde_json::json!(allowed) },
+        "system_prompt_preview": truncate_chars(&a.system_prompt, 200),
+    })
+}
+
+pub(crate) fn list_agents_tool(state: &AppState) -> Result<String, String> {
+    let agents = list_agent_records(state)?;
+    let items: Vec<Value> = agents.iter().map(agent_summary_json).collect();
+    Ok(serde_json::json!({"count": items.len(), "agents": items}).to_string())
+}
+
+pub(crate) fn create_agent_tool(
+    app: &AppHandle,
+    state: &AppState,
+    args: &Value,
+) -> Result<String, String> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing agent name".to_string())?
+        .to_string();
+    // Unique names keep name-based references (call_agent, task targeting) unambiguous.
+    let clash = list_agent_records(state)?
+        .iter()
+        .any(|a| a.name.trim().eq_ignore_ascii_case(&name));
+    if clash {
+        return Err(format!(
+            "an agent named '{}' already exists — pick a different name or update_agent it",
+            name
+        ));
+    }
+    let system_prompt = args
+        .get("system_prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing system_prompt — describe the agent's role and how it should work".to_string())?
+        .to_string();
+    let description = args.get("description").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let slash_command = args
+        .get("slash_command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('/')
+        .to_string();
+    let max_iterations = match args.get("max_iterations").and_then(Value::as_i64) {
+        None => 5,
+        Some(n) if (1..=100).contains(&n) => n,
+        Some(n) => return Err(format!("max_iterations must be 1-100 (got {})", n)),
+    };
+    let allowed = validate_agent_allowed_tools(state, args)?.unwrap_or_else(|| "[]".to_string());
+
+    let agent_id = uuid::Uuid::new_v4().to_string();
+    with_db(state, |db| {
+        db.execute(
+            r#"INSERT INTO agents (
+                 agent_id, name, description, slash_command, system_prompt,
+                 max_iterations, enabled, allowed_tools_json, updated_at
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, CURRENT_TIMESTAMP)"#,
+            rusqlite::params![agent_id, name, description, slash_command, system_prompt, max_iterations, allowed],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })?;
+    let _ = app.emit("agents-changed", ());
+    Ok(serde_json::json!({
+        "ok": true,
+        "agent_id": agent_id,
+        "name": name,
+        "note": "use call_agent to invoke it now, or set agent_id on a task to schedule it"
+    })
+    .to_string())
+}
+
+pub(crate) fn update_agent_tool(
+    app: &AppHandle,
+    state: &AppState,
+    args: &Value,
+) -> Result<String, String> {
+    let agent_ref = args
+        .get("agent")
+        .or_else(|| args.get("agent_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing agent (id or name, from list_agents)".to_string())?;
+    let existing = resolve_agent_ref(state, agent_ref)?;
+
+    let name = match args.get("name").and_then(Value::as_str).map(str::trim) {
+        None => existing.name.clone(),
+        Some("") => return Err("agent name cannot be empty".to_string()),
+        Some(n) => {
+            let clash = list_agent_records(state)?.iter().any(|a| {
+                a.agent_id != existing.agent_id && a.name.trim().eq_ignore_ascii_case(n)
+            });
+            if clash {
+                return Err(format!("another agent is already named '{}'", n));
+            }
+            n.to_string()
+        }
+    };
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .unwrap_or(existing.description);
+    let system_prompt = args
+        .get("system_prompt")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .unwrap_or(existing.system_prompt);
+    let slash_command = args
+        .get("slash_command")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().trim_start_matches('/').to_string())
+        .unwrap_or(existing.slash_command);
+    let max_iterations = match args.get("max_iterations").and_then(Value::as_i64) {
+        None => existing.max_iterations,
+        Some(n) if (1..=100).contains(&n) => n,
+        Some(n) => return Err(format!("max_iterations must be 1-100 (got {})", n)),
+    };
+    let enabled = match args.get("enabled") {
+        None => existing.enabled,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| "enabled must be true or false".to_string())?,
+    };
+    let allowed = validate_agent_allowed_tools(state, args)?.unwrap_or(existing.allowed_tools_json);
+
+    with_db(state, |db| {
+        db.execute(
+            r#"UPDATE agents
+               SET name = ?2, description = ?3, slash_command = ?4, system_prompt = ?5,
+                   max_iterations = ?6, enabled = ?7, allowed_tools_json = ?8,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE agent_id = ?1"#,
+            rusqlite::params![
+                existing.agent_id, name, description, slash_command, system_prompt,
+                max_iterations, if enabled { 1 } else { 0 }, allowed
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })?;
+    let _ = app.emit("agents-changed", ());
+    Ok(serde_json::json!({"ok": true, "agent_id": existing.agent_id, "name": name}).to_string())
+}
+
+pub(crate) fn delete_agent_tool(
+    app: &AppHandle,
+    state: &AppState,
+    args: &Value,
+) -> Result<String, String> {
+    let agent_ref = args
+        .get("agent")
+        .or_else(|| args.get("agent_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing agent (id or name, from list_agents)".to_string())?;
+    let agent = resolve_agent_ref(state, agent_ref)?;
+
+    // Tasks pointing at this agent would fail at run time — surface that, don't hide it.
+    let referencing: i64 = with_db(state, |db| {
+        db.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE agent_id = ?1",
+            rusqlite::params![agent.agent_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
+    })?;
+
+    with_db(state, |db| {
+        db.execute("DELETE FROM agents WHERE agent_id = ?1", rusqlite::params![agent.agent_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })?;
+    let _ = app.emit("agents-changed", ());
+    let mut out = serde_json::json!({"ok": true, "agent_id": agent.agent_id, "name": agent.name, "deleted": true});
+    if referencing > 0 {
+        out["warning"] = serde_json::json!(format!(
+            "{} task(s) still target this agent and will fail until reassigned (update_task with a new agent_id or empty string to clear)",
+            referencing
+        ));
+    }
+    Ok(out.to_string())
+}
+
+/// Invoke a custom agent inline and return its final answer as the tool result. The
+/// delegated run is autonomous (`interactive: false` — ask_user unavailable, dangerous
+/// commands hard-blocked) and uses a synthetic sub-session id, so its internal tool
+/// rounds are not persisted into the parent chat history (no `sessions` row → the
+/// loop's insert_message no-ops, same trick as run_project_init). One level only:
+/// a delegated agent cannot delegate further.
+pub(crate) async fn call_agent_tool(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    args: &Value,
+    scope: &WorkspaceScope,
+) -> Result<String, String> {
+    if session_id.contains("::delegate") {
+        return Err(
+            "nested delegation is not supported — you are already running as a delegated \
+             agent. Do the work yourself with your own tools."
+                .to_string(),
+        );
+    }
+    let agent_ref = args
+        .get("agent")
+        .or_else(|| args.get("agent_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing agent (id or name, from list_agents)".to_string())?;
+    let prompt = args
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing prompt — the task for the agent, self-contained".to_string())?;
+
+    let agent = resolve_agent_ref(state, agent_ref)?;
+    if !agent.enabled {
+        return Err(format!("agent '{}' is disabled — enable it first (update_agent)", agent.name));
+    }
+
+    let sub_session = format!(
+        "{}::delegate-{}",
+        session_id,
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    let history = vec![crate::models::HistoryMessage::text("user", prompt)];
+
+    // Peek (don't consume) the parent session's stop flag so the user's Stop button
+    // also aborts a runaway delegate; the parent loop still sees and consumes the
+    // flag on its next round check. Box::pin breaks the async recursion cycle
+    // (call_agent → run_agent → tool loop → call_agent) that would otherwise make
+    // this future infinitely sized.
+    let mut run = Box::pin(crate::llm::run_agent(
+        app, state, &sub_session, &agent.agent_id, &history, Some(scope), false,
+    ));
+    let result = loop {
+        tokio::select! {
+            res = &mut run => break res,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(400)) => {
+                let stopped = state
+                    .stop_requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(session_id);
+                if stopped {
+                    return Err("delegated agent run aborted: the user pressed stop".to_string());
+                }
+            }
+        }
+    };
+
+    let (text, _blocks) = result.map_err(|e| format!("agent '{}' failed: {}", agent.name, e))?;
+    Ok(format!("[agent '{}' result]\n{}", agent.name, text))
+}
+
+/// Validate an optional `agent_id` tool argument for task create/update. Returns `None`
+/// when not supplied (keep existing), `Some("")` for an explicit clear, and the resolved
+/// agent_id for a non-empty reference (accepts agent name too) — which must exist and be
+/// enabled, so a bad reference fails at create/update instead of at run time.
+fn validate_task_agent_id(state: &AppState, args: &Value) -> Result<Option<String>, String> {
+    let raw = match args.get("agent_id").and_then(Value::as_str) {
+        None => return Ok(None),
+        Some(s) => s.trim(),
+    };
+    if raw.is_empty() {
+        return Ok(Some(String::new()));
+    }
+    let agent = resolve_agent_ref(state, raw)?;
+    if !agent.enabled {
+        return Err(format!(
+            "agent '{}' is disabled — enable it first or target a different agent",
+            agent.name
+        ));
+    }
+    Ok(Some(agent.agent_id))
 }
 
 pub(crate) fn parse_tool_code_block(text: &str) -> Option<(String, String)> {

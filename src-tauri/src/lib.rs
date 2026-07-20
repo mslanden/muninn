@@ -1,6 +1,7 @@
 mod audio;
 mod calendar;
 mod commands;
+mod config_tools;
 mod db;
 mod feeds;
 mod interactive;

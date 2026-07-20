@@ -52,6 +52,15 @@ pub async fn fetch_models(
     state: State<'_, AppState>,
     provider: String,
 ) -> Result<Vec<ModelInfo>, String> {
+    fetch_models_impl(&state, provider.trim()).await
+}
+
+/// Shared implementation, also called by the agent's `list_models` tool (which has a
+/// bare `&AppState` rather than a tauri `State`).
+pub(crate) async fn fetch_models_impl(
+    state: &AppState,
+    provider: &str,
+) -> Result<Vec<ModelInfo>, String> {
     let provider = provider.trim().to_string();
     if provider == "minimax" {
         return Err("MiniMax has no public models API".to_string());
@@ -190,8 +199,17 @@ pub async fn test_llm_connection(
     provider: String,
     model: String,
 ) -> Result<String, String> {
+    test_llm_connection_impl(&state, provider.trim(), &model).await
+}
+
+/// Shared implementation, also called by the agent's `test_llm_connection` tool.
+pub(crate) async fn test_llm_connection_impl(
+    state: &AppState,
+    provider: &str,
+    model: &str,
+) -> Result<String, String> {
     let (is_anthropic, endpoint, api_key) =
-        crate::llm::resolve_provider_wire(&state, provider.trim())?;
+        crate::llm::resolve_provider_wire(state, provider.trim())?;
 
     let body = serde_json::json!({
         "model": model,

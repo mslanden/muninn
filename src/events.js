@@ -1,13 +1,15 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { tiles, chatStreams, tileMaps, ui } from "./state.js";
+import { tiles, chatStreams, tileMaps, ui, sidebarModel } from "./state.js";
 import { escapeHtml, renderMarkdown } from "./utils.js";
 import { getTilesByType, getChatTileBySessionId } from "./tilesys.js";
 import { playTts, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn } from "./chat.js";
 import { renderTasksTile } from "./tasks.js";
 import { renderMemoryTile } from "./memory.js";
 import { renderContentTile } from "./content.js";
-import { isDarkTheme } from "./theme.js";
+import { isDarkTheme, applyTheme } from "./theme.js";
+import { renderSettingsTile } from "./settings.js";
+import { renderAgentsTile } from "./agents.js";
 
 // ==================== TAURI EVENT LISTENERS ====================
 export async function setupEventListeners() {
@@ -310,6 +312,40 @@ export async function setupEventListeners() {
       const body = t.el.querySelector(".tile-body");
       if (body) renderMemoryTile(t, body);
     }
+  });
+
+  await listen("agents-changed", async () => {
+    // The agent created/edited/deleted a custom agent via tools — refresh the cache
+    // (slash commands, task agent pickers) and any open Agents tiles.
+    try { ui.cachedAgents = await invoke("get_agents"); } catch { /* keep old cache */ }
+    const agentTiles = getTilesByType("agents");
+    for (const t of agentTiles) {
+      const body = t.el.querySelector(".tile-body");
+      if (body) renderAgentsTile(t, body);
+    }
+  });
+
+  await listen("settings-updated", async () => {
+    // The agent changed a setting via set_setting — resync cached settings and any open
+    // Settings tiles so the UI doesn't show stale values.
+    try { ui.loadedSettings = await invoke("get_app_settings"); } catch { /* keep old cache */ }
+    if (sidebarModel) {
+      sidebarModel.textContent = ui.loadedSettings["llm/model"] || "MiniMax-M3";
+      sidebarModel.title = ui.loadedSettings["llm/model"] || "MiniMax-M3";
+    }
+    const settingsTiles = getTilesByType("settings");
+    for (const t of settingsTiles) {
+      const body = t.el.querySelector(".tile-body");
+      if (body) renderSettingsTile(t, body);
+    }
+  });
+
+  await listen("theme-changed", (event) => {
+    // The agent's set_theme tool — same effect as picking the theme in Settings.
+    const theme = event.payload?.theme;
+    if (!theme) return;
+    localStorage.setItem("muninn-theme", theme);
+    applyTheme(theme);
   });
 
   await listen("tasks-changed", () => {

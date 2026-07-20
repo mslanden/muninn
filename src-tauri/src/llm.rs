@@ -425,8 +425,18 @@ pub(crate) fn resolve_provider_key(state: &AppState, provider: &str) -> Result<S
         return Ok(key);
     } else {
         let key_setting = format!("llm/{}_api_key", provider);
-        first_non_empty_setting(state, &[&key_setting, "llm/openai_api_key"])?
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        // llm/key_fallback (default on) controls whether a generic provider without its
+        // own key may fall back to the OpenAI key. That fallback is usually wrong (the
+        // request just 401s with a confusing error), so users can disable it to get an
+        // honest "no key configured" instead.
+        let allow_openai_fallback =
+            get_app_setting_value(state, "llm/key_fallback")?.as_deref() != Some("0");
+        if allow_openai_fallback {
+            first_non_empty_setting(state, &[&key_setting, "llm/openai_api_key"])?
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        } else {
+            first_non_empty_setting(state, &[&key_setting])?
+        }
     };
 
     key_opt
@@ -2929,7 +2939,8 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "next_run": {"type": "string", "description": "ISO timestamp for first run (YYYY-MM-DDTHH:MM:SS). Optional; computed from schedule if omitted."},
                     "chain_next": {"type": "array", "items": {"type": "integer"}, "description": "Optional task ids to run after this one finishes successfully. Each downstream task fires on the next scheduler tick with this task's full output prepended to its prompt. Build workflows by creating the downstream tasks first (no schedule), then referencing their ids here."},
                     "conditions": {"type": "string", "description": "Optional natural-language gate. When this task is fired by an upstream task in a chain, it runs only if this condition holds for the upstream output — e.g. 'only if there are unread emails'. Ignored for the task's own scheduled runs."},
-                    "project_path": {"type": "string", "description": "Optional absolute folder path; the task run's file/shell tools are scoped to this folder (its workspace). Must be an existing directory. Omit to run in the default workspace root."}
+                    "project_path": {"type": "string", "description": "Optional absolute folder path; the task run's file/shell tools are scoped to this folder (its workspace). Must be an existing directory. Omit to run in the default workspace root."},
+                    "agent_id": {"type": "string", "description": "Optional custom agent (id or unique name, from list_agents) to run this task through — the run uses that agent's system prompt and tool allowlist instead of the default Muninn persona. Must exist and be enabled."}
                 },
                 "required": ["name", "description"]
             }),
@@ -2962,6 +2973,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "chain_next": {"type": "array", "items": {"type": "integer"}, "description": "Task ids to run after this one succeeds (replaces the existing chain). Pass an empty array to clear."},
                     "conditions": {"type": "string", "description": "Natural-language gate for chain-triggered runs (replaces existing). Pass an empty string to clear."},
                     "project_path": {"type": "string", "description": "Absolute folder path to scope the task run's file/shell tools to (must be an existing directory). Pass an empty string to clear (run in the default workspace root)."},
+                    "agent_id": {"type": "string", "description": "Custom agent (id or unique name) to run this task through. Pass an empty string to clear (run as default Muninn)."},
                     "status": {"type": "string", "description": "scheduled, completed, or paused (running/failed are engine-managed and can't be set)"}
                 },
                 "required": ["id"]
@@ -2991,6 +3003,81 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "id": {"type": "integer", "description": "Task id (from list_tasks)"}
                 },
                 "required": ["id"]
+            }),
+        ));
+    }
+    if enabled.contains("list_agents") {
+        defs.push((
+            "list_agents",
+            "List the custom agents: id, name, description, enabled, tool allowlist, and a system-prompt preview. Use before call_agent, update_agent, delete_agent, or targeting an agent from a task.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ));
+    }
+    if enabled.contains("create_agent") {
+        defs.push((
+            "create_agent",
+            "Create a reusable custom agent: a named persona with its own system prompt and tool allowlist. Use for specialist roles you (or scheduled tasks) will invoke repeatedly — e.g. a code reviewer, a news summarizer. After creating, invoke it with call_agent or attach it to a task via agent_id.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Unique agent name, e.g. 'Code Reviewer'."},
+                    "system_prompt": {"type": "string", "description": "The agent's role and working instructions. Written as a system prompt: who it is, how it should approach tasks, what its output should look like."},
+                    "description": {"type": "string", "description": "One-line summary shown in the Agents panel."},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool ids this agent may use (validated against the tools registry). Omit or pass [] to allow all enabled tools. Prefer a minimal list — e.g. a summarizer needs web_search/web_fetch, not run_command."},
+                    "max_iterations": {"type": "integer", "description": "Iteration budget hint (1-100, default 5)."},
+                    "slash_command": {"type": "string", "description": "Optional slash command (without the /) to invoke it from chat."}
+                },
+                "required": ["name", "system_prompt"]
+            }),
+        ));
+    }
+    if enabled.contains("update_agent") {
+        defs.push((
+            "update_agent",
+            "Edit an existing custom agent. Supply the agent (id or name) and any fields to change; omitted fields are left as-is. Set enabled: false to disable without deleting.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Agent id or unique name (from list_agents)."},
+                    "name": {"type": "string"},
+                    "system_prompt": {"type": "string"},
+                    "description": {"type": "string"},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Replaces the allowlist. Pass [] to allow all enabled tools."},
+                    "max_iterations": {"type": "integer"},
+                    "slash_command": {"type": "string"},
+                    "enabled": {"type": "boolean"}
+                },
+                "required": ["agent"]
+            }),
+        ));
+    }
+    if enabled.contains("delete_agent") {
+        defs.push((
+            "delete_agent",
+            "Delete a custom agent by id or name. Tasks still targeting it will fail until reassigned — the result warns you if any exist.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Agent id or unique name (from list_agents)."}
+                },
+                "required": ["agent"]
+            }),
+        ));
+    }
+    if enabled.contains("call_agent") {
+        defs.push((
+            "call_agent",
+            "Delegate a sub-task to a custom agent and get its final answer back as this tool's result. The agent runs autonomously with its own system prompt and tool allowlist in the current workspace: it cannot ask the user questions, dangerous shell commands are blocked, and it cannot delegate further. The call waits for the agent to finish — use it for focused sub-tasks ('review this diff', 'research X and summarize'), not open-ended work. The prompt must be self-contained: the agent sees none of this conversation.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Agent id or unique name (from list_agents)."},
+                    "prompt": {"type": "string", "description": "The task for the agent. Self-contained and specific — include any context it needs, since it cannot see this chat."}
+                },
+                "required": ["agent", "prompt"]
             }),
         ));
     }
@@ -3082,6 +3169,68 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "notes": {"type": "string", "description": "Optional notes/description."}
                 },
                 "required": ["title", "start", "end"]
+            }),
+        ));
+    }
+    if enabled.contains("get_settings") {
+        defs.push((
+            "get_settings",
+            "Read the app's agent-configurable settings: current values, allowed values, and which provider API keys are usable. Secrets are never included. Call this before set_setting to see valid keys and current state.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ));
+    }
+    if enabled.contains("set_setting") {
+        defs.push((
+            "set_setting",
+            "Change one app setting (validated against a fixed schema — see get_settings for keys and allowed values). Safety-related settings prompt the user for approval first. API keys and MCP server config cannot be changed with this tool. Changes take effect immediately unless the result notes otherwise.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Setting key, e.g. 'llm/model' or 'tts/voice_id'. Must be one of the keys listed by get_settings."},
+                    "value": {"type": "string", "description": "New value. Booleans accept true/false/1/0; pass an empty string to reset defaults where allowed."}
+                },
+                "required": ["key", "value"]
+            }),
+        ));
+    }
+    if enabled.contains("set_theme") {
+        defs.push((
+            "set_theme",
+            "Switch the app's UI theme. Applies immediately and persists.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "theme": {"type": "string", "enum": ["dark", "light", "terminal", "abyss", "slate", "ember", "paper", "ocean", "system"], "description": "'system' follows the OS light/dark preference."}
+                },
+                "required": ["theme"]
+            }),
+        ));
+    }
+    if enabled.contains("list_models") {
+        defs.push((
+            "list_models",
+            "List the model ids a chat provider actually offers (queried live from its /models API). Use before changing llm/model so you set a real id. MiniMax has no models API — its known model is 'MiniMax-M3'.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "provider": {"type": "string", "description": "Provider to query (e.g. 'openai', 'groq', 'anthropic'). Defaults to the currently configured llm/provider."}
+                }
+            }),
+        ));
+    }
+    if enabled.contains("test_llm_connection") {
+        defs.push((
+            "test_llm_connection",
+            "Send a minimal test request to verify a provider/model pair works with the configured API key. Use after changing llm/provider or llm/model, or to diagnose chat failures. Returns success or the provider's HTTP error.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "provider": {"type": "string", "description": "Provider to test. Defaults to the current llm/provider."},
+                    "model": {"type": "string", "description": "Model id to test. Defaults to the configured model for that provider."}
+                }
             }),
         ));
     }
@@ -3183,6 +3332,7 @@ struct StreamOutcome {
 /// Provider-specific wire format. Everything the OpenAI chat/completions and the
 /// Anthropic messages APIs disagree on (auth, request body, SSE framing, tool-round
 /// message shapes) lives behind this enum; the shared loop is `run_tool_loop`.
+#[derive(Clone, PartialEq)]
 enum Provider {
     OpenAi { endpoint: String, api_key: String },
     Anthropic { endpoint: String, api_key: String },
@@ -3684,6 +3834,64 @@ fn drain_captured_images(state: &AppState, session_id: &str) -> Vec<(String, Str
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Resolve the configured chat failover target (llm/fallback_provider +
+/// llm/fallback_model, with the per-provider model memory as a model fallback).
+/// Returns None when unconfigured or misconfigured — failover must never introduce a
+/// new failure mode, so any resolution problem silently means "no failover".
+fn resolve_chat_fallback(state: &AppState) -> Option<(Provider, String, String)> {
+    let provider_name = get_app_setting_value(state, "llm/fallback_provider")
+        .ok()
+        .flatten()?
+        .trim()
+        .to_string();
+    if provider_name.is_empty() {
+        return None;
+    }
+    let model = get_app_setting_value(state, "llm/fallback_model")
+        .ok()
+        .flatten()
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| {
+            get_app_setting_value(state, &format!("llm/model/{}", provider_name))
+                .ok()
+                .flatten()
+                .filter(|m| !m.trim().is_empty())
+        })?;
+    let provider = Provider::from_provider_name(state, &provider_name).ok()?;
+    Some((provider, model.trim().to_string(), provider_name))
+}
+
+/// Wrap a primary Provider construction result: when construction itself fails
+/// (typically a missing API key), fall back to the configured failover target so e.g. a
+/// local model still answers when no cloud key is set. Returns the provider plus the
+/// model to use with it — a provider swap swaps the model too.
+fn provider_or_fallback(
+    state: &AppState,
+    primary: Result<Provider, String>,
+    model: &str,
+) -> Result<(Provider, String), String> {
+    match primary {
+        Ok(p) => Ok((p, model.to_string())),
+        Err(err) => match resolve_chat_fallback(state) {
+            Some((fb, fb_model, fb_name)) => {
+                crate::db::add_feed_item(
+                    state,
+                    "system",
+                    "LLM failover",
+                    &format!(
+                        "Primary provider unavailable ({}). Using fallback {} / {}.",
+                        err, fb_name, fb_model
+                    ),
+                    "error",
+                    "",
+                );
+                Ok((fb, fb_model))
+            }
+            None => Err(err),
+        },
+    }
+}
+
 async fn run_tool_loop(
     app: &AppHandle,
     state: &AppState,
@@ -3697,6 +3905,9 @@ async fn run_tool_loop(
     interactive: bool,
     agent_name: Option<&str>,
 ) -> Result<(String, Vec<Value>), String> {
+    // Failover can swap these mid-turn, so the loop works on owned copies.
+    let mut provider = provider.clone();
+    let mut model = model.to_string();
     let mut tools = provider.tools_json(exec_tools, interactive);
     // Merge in tools from configured MCP servers (lazy-connects on first turn;
     // resilient — a broken server contributes nothing rather than failing the turn).
@@ -3705,6 +3916,7 @@ async fn run_tool_loop(
     let max_tokens = resolve_max_output_tokens(state);
     let mut tool_round: u32 = 0;
     let mut iteration: i64 = 0;
+    let mut fallback_tried = false;
 
     loop {
         if check_stop_requested(state, session_id) {
@@ -3723,8 +3935,46 @@ async fn run_tool_loop(
             });
         }
 
-        let request_body = provider.build_request(model, system_prompt, &messages, &tools, max_tokens);
-        let response = provider.send(&state.http, &request_body).await?;
+        let request_body = provider.build_request(&model, system_prompt, &messages, &tools, max_tokens);
+        let response = match provider.send(&state.http, &request_body).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                // Provider failover (llm/fallback_provider): only on the turn's FIRST
+                // request — nothing has streamed or executed yet, so rebuilding the
+                // provider-shaped tools/messages is lossless. Later rounds carry
+                // wire-format-specific message state and executed tool side effects, so
+                // a mid-turn provider swap is deliberately not attempted. `send` fails
+                // before any SSE bytes arrive, so no tokens were emitted to the UI.
+                if tool_round > 0 || fallback_tried {
+                    return Err(err);
+                }
+                let Some((fb_provider, fb_model, fb_name)) = resolve_chat_fallback(state)
+                else {
+                    return Err(err);
+                };
+                if fb_provider == provider && fb_model == model {
+                    return Err(err);
+                }
+                crate::db::add_feed_item(
+                    state,
+                    "system",
+                    "LLM failover",
+                    &format!(
+                        "Primary model '{}' failed ({}). Retrying with fallback {} / {}.",
+                        model, err, fb_name, fb_model
+                    ),
+                    "error",
+                    session_id,
+                );
+                fallback_tried = true;
+                provider = fb_provider;
+                model = fb_model;
+                tools = provider.tools_json(exec_tools, interactive);
+                tools.extend(provider.mcp_tools_json(&state.mcp.connected_tools(state).await));
+                messages = provider.initial_messages(system_prompt, history);
+                continue;
+            }
+        };
         let outcome = provider
             .parse_stream(response, |t| {
                 let _ = app.emit("chat-token", ChatTokenEvent {
@@ -3884,11 +4134,11 @@ pub(crate) async fn chat_with_openai(
     scope: Option<&WorkspaceScope>,
     interactive: bool,
 ) -> Result<(String, Vec<Value>), String> {
-    let provider = Provider::openai(state)?;
+    let (provider, model) = provider_or_fallback(state, Provider::openai(state), model)?;
     let enabled_tools = enabled_tool_ids(state)?;
     let system_prompt = resolve_chat_system_prompt(state, history, scope, interactive).await;
     run_tool_loop(
-        app, state, session_id, &provider, model, &system_prompt,
+        app, state, session_id, &provider, &model, &system_prompt,
         history, &enabled_tools, scope, interactive, None,
     )
     .await
@@ -3903,11 +4153,12 @@ pub(crate) async fn chat_with_minimax_anthropic(
     scope: Option<&WorkspaceScope>,
     interactive: bool,
 ) -> Result<(String, Vec<Value>), String> {
-    let provider = Provider::minimax_anthropic(state)?;
+    let (provider, model) =
+        provider_or_fallback(state, Provider::minimax_anthropic(state), model)?;
     let enabled_tools = enabled_tool_ids(state)?;
     let system_prompt = resolve_chat_system_prompt(state, history, scope, interactive).await;
     run_tool_loop(
-        app, state, session_id, &provider, model, &system_prompt,
+        app, state, session_id, &provider, &model, &system_prompt,
         history, &enabled_tools, scope, interactive, None,
     )
     .await
@@ -3927,11 +4178,12 @@ pub(crate) async fn chat_dynamic(
     scope: Option<&WorkspaceScope>,
     interactive: bool,
 ) -> Result<(String, Vec<Value>), String> {
-    let provider = Provider::from_provider_name(state, provider_name)?;
+    let (provider, model) =
+        provider_or_fallback(state, Provider::from_provider_name(state, provider_name), model)?;
     let enabled_tools = enabled_tool_ids(state)?;
     let system_prompt = resolve_chat_system_prompt(state, history, scope, interactive).await;
     run_tool_loop(
-        app, state, session_id, &provider, model, &system_prompt,
+        app, state, session_id, &provider, &model, &system_prompt,
         history, &enabled_tools, scope, interactive, None,
     )
     .await
@@ -4009,11 +4261,12 @@ pub(crate) async fn run_agent(
             }
         });
 
-    let provider = if provider_name == "minimax" || model.starts_with("MiniMax-") {
-        Provider::minimax_anthropic(state)?
+    let primary = if provider_name == "minimax" || model.starts_with("MiniMax-") {
+        Provider::minimax_anthropic(state)
     } else {
-        Provider::from_provider_name(state, &provider_name)?
+        Provider::from_provider_name(state, &provider_name)
     };
+    let (provider, model) = provider_or_fallback(state, primary, &model)?;
 
     // Chat-invoked agents pass scope: None, interactive: true (the previous hardcoded
     // behavior). Scheduled task runs pass the task's workspace scope and
@@ -4076,11 +4329,12 @@ pub(crate) async fn run_project_init(
             }
         });
 
-    let provider = if provider_name == "minimax" || model.starts_with("MiniMax-") {
-        Provider::minimax_anthropic(state)?
+    let primary = if provider_name == "minimax" || model.starts_with("MiniMax-") {
+        Provider::minimax_anthropic(state)
     } else {
-        Provider::from_provider_name(state, &provider_name)?
+        Provider::from_provider_name(state, &provider_name)
     };
+    let (provider, model) = provider_or_fallback(state, primary, &model)?;
 
     let history = vec![HistoryMessage::text("user", &prompt)];
 
