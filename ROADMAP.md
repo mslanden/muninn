@@ -1,140 +1,42 @@
-# Muninn V1 Roadmap
+# Muninn Roadmap
 
-## Goal
-Recreate core Verus app workflows in Tauri + Rust with **no daemon**.
-All state and logic run in the Tauri process (`src-tauri`), exposed via `#[tauri::command]`.
+Last updated: 2026-07-23. The original V1 parity plan (recreating the Verus app workflows in Tauri + Rust with no daemon) shipped in full and this file no longer tracks it — see git history for the old document.
 
-## V1 Scope (Parity Targets)
+## Shipped
 
-### 1) Chat Surface (Must Have)
-- [ ] Chat transcript (user/assistant bubbles)
-- [ ] Streaming response indicator
-- [ ] Provider + model selector
-- [ ] Slash command picker (at least basic command dispatch)
-- [ ] Stop generation
-- [ ] Tool activity panel (already present, keep and improve)
-- [ ] Session history list + reopen + delete
+Everything below is live on `main`:
 
-### 2) Navigation + Panels (Must Have)
-- [ ] Left nav rail with sections:
-  - [ ] Feed
-  - [ ] Tasks
-  - [ ] Tools
-  - [ ] Agents
-  - [ ] Memory
-  - [ ] Gallery
-  - [ ] Settings
-- [ ] Slide-over content panel for selected section
+- **Core app** — tile dashboard (chat, feeds, tasks, agents, memory, content, studio, logs, settings), pop-out windows, persisted layouts, tray-resident lifecycle
+- **Chat & providers** — streaming, stop, slash commands, session history with pin/rename/delete/search/export, provider/model selector with fetch-models + test-connection (OpenAI, MiniMax/Anthropic-compatible, Meta, custom endpoints), MiniMax-M3 native vision (paste/drag/attach screenshots)
+- **Agent tooling** — workspace-scoped file/search/shell, write/edit/append, git/code/http/test, web search/fetch, image gen, Mapbox, screen capture/open app, settings self-config (schema allowlist + ask_user gating), agent self-management CRUD + `call_agent` delegation with sub-session isolation
+- **Tasks** — natural-language schedules, chaining with condition gates, per-run history, run-now/pause/fail states, once-mode, per-task workspace + agent targeting, concurrent scheduler
+- **Safety** — workspace scoping, dangerous-command detection with approval prompts, LLM auto-verify with deferred-command queue, secret redaction, `/goal` auto-continue loop
+- **Media Studio (video 10x, all 3 tiers)** — EDL engine with captions (ASS, karaoke), filler-word removal, audio polish (loudnorm/denoise/fades), hardware encode, preview + interactive timeline/transcript, plan autosave, multi-source b-roll/stills, smart reframe (Vision face tracking), auto-shorts, multi-clip compile
+- **Transcription** — on-device Swift sidecar (SpeechAnalyzer on macOS 26, SFSpeechRecognizer fallback), cloud whisper (Groq/OpenAI) fallback
+- **Mobile** — opt-in in-process HTTP/WS server, QR pairing, embedded phone UI, mobile image support
+- **Memory** — profile/entities/episodes with embedding retrieval + backfill
 
-### 3) Feed (Must Have)
-- [ ] List feed items
-- [ ] Unread count badge
-- [ ] Mark item read
-- [ ] Mark all read
-- [ ] Remove item
-- [ ] Clear all
+## Next up (candidates)
 
-### 4) Tasks (Must Have)
-- [ ] Create/edit/delete task
-- [ ] Status tabs: scheduled/running/completed
-- [ ] Manual status changes
-- [ ] Store `schedule`, `next_run`, `run_count`, `conditions`, `chain_next`
+Video (carry-over ideas from the 10x roadmap):
 
-### 5) Tools (Must Have)
-- [ ] List tools with metadata
-- [ ] Enable/disable tool toggle
-- [ ] Tool toggle enforced by chat tool-calling path
+- [ ] MCP/social posting of rendered shorts (publish from the Content library)
+- [ ] Watched-folder auto-clip task template (drop a recording → shorts appear)
+- [ ] ASS caption style editor in the studio UI
+- [ ] `duration_hint` control in the studio auto-shorts row
+- [ ] Vertical (y-axis) smart reframe
+- [ ] Multi-clip compile v2: per-clip audio handling and resolution normalization (v1 derives both from clip 0)
 
-### 6) Agents (Must Have)
-- [ ] CRUD custom agents
-- [ ] Enabled toggle
-- [ ] Slash command
-- [ ] System prompt + max iterations
-- [ ] Allowed tools selection
+Platform:
 
-### 7) Memory (Must Have)
-- [ ] Profile card (user profile text)
-- [ ] Entities tab (list + delete)
-- [ ] Timeline tab (episodes list)
-- [ ] History tab (search sessions, inspect session messages)
+- [ ] Native iOS companion app with push notifications (paid Apple Developer account + paired devices ready; would replace/augment the embedded mobile web UI)
+- [ ] Frontend test suite (none exists today; `npm run lint` / `prettier` are in place)
 
-### 8) Gallery (Should Have for v1)
-- [ ] Images tab from local gallery folder
-- [ ] Audio tab from local audio folder
-- [ ] Open folder action
-- [ ] Delete media item
+## Non-goals (decided)
 
-### 9) Settings (Must Have, Reduced)
-- [ ] Profile: name/about
-- [ ] LLM provider
-- [ ] LLM model
-- [ ] API key fields (OpenAI + MiniMax first, others can be added incrementally)
-- [ ] Web search key field
-- [ ] Image generation provider/model field
+- **Remotion** for video compositing — rejected 2026-07-08; React + headless-Chrome is the wrong fit for a framework-free Tauri app editing real footage. ffmpeg/libass covers captions; animated title cards can reuse the `renderSlideToPng` HTML→PNG overlay trick.
+- **Daemon/sidecar backend** — all state and logic stay in the single Tauri Rust process.
 
-## Out of Scope for Initial V1
-- Voice mode orb + full speech pipeline parity
-- macOS launchd lifecycle management
-- Daemon IPC protocol compatibility
-- Full external service parity for every provider on day one
+## Housekeeping
 
-## Data Model Plan (`src-tauri` SQLite)
-
-Existing tables:
-- `sessions`
-- `messages`
-- `tool_logs`
-- `saved_workspaces`
-
-Add tables:
-- `feed_items(id, type, title, message, icon_name, is_read, metadata, created_at)`
-- `tasks(id, name, description, schedule, next_run, status, completed_at, result, chain_next, conditions, condition_status, run_count, triggered_by, created_at, updated_at)`
-- `tools(tool_id, name, description, icon_name, enabled, updated_at)`
-- `agents(agent_id, name, description, icon_name, slash_command, system_prompt, max_iterations, enabled, allowed_tools_json, created_at, updated_at)`
-- `entities(id, type, name, summary, metadata, created_at, updated_at)`
-- `episodes(id, description, entity_names_json, timestamp, created_at)`
-- `profiles(id, user_name, user_about, profile_text, updated_at)`
-- `app_config(key, value, updated_at)` (or a json config blob table)
-
-## Tauri Command Plan
-
-Existing command base already available:
-- `chat`, `create_session`, `get_messages`, `get_tool_logs`
-- workspace/file/terminal command set
-
-Add command groups:
-- `feed_*`: list/add/mark_read/mark_all_read/remove/clear
-- `task_*`: list/add/update/remove/set_status/complete
-- `tool_*`: list/set_enabled
-- `agent_*`: list/add/update/remove/set_enabled
-- `memory_*`: get_profile/update_profile/list_entities/delete_entity/list_episodes
-- `history_*`: get_sessions/get_session_messages/search_messages/delete_session
-- `settings_*`: get_config/set_config/get_providers/get_models
-- `gallery_*`: list_images/list_audio/delete_image/delete_audio/open_folder
-
-## Delivery Order
-
-1. Foundation + UI shell
-- Nav rail and panel shell in web UI.
-- Shared state store on frontend.
-
-2. Vertical Slice A (first execution target)
-- Chat + sessions + tool logs fully polished.
-- Add session list panel (history) and delete/search.
-
-3. Vertical Slice B
-- Tools + Feed.
-
-4. Vertical Slice C
-- Tasks + Agents.
-
-5. Vertical Slice D
-- Memory + Settings + Gallery.
-
-6. Hardening
-- Migration handling
-- Better error surfaces
-- Test pass (`npm run build`, `cargo check`)
-
-## Immediate Next Build Step
-- Implement nav rail + section panel scaffold in `muninn` frontend, then ship Vertical Slice A (Chat + session history) on top of that shell.
+- Update this file when an item ships or a new decision lands; keep "Shipped" as a one-line-per-feature summary, not a changelog.
