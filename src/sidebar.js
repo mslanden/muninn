@@ -7,7 +7,7 @@
 // existing tilesys<->chat cycle.
 
 import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, ask } from "@tauri-apps/plugin-dialog";
 import {
   sidebarTabs,
   sidebarNavApps,
@@ -312,7 +312,12 @@ function sessionRow(s, index) {
 
   row.querySelector('[data-act="delete"]').addEventListener("click", async (e) => {
     e.stopPropagation();
-    if (!confirm(`Delete this chat?\n\n${label}`)) return;
+    // window.confirm() is a silent no-op in the Tauri webview — use the dialog plugin.
+    let yes = false;
+    try {
+      yes = await ask(`Delete this chat?\n\n${label}`, { title: "Delete chat", kind: "warning" });
+    } catch (err) { console.error("ask dialog failed:", err); }
+    if (!yes) return;
     try {
       await invoke("delete_session", { sessionId: sid });
     } catch (err) { console.error("delete_session failed:", err); }

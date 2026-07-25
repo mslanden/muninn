@@ -428,7 +428,16 @@ export function renderSettingsTile(tileObj, body) {
   });
 
   mobileRegenBtn.addEventListener("click", async () => {
-    if (!confirm("This will disconnect the phone until you re-scan.")) return;
+    // window.confirm() is a silent no-op in the Tauri webview — use the dialog plugin.
+    let yes = false;
+    try {
+      const { ask } = await import("@tauri-apps/plugin-dialog");
+      yes = await ask("This will disconnect the phone until you re-scan.", {
+        title: "Regenerate pairing token",
+        kind: "warning",
+      });
+    } catch (err) { console.error("ask dialog failed:", err); }
+    if (!yes) return;
     mobileErrorEl.textContent = "";
     try {
       await invoke("regenerate_mobile_token");
