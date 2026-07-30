@@ -2379,6 +2379,9 @@ body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
   animation: mic-pulse 1.1s ease-in-out infinite;
 }
 .hint-chip.transcribing { color: var(--muted); }
+/* Voice auto-respond toggle (speaker chip) */
+.hint-chip.active { color: var(--accent); }
+.hint-chip.active:hover { color: var(--accent); }
 @keyframes mic-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.45; transform: scale(1.18); }

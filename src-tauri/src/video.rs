@@ -2580,7 +2580,8 @@ fn transcriber_helper_path() -> Option<PathBuf> {
 
 /// Run the on-device (Apple Speech) helper on an extracted audio file. Blocking —
 /// the first use per locale downloads Apple's speech model, which can take a while.
-fn transcribe_local(audio: &Path) -> Result<Transcript, String> {
+/// Also used by `transcribe_wav` (chat voice input) via `commands::voice`.
+pub(crate) fn transcribe_local(audio: &Path) -> Result<Transcript, String> {
     let helper = transcriber_helper_path().ok_or_else(|| {
         "on-device transcriber helper not found (it is compiled by build.rs — rebuild with Xcode installed)".to_string()
     })?;

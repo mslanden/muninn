@@ -99,14 +99,16 @@ export function renderSettingsTile(tileObj, body) {
         <div class="form-row" style="margin-bottom:6px;">
           <select data-s-ttsprov="${tileObj.id}" style="flex:1; min-width:0;">
             <option value="minimax">MiniMax</option>
-            <option value="fishspeech">FishSpeech</option>
+            <option value="fishaudio">Fish Audio</option>
+            <option value="fishspeech">FishSpeech (local)</option>
           </select>
           <input type="text" placeholder="speech-2.8-hd" data-s-ttsmodel="${tileObj.id}" style="flex:2; min-width:0;" />
         </div>
         <div class="form-row" style="margin-bottom:6px; align-items:center;">
-          <input type="text" placeholder="Voice ID (e.g. English_Graceful_Lady)" data-s-voiceid="${tileObj.id}" style="flex:1;" />
+          <input type="text" placeholder="Voice ID (MiniMax voice or Fish Audio reference id)" data-s-voiceid="${tileObj.id}" style="flex:1;" />
           <button class="form-btn" data-s-tts-preview="${tileObj.id}" title="Preview voice">▶</button>
         </div>
+        <input type="password" placeholder="Fish Audio API key" data-s-fishaudio="${tileObj.id}" style="margin-bottom:6px;" />
         <span class="muted" data-s-tts-status="${tileObj.id}" style="font-size:10px;"></span>
         <div class="form-row" style="margin-top:6px;">
           <select data-s-sttprov="${tileObj.id}" style="flex:1;">
@@ -136,7 +138,7 @@ export function renderSettingsTile(tileObj, body) {
         <label class="checkbox-inline">
           <input type="checkbox" data-s-localtranscribe="${tileObj.id}" /> On-device transcription (Apple Speech)
         </label>
-        <span class="muted" style="font-size:10px;">Studio video analysis transcribes on your Mac — no API key, audio never leaves the device. Falls back to cloud whisper (Groq/OpenAI) if it fails. First use downloads a speech model.</span>
+        <span class="muted" style="font-size:10px;">Chat voice input and Studio video analysis transcribe on your Mac — no API key, audio never leaves the device. Falls back to cloud whisper (Groq/OpenAI) if it fails. First use downloads a speech model.</span>
         <label class="checkbox-inline" style="margin-top:6px;">
           <input type="checkbox" data-s-hwencode="${tileObj.id}" /> Hardware video encoding (VideoToolbox)
         </label>
@@ -282,6 +284,7 @@ export function renderSettingsTile(tileObj, body) {
   const imgModelSelect = body.querySelector(`[data-s-imgmodel="${tileObj.id}"]`);
   const wsInput = body.querySelector(`[data-s-workspace="${tileObj.id}"]`);
   const voiceidInput = body.querySelector(`[data-s-voiceid="${tileObj.id}"]`);
+  const fishaudioInput = body.querySelector(`[data-s-fishaudio="${tileObj.id}"]`);
   const ttsProvSelect = body.querySelector(`[data-s-ttsprov="${tileObj.id}"]`);
   const ttsModelInput = body.querySelector(`[data-s-ttsmodel="${tileObj.id}"]`);
   const ttsStatusEl = body.querySelector(`[data-s-tts-status="${tileObj.id}"]`);
@@ -549,6 +552,8 @@ export function renderSettingsTile(tileObj, body) {
     searchInput.placeholder = s["search/brave_api_key"] ? "Search key (saved)" : "Web search key";
     togetherInput.placeholder = s["imagegen/together_api_key"] ? "Together key (saved)" : "Together AI key";
     mapboxInput.placeholder = s["maps/mapbox_api_key"] ? "Mapbox key (saved)" : "Mapbox API key (maps)";
+    fishaudioInput.value = "";
+    fishaudioInput.placeholder = s["tts/fishaudio_api_key"] ? "Fish Audio key (saved)" : "Fish Audio API key";
     voiceidInput.value = s["tts/voice_id"] || "";
     ttsProvSelect.value = s["tts/provider"] || "minimax";
     ttsModelInput.value = s["tts/model"] || "";
@@ -618,6 +623,7 @@ export function renderSettingsTile(tileObj, body) {
     if (groqInput.value.trim()) updates["llm/groq_api_key"] = groqInput.value.trim();
     if (searchInput.value.trim()) updates["search/brave_api_key"] = searchInput.value.trim();
     if (togetherInput.value.trim()) updates["imagegen/together_api_key"] = togetherInput.value.trim();
+    if (fishaudioInput.value.trim()) updates["tts/fishaudio_api_key"] = fishaudioInput.value.trim();
     if (mapboxInput.value.trim()) {
       updates["maps/mapbox_api_key"] = mapboxInput.value.trim();
       ui.mapboxToken = mapboxInput.value.trim();

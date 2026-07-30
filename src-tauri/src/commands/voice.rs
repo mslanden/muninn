@@ -121,6 +121,66 @@ pub async fn tts_speak(
                 content_type,
             })
         }
+        "fishaudio" => {
+            // Fish Audio cloud TTS (api.fish.audio) — distinct from the local
+            // "fishspeech" server branch above.
+            let api_key = first_non_empty_setting(&state, &["tts/fishaudio_api_key"])
+                .map_err(|e| e.to_string())?
+                .or_else(|| std::env::var("FISH_AUDIO_API_KEY").ok())
+                .ok_or_else(|| "Fish Audio API key not configured (set it in Settings → Voice).".to_string())?;
+
+            // `tts/model` is shared across providers; only honor it when it names a
+            // Fish Audio model so a leftover MiniMax model id doesn't break the call.
+            let model = first_non_empty_setting(&state, &["tts/model"])
+                .map_err(|e| e.to_string())?
+                .filter(|m| {
+                    matches!(
+                        m.trim(),
+                        "speech-1.5" | "speech-1.6" | "s1" | "s1-mini" | "s2" | "s2.1-pro" | "s2.1-pro-free"
+                    )
+                })
+                .unwrap_or_else(|| "s1".to_string());
+
+            let mut body = serde_json::json!({
+                "text": req.text,
+                "format": "mp3",
+            });
+            // Voice ID doubles as the Fish Audio reference/model id; empty → default voice.
+            if let Some(voice_id) = first_non_empty_setting(&state, &["tts/voice_id"])
+                .map_err(|e| e.to_string())?
+                .filter(|v| !v.trim().is_empty())
+            {
+                body["reference_id"] = serde_json::Value::String(voice_id.trim().to_string());
+            }
+
+            let resp = state
+                .http
+                .post("https://api.fish.audio/v1/tts")
+                .bearer_auth(&api_key)
+                .header("model", model)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Fish Audio TTS request failed: {e}"))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("Fish Audio TTS error ({status}): {body}"));
+            }
+
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("audio/mp3")
+                .to_string();
+            let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+            Ok(TtsResponse {
+                audio_base64: B64.encode(&bytes),
+                content_type,
+            })
+        }
         "minimax" => {
             let api_key = first_non_empty_setting(&state, &["llm/minimax_api_key"])
                 .map_err(|e| e.to_string())?
@@ -230,10 +290,45 @@ pub async fn transcribe_wav(
     state: State<'_, AppState>,
     wav_base64: String,
 ) -> Result<TranscribeResponse, String> {
-    // Provider precedence is governed by the `stt/provider` setting (auto/groq/openai).
-    let (api_key, model, endpoint) = crate::llm::resolve_stt(&state)?;
-
     let audio_bytes = B64.decode(&wav_base64).map_err(|e| format!("base64 decode error: {e}"))?;
+
+    // On-device first when enabled (same setting that gates Studio video transcription).
+    // Any failure falls through to the cloud whisper path below.
+    let mut local_err: Option<String> = None;
+    let use_local = get_app_setting_value(&state, "video/local_transcription")?.as_deref() == Some("1");
+    if use_local {
+        let tmp = std::env::temp_dir().join(format!(
+            "muninn-voice-{}.wav",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let local = match std::fs::write(&tmp, &audio_bytes) {
+            Ok(()) => {
+                let tmp_clone = tmp.clone();
+                let res = tauri::async_runtime::spawn_blocking(move || {
+                    crate::video::transcribe_local(&tmp_clone)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+                let _ = std::fs::remove_file(&tmp);
+                res
+            }
+            Err(e) => Err(format!("failed to write temp audio file: {e}")),
+        };
+        match local {
+            Ok(t) => return Ok(TranscribeResponse { text: t.text }),
+            Err(e) => local_err = Some(e),
+        }
+    }
+
+    // Provider precedence is governed by the `stt/provider` setting (auto/groq/openai).
+    let (api_key, model, endpoint) = crate::llm::resolve_stt(&state).map_err(|e| match &local_err {
+        Some(le) => format!("on-device transcription failed ({le}); cloud fallback unavailable: {e}"),
+        None => e,
+    })?;
 
     let part = reqwest::multipart::Part::bytes(audio_bytes)
         .file_name("audio.wav")
@@ -244,6 +339,11 @@ pub async fn transcribe_wav(
         .text("model", model)
         .part("file", part);
 
+    let with_local_err = |e: String| match &local_err {
+        Some(le) => format!("on-device transcription failed ({le}); cloud fallback also failed: {e}"),
+        None => e,
+    };
+
     let resp = state
         .http
         .post(endpoint)
@@ -251,11 +351,11 @@ pub async fn transcribe_wav(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| format!("whisper request failed: {e}"))?;
+        .map_err(|e| with_local_err(format!("whisper request failed: {e}")))?;
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("whisper API error: {body}"));
+        return Err(with_local_err(format!("whisper API error: {body}")));
     }
 
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;

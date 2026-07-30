@@ -85,7 +85,8 @@ export function addTile(type, opts = {}) {
     el: tile,
     chatId: opts.chatId || null,
     projectPath: opts.projectPath || "",
-    webUrl: opts.webUrl || ""
+    webUrl: opts.webUrl || "",
+    autoVoice: !!opts.autoVoice
   };
   tiles.push(tileObj);
   workspace.appendChild(tile);
@@ -257,7 +258,8 @@ export function saveLayout() {
     type: t.type,
     chatId: t.chatId,
     projectPath: t.projectPath || "",
-    webUrl: t.webUrl || ""
+    webUrl: t.webUrl || "",
+    autoVoice: !!t.autoVoice
   }));
   localStorage.setItem("muninn.layout", JSON.stringify(layout));
 }

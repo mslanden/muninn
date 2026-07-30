@@ -72,7 +72,7 @@ export async function openQueryInChat(query) {
 }
 
 // ========== CHAT TILE ==========
-export async function addChatTile(existingSessionId, projectPath) {
+export async function addChatTile(existingSessionId, projectPath, opts = {}) {
   let chatSessionId = existingSessionId || "";
   const pp = projectPath || "";
 
@@ -93,7 +93,8 @@ export async function addChatTile(existingSessionId, projectPath) {
   const tileObj = addTile("chat", {
     chatId: chatSessionId,
     subtitle,
-    projectPath: pp
+    projectPath: pp,
+    autoVoice: !!opts.autoVoice
   });
 
   // Init streaming state
@@ -245,6 +246,12 @@ export async function onVoiceRecorded(wavBase64) {
         input.value = input.value.trim() ? `${input.value.trimEnd()} ${text}` : text;
         autoResize(input);
         input.focus();
+        // Auto-respond mode: fire the send immediately and speak the reply when it lands.
+        if (tileObj.autoVoice) {
+          tileObj.speakNextReply = true;
+          const sendBtn = tileObj.el.querySelector(`[data-chat-send="${tileObj.id}"]`);
+          if (sendBtn) sendBtn.click();
+        }
       }
     }
   } catch (e) {
@@ -365,6 +372,7 @@ export function renderChatTile(tileObj, body) {
           <button class="hint-chip" data-chat-folder="${tileObj.id}" title="Set working folder for this chat" aria-label="Set working folder">${icon("folder")}</button>
           <button class="hint-chip" data-chat-attach="${tileObj.id}" title="Attach an image / screenshot" aria-label="Attach">${icon("paperclip")}</button>
           <button class="hint-chip" data-chat-mic="${tileObj.id}" title="Voice input" aria-label="Voice input">${icon("mic")}</button>
+          <button class="hint-chip${tileObj.autoVoice ? " active" : ""}" data-chat-autovoice="${tileObj.id}" title="Voice auto-respond: send the transcript immediately and read the reply aloud" aria-label="Toggle voice auto-respond" aria-pressed="${!!tileObj.autoVoice}">${icon("volume")}</button>
           <button class="hint-chip" data-chat-search-btn="${tileObj.id}" title="Search this conversation" aria-label="Search conversation">${icon("search")}</button>
           <button class="hint-chip" data-chat-export="${tileObj.id}" title="Copy conversation as Markdown" aria-label="Export conversation">${icon("download")}</button>
           <button class="hint-chip" data-hint="slash" aria-label="Slash commands">/</button>
@@ -394,6 +402,16 @@ export function renderChatTile(tileObj, body) {
 
   const micBtn = composer.querySelector(`[data-chat-mic="${tileObj.id}"]`);
   micBtn.addEventListener("click", () => toggleVoiceRecording(tileObj));
+
+  // Voice auto-respond toggle: when on, a finished transcription is sent without
+  // touching the keyboard and the reply is read aloud (hands-free voice loop).
+  const autoVoiceBtn = composer.querySelector(`[data-chat-autovoice="${tileObj.id}"]`);
+  autoVoiceBtn.addEventListener("click", () => {
+    tileObj.autoVoice = !tileObj.autoVoice;
+    autoVoiceBtn.classList.toggle("active", tileObj.autoVoice);
+    autoVoiceBtn.setAttribute("aria-pressed", String(tileObj.autoVoice));
+    saveLayout();
+  });
 
   // Goal banner clear button.
   const goalClearBtn = composer.querySelector(`[data-goal-clear="${tileObj.id}"]`);
@@ -704,12 +722,14 @@ export function renderChatTile(tileObj, body) {
 
       if (stream.bubble) {
         stream.bubble.innerHTML = renderMarkdown(stream.text);
+        maybeAutoSpeak(tileObj, stream.text);
         stream.bubble = null;
         stream.text = "";
       }
       hideThinking(tileObj.id);
     } catch (error) {
       hideThinking(tileObj.id);
+      tileObj.speakNextReply = false; // don't read errors (or a later reply) aloud
       if (stream.bubble) {
         stream.bubble.remove();
         stream.bubble = null;
@@ -809,20 +829,25 @@ let currentTtsAudio = null;
 const ttsCache = new Map();
 
 export async function playTts(btn, text) {
-  // If already playing, stop it
-  if (btn.classList.contains("playing")) {
+  // If already playing, stop it. `btn` is null when auto-respond speaks a reply
+  // with no visible play button — skip the toggle/state updates in that case.
+  if (btn && btn.classList.contains("playing")) {
     if (currentTtsAudio) { currentTtsAudio.pause(); currentTtsAudio = null; }
     btn.classList.remove("playing");
     btn.innerHTML = icon("play", 12);
     return;
   }
+  // Auto-speak replaces whatever is currently playing.
+  if (!btn && currentTtsAudio) { currentTtsAudio.pause(); currentTtsAudio = null; }
 
   // Strip markdown for cleaner TTS input
   const plain = text.replace(/```[\s\S]*?```/g, " code block ").replace(/[*_#`>\[\]()!|]/g, "").replace(/\n+/g, " ").trim();
   if (!plain) return;
 
-  btn.classList.add("playing");
-  btn.innerHTML = "&#9632;";
+  if (btn) {
+    btn.classList.add("playing");
+    btn.innerHTML = "&#9632;";
+  }
 
   try {
     // Use cache key based on first 200 chars (enough to be unique)
@@ -830,8 +855,12 @@ export async function playTts(btn, text) {
     let blobUrl = ttsCache.get(cacheKey);
 
     if (!blobUrl) {
-      const resp = await invoke("tts_speak", { req: { text: plain, provider: "minimax" } });
-      if (!resp.audioBase64) { btn.classList.remove("playing"); btn.innerHTML = icon("play", 12); return; }
+      // Empty provider → the backend resolves it from the `tts/provider` setting.
+      const resp = await invoke("tts_speak", { req: { text: plain, provider: "" } });
+      if (!resp.audioBase64) {
+        if (btn) { btn.classList.remove("playing"); btn.innerHTML = icon("play", 12); }
+        return;
+      }
 
       const audioBlob = new Blob(
         [Uint8Array.from(atob(resp.audioBase64), c => c.charCodeAt(0))],
@@ -844,16 +873,23 @@ export async function playTts(btn, text) {
     const audio = new Audio(blobUrl);
     currentTtsAudio = audio;
     audio.onended = () => {
-      btn.classList.remove("playing");
-      btn.innerHTML = icon("play", 12);
+      if (btn) { btn.classList.remove("playing"); btn.innerHTML = icon("play", 12); }
       currentTtsAudio = null;
     };
     audio.play();
   } catch (e) {
     console.error("TTS error:", e);
-    btn.classList.remove("playing");
-    btn.innerHTML = icon("play", 12);
+    if (btn) { btn.classList.remove("playing"); btn.innerHTML = icon("play", 12); }
   }
+}
+
+// Voice auto-respond: speak a finished reply once if this tile's last send came
+// from the mic. Consumes the flag so typed follow-ups stay silent. Called from
+// both finalization paths (doSend's post-invoke branch and the chat-done event).
+export function maybeAutoSpeak(tileObj, text) {
+  if (!tileObj || !tileObj.speakNextReply) return;
+  tileObj.speakNextReply = false;
+  if (text && text.trim()) void playTts(null, text);
 }
 
 export function addTurn(chatLog, role, text, images = []) {

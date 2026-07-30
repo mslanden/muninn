@@ -107,7 +107,7 @@ async function bootMain() {
   if (saved && saved.length > 0) {
     for (const item of saved) {
       if (item.type === "chat") {
-        await addChatTile(item.chatId || "", item.projectPath || "");
+        await addChatTile(item.chatId || "", item.projectPath || "", { autoVoice: !!item.autoVoice });
       } else if (item.type === "settings") {
         addTile("settings");
       } else {
