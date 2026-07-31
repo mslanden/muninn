@@ -303,6 +303,18 @@ body::before {
   -webkit-app-region: no-drag;
 }
 
+/* Settings + sidebar toggle pinned right of the macOS traffic lights; they live
+   in the titlebar (not the sidebar) so they stay put when the sidebar collapses. */
+.titlebar-actions {
+  /* Vertically centered on the macOS Overlay-titlebar traffic lights
+     (eyeballed against the real window — see screenshot iterations). */
+  position: absolute;
+  top: 4px;
+  left: 78px;
+  display: flex;
+  gap: 4px;
+}
+
 /* ========== SHELL ========== */
 .shell {
   position: relative;
@@ -314,41 +326,17 @@ body::before {
 }
 
 body.sidebar-collapsed .shell {
-  /* Workspace is full-bleed; a small floating handle (bottom-left) re-expands. */
+  /* Workspace is full-bleed; the titlebar's toggle button re-expands. */
   --sidebar-width: 0px;
   grid-template-columns: 1fr;
 }
 
 body.sidebar-collapsed .sidebar { display: none; }
 
-/* Floating expand handle — exists in the DOM always, shown only while collapsed. */
-.sidebar-expand-fab { display: none; }
-
-body.sidebar-collapsed .sidebar-expand-fab {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  position: fixed;
-  left: 10px;
-  bottom: 10px;
-  width: 30px;
-  height: 30px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--card);
-  cursor: pointer;
-  z-index: 30;
-  transition: all 160ms ease;
-}
-
-body.sidebar-collapsed .sidebar-expand-fab:hover {
-  border-color: var(--accent);
-  background: var(--overlay-light);
-}
-
-/* Single chat collapsed: header spans under the traffic lights, title shifts right. */
+/* Single chat collapsed: header spans under the traffic lights + titlebar
+   actions (settings + expand), so the title shifts right past them. */
 body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
-  padding-left: 78px;
+  padding-left: 142px;
 }
 
 /* ========== SIDEBAR ========== */
@@ -363,14 +351,6 @@ body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
   min-width: 0;
 }
 
-.rail-mark {
-  font-family: 'Orbitron', sans-serif;
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: 0;
-  color: var(--text);
-}
-
 .sidebar-panel-wrap {
   flex: 1;
   min-width: 0;
@@ -379,33 +359,6 @@ body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
   flex-direction: column;
   overflow: hidden;
 }
-
-/* Header row: brand mark, view tabs, settings, collapse */
-.sidebar-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 8px 8px;
-  flex-shrink: 0;
-}
-
-.head-brand {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background 160ms ease;
-}
-
-.head-brand:hover { background: var(--overlay-light); }
-
-.head-spacer { flex: 1; }
 
 .head-btn {
   display: flex;
@@ -425,37 +378,9 @@ body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
 .head-btn:hover { color: var(--accent); background: var(--overlay-light); }
 .head-btn.open { color: var(--text); background: var(--overlay-medium); }
 
-/* Segmented view switcher */
-.sidebar-tabs {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-}
-
-.seg-btn {
-  padding: 3px 9px;
-  border: none;
-  border-radius: 3px;
-  background: transparent;
-  color: var(--dim);
-  font: inherit;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 1px;
-  text-transform: uppercase;
-  cursor: pointer;
-  transition: all 160ms ease;
-}
-
-.seg-btn:hover { color: var(--accent); }
-.seg-btn.active { color: var(--text); background: var(--overlay-medium); }
-
 /* New chat + shared scroll area */
 .sidebar-topline {
-  padding: 0 8px;
+  padding: 2px 8px 0;
   flex-shrink: 0;
 }
 
@@ -787,50 +712,33 @@ body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
 .session-item:not(:hover) .session-item-actions:has(.session-pin.pinned) .session-act:not(.session-pin) { display: none; }
 
 .sidebar-footer {
-  padding: 8px 10px;
+  padding: 6px 8px;
   border-top: 1px solid var(--border);
   display: flex;
   flex-direction: row;
   align-items: center;
+  justify-content: space-evenly;
   gap: 2px;
   flex-shrink: 0;
 }
 
-.footer-dot {
-  color: var(--dim);
-  font-size: 10px;
-  flex-shrink: 0;
-}
-
-.footer-model {
-  flex: 1;
-  text-align: right;
-}
-
-.footer-switch {
-  display: block;
-  min-width: 0;
-  padding: 5px 6px;
-  border: 1px solid transparent;
-  border-radius: 3px;
+/* App launcher icons (studio / content / web / feeds / tasks / memory) */
+.apps-rail-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  border: none;
+  border-radius: 4px;
   background: transparent;
   color: var(--dim);
-  font: inherit;
-  font-size: 10px;
-  letter-spacing: 0.5px;
-  text-align: left;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   cursor: pointer;
   transition: all 160ms ease;
 }
 
-.footer-switch:hover {
-  color: var(--accent);
-  background: var(--overlay-light);
-  border-color: var(--border);
-}
+.apps-rail-btn:hover { color: var(--accent); background: var(--overlay-light); }
+.apps-rail-btn.open { color: var(--text); background: var(--overlay-medium); }
 
 /* Footer popovers (workspace / model switchers) */
 .footer-popover {
@@ -917,6 +825,34 @@ body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
   min-width: 0;
 }
 
+/* Drag-to-open: highlight the workspace while a sidebar item hovers over it. */
+.workspace.drop-target {
+  outline: 1px dashed var(--accent);
+  outline-offset: -6px;
+}
+
+/* Floating label that follows the cursor during a sidebar-item drag. */
+.drag-ghost {
+  position: fixed;
+  z-index: 2000;
+  padding: 4px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  pointer-events: none;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+body.tile-dragging { cursor: grabbing; user-select: none; }
+body.tile-dragging * { cursor: grabbing !important; }
+
 /* Empty workspace: when the last tile is closed (tilesys keeps data-tile-count
    in sync), fill the area with a centered hint instead of bare border-color. */
 .workspace[data-tile-count="0"]::after {
@@ -944,7 +880,9 @@ body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
   display: flex;
   align-items: center;
   padding: 0 14px;
-  height: 40px;
+  /* 34px centers the header content on the same ~17pt line as the macOS
+     traffic lights and the titlebar settings/collapse cluster. */
+  height: 34px;
   border-bottom: 1px solid var(--border);
   background: var(--card);
   gap: 10px;
@@ -2379,6 +2317,25 @@ body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
   animation: mic-pulse 1.1s ease-in-out infinite;
 }
 .hint-chip.transcribing { color: var(--muted); }
+/* Labeled chips: working-folder + model switchers in the composer bar */
+.hint-chip.chip-labeled {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 160px;
+}
+.hint-chip .chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 /* Voice auto-respond toggle (speaker chip) */
 .hint-chip.active { color: var(--accent); }
 .hint-chip.active:hover { color: var(--accent); }

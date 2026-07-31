@@ -15,28 +15,23 @@ import "./settings.js";
 
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { workspace, sidebarWorkspace, sidebarModel, newChatBtn, navSettingsBtn, ui } from "./state.js";
-import { field, projectLabel } from "./utils.js";
-import { focusTile, addTile, getTilesByType, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav } from "./tilesys.js";
-import { addChatTile } from "./chat.js";
+import { workspace, newChatBtn, navSettingsBtn, ui } from "./state.js";
+import { addTile, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav, openTileForType, replaceSingleTileIfAlone, makeDragSource } from "./tilesys.js";
+import { addChatTile, updateModelChips } from "./chat.js";
 import { initSidebar, refreshSessionList } from "./sidebar.js";
 import { setupEventListeners } from "./events.js";
 import { isQuickAsk, bootQuickAsk } from "./quickask.js";
 
 // ==================== SIDEBAR BUTTONS ====================
 newChatBtn.addEventListener("click", async () => {
+  replaceSingleTileIfAlone();
   await addChatTile();
   try { refreshSessionList(); } catch {}
 });
+makeDragSource(newChatBtn, { type: "chat" });
 
-navSettingsBtn.addEventListener("click", () => {
-  const existing = getTilesByType("settings");
-  if (existing.length > 0) {
-    focusTile(existing[0].id);
-  } else {
-    addTile("settings");
-  }
-});
+navSettingsBtn.addEventListener("click", () => openTileForType("settings"));
+makeDragSource(navSettingsBtn, { type: "settings" });
 
 // ==================== BOOT ====================
 async function bootPopout() {
@@ -47,9 +42,9 @@ async function bootPopout() {
   const shell = document.querySelector(".shell");
   if (sidebar) sidebar.style.display = "none";
   if (shell) shell.style.gridTemplateColumns = "1fr";
-  // No sidebar in pop-outs — never show the collapsed-state expand handle either.
-  const fab = document.getElementById("sidebar-expand-fab");
-  if (fab) fab.style.display = "none";
+  // No sidebar in pop-outs — hide the titlebar's settings/collapse cluster too.
+  const titlebarActions = document.querySelector(".titlebar-actions");
+  if (titlebarActions) titlebarActions.style.display = "none";
 
   await setupEventListeners();
   try { ui.loadedSettings = await invoke("get_app_settings"); } catch { ui.loadedSettings = {}; }
@@ -90,16 +85,7 @@ async function bootMain() {
 
   try { ui.loadedSettings = await invoke("get_app_settings"); } catch { ui.loadedSettings = {}; }
   ui.mapboxToken = ui.loadedSettings["maps/mapbox_api_key"] || null;
-  sidebarModel.textContent = ui.loadedSettings["llm/model"] || "MiniMax-M3";
-  sidebarModel.title = ui.loadedSettings["llm/model"] || "MiniMax-M3";
-
-  try {
-    const pathInfo = await invoke("get_workspace_root");
-    const workspaceRoot = field(pathInfo, "workspaceRoot", "workspace_root");
-    sidebarWorkspace.textContent = projectLabel(workspaceRoot);
-    sidebarWorkspace.title = workspaceRoot || "~/";
-  } catch { sidebarWorkspace.textContent = "~/"; }
-
+  updateModelChips();
 
   try { ui.cachedAgents = await invoke("get_agents"); } catch {}
 

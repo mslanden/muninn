@@ -10,7 +10,7 @@ import { icon } from "./icons.js";
 // lazily-at-call (module-level import is fine — only *invoked* at runtime, so the
 // chat.js<->sidebar.js cycle never bites at init). Guarded so a missing sidebar
 // (pop-out / quick-ask windows) never breaks chat.
-import { refreshSessionList } from "./sidebar.js";
+import { refreshSessionList, openModelPopover } from "./sidebar.js";
 function bumpSessionList() {
   try { refreshSessionList(); } catch {}
 }
@@ -180,9 +180,30 @@ async function setTileProject(tileObj, projectPath) {
 
   const badge = tileObj.el.querySelector(`[data-project-badge="${tileObj.id}"]`);
   if (badge) updateProjectBadge(badge, projectPath);
+  updateFolderChip(tileObj);
 
   await refreshThreadSelect(tileObj);
   saveLayout();
+}
+
+// Reflect the chat's working folder in the composer's folder chip.
+function updateFolderChip(tileObj) {
+  const label = tileObj.el.querySelector(`[data-folder-label="${tileObj.id}"]`);
+  if (!label) return;
+  label.textContent = tileObj.projectPath ? projectLabel(tileObj.projectPath) : "~/";
+  const btn = label.closest("[data-chat-folder]");
+  if (btn) btn.title = tileObj.projectPath || "Set working folder for this chat";
+}
+
+// Reflect the active model in every chat composer's model chip. Called from
+// boot, the settings tile, and the model popover (sidebar.js) after changes.
+export function updateModelChips() {
+  const model = (ui.loadedSettings && ui.loadedSettings["llm/model"]) || "default model";
+  document.querySelectorAll("[data-chat-model]").forEach((btn) => {
+    const label = btn.querySelector(".chip-label");
+    if (label) label.textContent = model;
+    btn.title = `Model: ${model} — click to switch`;
+  });
 }
 
 // ===== Voice input (native recorder -> Whisper transcription) =====
@@ -369,7 +390,7 @@ export function renderChatTile(tileObj, body) {
       <textarea rows="1" placeholder="Message... (paste or drag an image to share a screenshot)" data-chat-input="${tileObj.id}"></textarea>
       <div class="composer-bar">
         <div class="composer-left">
-          <button class="hint-chip" data-chat-folder="${tileObj.id}" title="Set working folder for this chat" aria-label="Set working folder">${icon("folder")}</button>
+          <button class="hint-chip chip-labeled" data-chat-folder="${tileObj.id}" title="Set working folder for this chat" aria-label="Set working folder">${icon("folder")}<span class="chip-label" data-folder-label="${tileObj.id}"></span></button>
           <button class="hint-chip" data-chat-attach="${tileObj.id}" title="Attach an image / screenshot" aria-label="Attach">${icon("paperclip")}</button>
           <button class="hint-chip" data-chat-mic="${tileObj.id}" title="Voice input" aria-label="Voice input">${icon("mic")}</button>
           <button class="hint-chip${tileObj.autoVoice ? " active" : ""}" data-chat-autovoice="${tileObj.id}" title="Voice auto-respond: send the transcript immediately and read the reply aloud" aria-label="Toggle voice auto-respond" aria-pressed="${!!tileObj.autoVoice}">${icon("volume")}</button>
@@ -378,7 +399,10 @@ export function renderChatTile(tileObj, body) {
           <button class="hint-chip" data-hint="slash" aria-label="Slash commands">/</button>
           <input type="file" accept="image/*" multiple data-chat-file="${tileObj.id}" style="display:none;" />
         </div>
-        <button class="send-btn" data-chat-send="${tileObj.id}">SEND</button>
+        <div class="composer-right">
+          <button class="hint-chip chip-labeled" data-chat-model="${tileObj.id}" title="Switch model" aria-label="Switch model"><span class="chip-label"></span></button>
+          <button class="send-btn" data-chat-send="${tileObj.id}">SEND</button>
+        </div>
       </div>
     </div>
   `;
@@ -402,6 +426,15 @@ export function renderChatTile(tileObj, body) {
 
   const micBtn = composer.querySelector(`[data-chat-mic="${tileObj.id}"]`);
   micBtn.addEventListener("click", () => toggleVoiceRecording(tileObj));
+
+  // Working-folder + model chips (moved here from the old sidebar footer).
+  updateFolderChip(tileObj);
+  const modelBtn = composer.querySelector(`[data-chat-model="${tileObj.id}"]`);
+  modelBtn.addEventListener("click", (e) => {
+    e.stopPropagation(); // keep the document-level popover dismisser from firing
+    openModelPopover(modelBtn);
+  });
+  updateModelChips();
 
   // Voice auto-respond toggle: when on, a finished transcription is sent without
   // touching the keyboard and the reply is read aloud (hands-free voice loop).

@@ -1,5 +1,6 @@
-// Sidebar: icon rail + expandable panel with Chat / Apps tabs, session browser,
-// agents shortcuts, and footer workspace/model switchers.
+// Sidebar: chats-only panel (session browser + agents shortcuts) with an app
+// launcher icon rail in the footer. Workspace/model switching lives in the
+// chat composer (chat.js) — the model popover here is opened from there.
 //
 // Import discipline: this module imports runtime helpers from tilesys.js and
 // chat.js. Those functions are only *called* at event time (never at module
@@ -7,18 +8,14 @@
 // existing tilesys<->chat cycle.
 
 import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog, ask } from "@tauri-apps/plugin-dialog";
+import { ask } from "@tauri-apps/plugin-dialog";
 import {
-  sidebarTabs,
-  sidebarNavApps,
   sessionList,
   sessionSearchInput,
   sidebarAgentsList,
-  sidebarWorkspace,
-  sidebarModel,
+  sidebarAppsRail,
   navSettingsBtn,
   sidebarCollapseBtn,
-  railBrandBtn,
   tiles,
   chatStreams,
   ui,
@@ -31,89 +28,50 @@ import {
   focusTile,
   openTileForType,
   removeTile,
+  makeDragSource,
+  replaceSingleTileIfAlone,
 } from "./tilesys.js";
-import { addChatTile } from "./chat.js";
+import { addChatTile, updateModelChips } from "./chat.js";
 
-// ==================== TABS ====================
-const TABS = [
-  { id: "chat", label: "Chat", ic: "message-square" },
-  { id: "apps", label: "Apps", ic: "grid" },
-];
-
-// Apps panel tile types (Logs & Tools live under Settings now).
+// ==================== APP RAIL ====================
+// App tile types shown as icons in the footer rail (Logs & Tools live under
+// Settings now).
 const APPS_TYPES = ["studio", "content", "web", "feeds", "tasks", "memory"];
+const APPS_ICONS = {
+  studio: "video",
+  content: "image",
+  web: "globe",
+  feeds: "rss",
+  tasks: "list-checks",
+  memory: "brain",
+};
 
-const TAB_KEY = "muninn.sidebar-tab";
 const COLLAPSE_KEY = "muninn.sidebar-collapsed";
-
-function getActiveTab() {
-  const saved = localStorage.getItem(TAB_KEY);
-  // Migrate old Create/Data tab ids.
-  if (saved === "create" || saved === "data") return "apps";
-  return TABS.some((t) => t.id === saved) ? saved : "chat";
-}
-
-function setActiveTab(id) {
-  localStorage.setItem(TAB_KEY, id);
-  renderTabs();
-  showPanel(id);
-  // Expanding to a tab should un-collapse the panel.
-  if (document.body.classList.contains("sidebar-collapsed")) {
-    setCollapsed(false);
-  }
-}
-
-function showPanel(id) {
-  document.querySelectorAll(".sidebar-panel").forEach((p) => {
-    p.hidden = p.dataset.panel !== id;
-  });
-  if (id === "chat") {
-    refreshSessionList();
-    refreshAgentsList();
-  } else {
-    renderAppsPanel();
-  }
-}
-
-function renderTabs() {
-  if (!sidebarTabs) return;
-  const active = getActiveTab();
-  sidebarTabs.innerHTML = "";
-  for (const tab of TABS) {
-    const btn = document.createElement("button");
-    btn.className = `seg-btn${tab.id === active ? " active" : ""}`;
-    btn.title = tab.label;
-    btn.setAttribute("aria-label", tab.label);
-    btn.textContent = tab.label;
-    btn.addEventListener("click", () => setActiveTab(tab.id));
-    sidebarTabs.appendChild(btn);
-  }
-}
 
 // ==================== COLLAPSE ====================
 function isCollapsed() {
   return localStorage.getItem(COLLAPSE_KEY) === "1";
 }
 
+// The toggle lives in the titlebar (next to the traffic lights), so it stays in
+// the same spot whether the sidebar is open or collapsed — the chevron flips.
+function applyCollapseIcon() {
+  if (!sidebarCollapseBtn) return;
+  const collapsed = isCollapsed();
+  sidebarCollapseBtn.innerHTML = icon(collapsed ? "chevron-right" : "chevron-left", 15);
+  sidebarCollapseBtn.title = collapsed ? "Expand sidebar" : "Collapse sidebar";
+  sidebarCollapseBtn.setAttribute("aria-label", sidebarCollapseBtn.title);
+}
+
 function setCollapsed(collapsed) {
   localStorage.setItem(COLLAPSE_KEY, collapsed ? "1" : "0");
   document.body.classList.toggle("sidebar-collapsed", collapsed);
+  applyCollapseIcon();
 }
 
 function wireCollapse() {
   if (sidebarCollapseBtn) {
-    sidebarCollapseBtn.innerHTML = icon("chevron-left", 15);
     sidebarCollapseBtn.addEventListener("click", () => setCollapsed(!isCollapsed()));
-  }
-  // Floating handle shown (via CSS) only while collapsed — the panel, including its
-  // collapse button, is hidden then.
-  const fab = document.getElementById("sidebar-expand-fab");
-  if (fab) fab.addEventListener("click", () => setCollapsed(false));
-  if (railBrandBtn) {
-    railBrandBtn.addEventListener("click", () => {
-      if (isCollapsed()) setCollapsed(false);
-      setActiveTab("chat");
-    });
   }
 }
 
@@ -130,39 +88,31 @@ function toggleSection(id) {
   refreshAgentsList();
 }
 
-// ==================== APPS PANEL ====================
-function makeNavItem(def) {
-  const openTiles = getTilesByType(def.type);
-  const isOpen = openTiles.length > 0;
-
-  const btn = document.createElement("button");
-  btn.className = `nav-item${isOpen ? " open" : ""}`;
-  btn.title = def.label;
-  btn.innerHTML = `
-    <span class="nav-dot ${isOpen ? def.dot : "off"}"></span>
-    ${escapeHtml(def.label)}
-    ${openTiles.length > 1 ? `<span class="nav-count">${openTiles.length}</span>` : ""}
-    <span class="nav-pip"></span>
-  `;
-
-  btn.addEventListener("click", () => {
-    if (isOpen) {
-      focusTile(openTiles[0].id);
-    } else {
-      openTileForType(def.type);
-    }
-  });
-
-  return btn;
-}
-
-function renderAppsPanel() {
-  if (!sidebarNavApps) return;
-  sidebarNavApps.innerHTML = "";
+// ==================== APP RAIL (footer icons) ====================
+function renderAppsRail() {
+  if (!sidebarAppsRail) return;
+  sidebarAppsRail.innerHTML = "";
   for (const type of APPS_TYPES) {
     const def = TILE_TYPES.find((t) => t.type === type);
     if (!def) continue;
-    sidebarNavApps.appendChild(makeNavItem(def));
+    const openTiles = getTilesByType(type);
+    const isOpen = openTiles.length > 0;
+
+    const btn = document.createElement("button");
+    btn.className = `apps-rail-btn${isOpen ? " open" : ""}`;
+    btn.title = def.label;
+    btn.setAttribute("aria-label", def.label);
+    btn.innerHTML = icon(APPS_ICONS[type] || "grid", 15);
+
+    btn.addEventListener("click", () => {
+      if (isOpen) {
+        focusTile(openTiles[0].id);
+      } else {
+        openTileForType(type);
+      }
+    });
+    makeDragSource(btn, { type });
+    sidebarAppsRail.appendChild(btn);
   }
 }
 
@@ -195,6 +145,7 @@ export async function refreshAgentsList() {
     Manage agents
   `;
   manage.addEventListener("click", () => openTileForType("agents"));
+  makeDragSource(manage, { type: "agents" });
   sidebarAgentsList.appendChild(manage);
 
   for (const a of enabled.slice(0, 8)) {
@@ -296,6 +247,7 @@ function sessionRow(s, index) {
 
   const main = row.querySelector(".session-main");
   main.addEventListener("click", () => openSession(sid, pp));
+  makeDragSource(row, { type: "chat", chatId: sid, projectPath: pp });
 
   row.querySelector('[data-act="pin"]').addEventListener("click", async (e) => {
     e.stopPropagation();
@@ -337,6 +289,7 @@ async function openSession(sessionId, projectPath) {
     focusTile(existing.id);
     return;
   }
+  replaceSingleTileIfAlone();
   await addChatTile(sessionId, projectPath || "");
   refreshSessionList();
 }
@@ -504,81 +457,6 @@ function placePopover(anchor, el) {
   });
 }
 
-async function showWorkspacePopover(anchor) {
-  const pop = document.createElement("div");
-  pop.className = "footer-popover";
-  pop.innerHTML = `<div class="footer-popover-title">Workspace</div><div class="footer-popover-list"></div>`;
-  const list = pop.querySelector(".footer-popover-list");
-
-  // Current default directory
-  let currentRoot = "~/";
-  try {
-    const pathInfo = await invoke("get_workspace_root");
-    currentRoot = field(pathInfo, "workspaceRoot", "workspace_root") || "~/";
-  } catch {}
-
-  const addRow = (label, path, isCurrent) => {
-    const btn = document.createElement("button");
-    btn.className = `footer-popover-item${isCurrent ? " current" : ""}`;
-    btn.innerHTML = `
-      <span class="footer-popover-label">${escapeHtml(label)}</span>
-      ${path ? `<span class="footer-popover-path">${escapeHtml(path)}</span>` : ""}
-    `;
-    btn.addEventListener("click", async () => {
-      closePopover();
-      if (!path) return;
-      try {
-        await invoke("set_workspace_root", { req: { workspaceRoot: path } });
-        if (sidebarWorkspace) {
-          sidebarWorkspace.textContent = projectLabel(path);
-          sidebarWorkspace.title = path;
-        }
-      } catch (e) {
-        console.error("set_workspace_root failed:", e);
-      }
-    });
-    list.appendChild(btn);
-  };
-
-  addRow(projectLabel(currentRoot) || "Default", currentRoot, true);
-
-  try {
-    const projects = await invoke("get_projects");
-    for (const p of projects || []) {
-      const path = field(p, "path", "path");
-      const name = field(p, "name", "name") || projectLabel(path);
-      if (path === currentRoot) continue;
-      addRow(name, path, false);
-    }
-  } catch {}
-
-  const browse = document.createElement("button");
-  browse.className = "footer-popover-item footer-popover-action";
-  browse.innerHTML = `${icon("folder", 13)} Choose folder…`;
-  browse.addEventListener("click", async () => {
-    closePopover();
-    try {
-      const selected = await openDialog({
-        directory: true,
-        multiple: false,
-        title: "Set default workspace folder",
-      });
-      if (!selected) return;
-      const path = typeof selected === "string" ? selected : selected;
-      await invoke("set_workspace_root", { req: { workspaceRoot: path } });
-      if (sidebarWorkspace) {
-        sidebarWorkspace.textContent = projectLabel(path);
-        sidebarWorkspace.title = path;
-      }
-    } catch (e) {
-      console.error("workspace pick failed:", e);
-    }
-  });
-  list.appendChild(browse);
-
-  placePopover(anchor, pop);
-}
-
 const MODEL_PRESETS = [
   { provider: "minimax", model: "MiniMax-M3", label: "MiniMax M3" },
   { provider: "meta", model: "muse-spark-1.1", label: "Muse Spark 1.1" },
@@ -590,6 +468,12 @@ const MODEL_PRESETS = [
   { provider: "xai", model: "grok-3", label: "Grok 3" },
   { provider: "openrouter", model: "openrouter/auto", label: "OpenRouter Auto" },
 ];
+
+// Opened from the model chip in each chat composer (chat.js).
+export async function openModelPopover(anchor) {
+  if (openPopover) { closePopover(); return; }
+  return showModelPopover(anchor);
+}
 
 async function showModelPopover(anchor) {
   const pop = document.createElement("div");
@@ -619,10 +503,7 @@ async function showModelPopover(anchor) {
           "llm/provider": preset.provider,
           "llm/model": preset.model,
         };
-        if (sidebarModel) {
-          sidebarModel.textContent = preset.model;
-          sidebarModel.title = `${preset.provider} · ${preset.model}`;
-        }
+        updateModelChips();
       } catch (e) {
         console.error("set model failed:", e);
       }
@@ -642,25 +523,10 @@ async function showModelPopover(anchor) {
   placePopover(anchor, pop);
 }
 
-function wireFooterSwitchers() {
-  if (sidebarWorkspace) {
-    sidebarWorkspace.addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (openPopover) { closePopover(); return; }
-      showWorkspacePopover(sidebarWorkspace);
-    });
-  }
-  if (sidebarModel) {
-    sidebarModel.addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (openPopover) { closePopover(); return; }
-      showModelPopover(sidebarModel);
-    });
-  }
+function wirePopoverDismiss() {
   document.addEventListener("click", (e) => {
     if (!openPopover) return;
     if (openPopover.contains(e.target)) return;
-    if (e.target === sidebarWorkspace || e.target === sidebarModel) return;
     closePopover();
   });
   document.addEventListener("keydown", (e) => {
@@ -670,9 +536,9 @@ function wireFooterSwitchers() {
 
 // ==================== PUBLIC ENTRY ====================
 export function updateSidebar() {
-  renderTabs();
-  const active = getActiveTab();
-  showPanel(active);
+  refreshSessionList();
+  refreshAgentsList();
+  renderAppsRail();
 
   const settingsOpen = getTilesByType("settings").length > 0;
   if (navSettingsBtn) {
@@ -684,7 +550,7 @@ export function initSidebar() {
   if (navSettingsBtn) navSettingsBtn.innerHTML = icon("settings", 15);
   wireSearch();
   wireCollapse();
-  wireFooterSwitchers();
+  wirePopoverDismiss();
   setCollapsed(isCollapsed());
   updateSidebar();
 }

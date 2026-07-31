@@ -13,23 +13,18 @@
   </head>
   <body>
     <main class="shell">
-      <div class="titlebar" data-tauri-drag-region></div>
+      <div class="titlebar" data-tauri-drag-region>
+        <!-- Pinned next to the traffic lights so they survive sidebar collapse -->
+        <div class="titlebar-actions">
+          <button class="head-btn" id="nav-settings" title="Settings" aria-label="Settings"></button>
+          <button class="head-btn" id="sidebar-collapse-btn" title="Collapse sidebar" aria-label="Collapse sidebar"></button>
+        </div>
+      </div>
 
       <aside class="sidebar">
         <div class="sidebar-panel-wrap">
-          <!-- Single header row: brand mark, view tabs, settings, collapse -->
-          <div class="sidebar-head">
-            <button class="head-brand" id="rail-brand" title="Muninn" aria-label="Muninn">
-              <span class="rail-mark">M</span>
-            </button>
-            <div id="sidebar-tabs" class="sidebar-tabs"></div>
-            <div class="head-spacer"></div>
-            <button class="head-btn" id="nav-settings" title="Settings" aria-label="Settings"></button>
-            <button class="head-btn" id="sidebar-collapse-btn" title="Collapse sidebar" aria-label="Collapse sidebar"></button>
-          </div>
-
           <div id="sidebar-panels" class="sidebar-panels">
-            <!-- Chat panel -->
+            <!-- Chat panel — the sidebar is chats-only; apps live in the footer rail -->
             <div class="sidebar-panel" data-panel="chat">
               <div class="sidebar-topline">
                 <button class="new-chat-btn" id="new-chat-btn" title="New Chat">+ New Chat</button>
@@ -43,23 +38,12 @@
                 <div id="sidebar-agents-list" class="sidebar-agents-list"></div>
               </div>
             </div>
-
-            <!-- Apps panel -->
-            <div class="sidebar-panel" data-panel="apps" hidden>
-              <nav id="sidebar-nav-apps" class="sidebar-nav" style="padding-top: 8px;"></nav>
-            </div>
           </div>
 
-          <div class="sidebar-footer">
-            <button type="button" class="footer-switch" id="sidebar-workspace" title="Switch workspace">~/</button>
-            <span class="footer-dot">·</span>
-            <button type="button" class="footer-switch footer-model" id="sidebar-model" title="Switch model">connecting...</button>
-          </div>
+          <!-- App launcher rail: one icon per app tile type -->
+          <div class="sidebar-footer" id="sidebar-apps-rail"></div>
         </div>
       </aside>
-
-      <!-- Floating expand handle, visible only while the sidebar is collapsed -->
-      <button id="sidebar-expand-fab" class="sidebar-expand-fab" title="Expand sidebar" aria-label="Expand sidebar"><span class="rail-mark">M</span></button>
 
       <div id="workspace" class="workspace"></div>
 

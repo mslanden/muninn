@@ -1,9 +1,10 @@
 import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
-import { workspace, sidebarWorkspace, sidebarModel, ui } from "./state.js";
+import { ui } from "./state.js";
+import { updateModelChips } from "./chat.js";
 import { applyTheme, THEMES } from "./theme.js";
-import { field, projectLabel, escapeHtml } from "./utils.js";
+import { field, escapeHtml } from "./utils.js";
 import { icon } from "./icons.js";
 import qrcode from "qrcode-generator";
 import { renderLogsTile } from "./logs.js";
@@ -563,8 +564,7 @@ export function renderSettingsTile(tileObj, body) {
     const currentImgModel = s["imagegen/model"] || "";
     ensureOption(imgModelSelect, currentImgModel);
 
-    sidebarModel.textContent = currentModel || "default model";
-    sidebarModel.title = currentModel || "provider default";
+    updateModelChips();
 
     try { autostartInput.checked = await isAutostartEnabled(); } catch {}
 
@@ -585,8 +585,6 @@ export function renderSettingsTile(tileObj, body) {
     const pathInfo = await invoke("get_workspace_root");
     const workspaceRoot = field(pathInfo, "workspaceRoot", "workspace_root");
     wsInput.value = workspaceRoot;
-    sidebarWorkspace.textContent = projectLabel(workspaceRoot);
-    sidebarWorkspace.title = workspaceRoot || "~/";
   }
 
   // Save
@@ -681,8 +679,7 @@ export function renderSettingsTile(tileObj, body) {
       statusEl.textContent = "Saved";
     }
     ui.loadedSettings = { ...ui.loadedSettings, ...updates };
-    sidebarModel.textContent = updates["llm/model"] || "default model";
-    sidebarModel.title = updates["llm/model"] || "provider default";
+    updateModelChips();
     setTimeout(() => { statusEl.textContent = ""; }, 2000);
     await loadS();
   });
@@ -839,8 +836,6 @@ export function renderSettingsTile(tileObj, body) {
     try {
       const result = await invoke("set_workspace_root", { req: { workspaceRoot: wsInput.value.trim() } });
       wsInput.value = field(result, "workspaceRoot", "workspace_root");
-      sidebarWorkspace.textContent = projectLabel(wsInput.value);
-      sidebarWorkspace.title = wsInput.value;
       statusEl.textContent = "Default directory set";
       setTimeout(() => { statusEl.textContent = ""; }, 2000);
     } catch (e) { statusEl.textContent = String(e); }

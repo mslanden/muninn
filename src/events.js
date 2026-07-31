@@ -1,9 +1,9 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { tiles, chatStreams, tileMaps, ui, sidebarModel } from "./state.js";
+import { tiles, chatStreams, tileMaps, ui } from "./state.js";
 import { escapeHtml, renderMarkdown } from "./utils.js";
 import { getTilesByType, getChatTileBySessionId } from "./tilesys.js";
-import { playTts, maybeAutoSpeak, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn } from "./chat.js";
+import { playTts, maybeAutoSpeak, updateModelChips, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn } from "./chat.js";
 import { renderTasksTile } from "./tasks.js";
 import { renderMemoryTile } from "./memory.js";
 import { renderContentTile } from "./content.js";
@@ -330,10 +330,7 @@ export async function setupEventListeners() {
     // The agent changed a setting via set_setting — resync cached settings and any open
     // Settings tiles so the UI doesn't show stale values.
     try { ui.loadedSettings = await invoke("get_app_settings"); } catch { /* keep old cache */ }
-    if (sidebarModel) {
-      sidebarModel.textContent = ui.loadedSettings["llm/model"] || "MiniMax-M3";
-      sidebarModel.title = ui.loadedSettings["llm/model"] || "MiniMax-M3";
-    }
+    updateModelChips();
     const settingsTiles = getTilesByType("settings");
     for (const t of settingsTiles) {
       const body = t.el.querySelector(".tile-body");

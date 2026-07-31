@@ -191,8 +191,16 @@ export function getChatTileBySessionId(sessionId) {
 // The categorized sidebar (tabs + chat-history browser) lives in sidebar.js.
 // updateSidebar is re-exported from there at the top of this module.
 
+// Single-window mode: when exactly one tile is open, a sidebar click swaps that
+// tile in place instead of stacking a second one. Dragging a sidebar item into
+// the workspace (makeDragSource's pointer drag) is the explicit "open another tile" path.
+export function replaceSingleTileIfAlone() {
+  if (tiles.length === 1) removeTile(tiles[0].id);
+}
+
 export function openTileForType(type) {
   if (type === "chat") {
+    replaceSingleTileIfAlone();
     addChatTile();
   } else {
     // For non-chat types, only allow one instance
@@ -201,8 +209,88 @@ export function openTileForType(type) {
       focusTile(existing[0].id);
       return;
     }
+    replaceSingleTileIfAlone();
     addTile(type);
   }
+}
+
+// ==================== DRAG-TO-OPEN ====================
+// Dropping a sidebar item on the workspace always ADDS a tile, bypassing the
+// single-window swap above. Implemented with pointer events rather than HTML5
+// drag-and-drop: Tauri's native drag-drop handler (used for file imports via
+// tauri://drag-drop) swallows DOM drag events on macOS, so `dragstart` from
+// draggable elements never fires inside the webview.
+
+async function dropTilePayload(payload) {
+  if (payload.type === "chat") {
+    // A session already on screen just gets focused, never duplicated.
+    if (payload.chatId) {
+      const existing = getChatTileBySessionId(payload.chatId);
+      if (existing) { focusTile(existing.id); return; }
+    }
+    await addChatTile(payload.chatId || "", payload.projectPath || "");
+  } else {
+    // Non-chat tiles stay single-instance even via drag.
+    const existing = getTilesByType(payload.type);
+    if (existing.length > 0) { focusTile(existing[0].id); return; }
+    addTile(payload.type);
+  }
+}
+
+function overWorkspace(e) {
+  const r = workspace.getBoundingClientRect();
+  return e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+}
+
+// Attach drag-source behavior to a sidebar element. `payload` is
+// {type, chatId?, projectPath?} — chat entries carry their session.
+export function makeDragSource(el, payload) {
+  el.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    // Leave inner controls (session pin/rename/delete, inline rename input) alone.
+    if (e.target.closest(".session-act, input, textarea, select")) return;
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let started = false;
+    let ghost = null;
+
+    const onMove = (mv) => {
+      if (!started) {
+        if (Math.hypot(mv.clientX - startX, mv.clientY - startY) < 5) return;
+        started = true;
+        const label =
+          el.querySelector(".session-title")?.textContent?.trim() ||
+          el.title ||
+          TILE_TYPES.find((t) => t.type === payload.type)?.label ||
+          payload.type;
+        ghost = document.createElement("div");
+        ghost.className = "drag-ghost";
+        ghost.textContent = label;
+        document.body.appendChild(ghost);
+        document.body.classList.add("tile-dragging");
+      }
+      ghost.style.left = `${mv.clientX + 10}px`;
+      ghost.style.top = `${mv.clientY + 8}px`;
+      workspace.classList.toggle("drop-target", overWorkspace(mv));
+      mv.preventDefault();
+    };
+
+    const onUp = (up) => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      if (!started) return;
+      if (ghost) ghost.remove();
+      document.body.classList.remove("tile-dragging");
+      workspace.classList.remove("drop-target");
+      // A real drag must not double as a click on the source element.
+      el.addEventListener("click", (c) => { c.stopImmediatePropagation(); c.preventDefault(); }, { capture: true, once: true });
+      if (overWorkspace(up)) void dropTilePayload(payload);
+    };
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
 }
 
 // Open a URL in a dedicated Tauri webview window — a real native webview, so sites that
