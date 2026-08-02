@@ -4,7 +4,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml, field, projectLabel, renderMarkdown, threadLabel } from "./utils.js";
 import { focusTile, addTile, getChatTileBySessionId, saveLayout } from "./tilesys.js";
-import { icon } from "./icons.js";
+import { icon, ravenLogo } from "./icons.js";
 
 // Refresh the sidebar chat-history list after session-mutating actions. Imported
 // lazily-at-call (module-level import is fine — only *invoked* at runtime, so the
@@ -1154,13 +1154,9 @@ export function showChatWelcome(chatLog) {
   const el = document.createElement("div");
   el.className = "chat-welcome";
   el.innerHTML = `
+    ${ravenLogo(64)}
     <div class="chat-welcome-brand">MUNINN</div>
-    <p class="chat-welcome-lead">Ask a question, create images, edit video, or work in a project folder.</p>
-    <ul class="chat-welcome-hints">
-      <li>Type naturally — Muninn can use tools in your workspace</li>
-      <li>Paste or attach a screenshot to talk about it</li>
-      <li>Use <kbd>/</kbd> for agents and slash commands</li>
-    </ul>
+    <p class="chat-welcome-lead">Ask anything — Muninn can use tools, see screenshots, and run agents with <kbd>/</kbd></p>
   `;
   chatLog.appendChild(el);
 }

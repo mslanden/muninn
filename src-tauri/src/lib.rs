@@ -195,7 +195,10 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
             TrayIconBuilder::new()
-                .icon(app.default_window_icon().expect("app icon missing — check bundle.icon in tauri.conf.json").clone())
+                // Menu-bar template glyph (black + alpha, generated from the plain
+                // raven logo): macOS recolors it for light/dark menu bars.
+                .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+                .icon_as_template(true)
                 .tooltip("Muninn")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
