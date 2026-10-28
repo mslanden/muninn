@@ -1,6 +1,7 @@
 import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
 import { escapeHtml, field } from "./utils.js";
+import { emptyState } from "./uikit.js";
 
 // ========== MEMORY TILE ==========
 export function renderMemoryTile(tileObj, body) {
@@ -13,74 +14,74 @@ export function renderMemoryTile(tileObj, body) {
     </div>
     <div data-memory-view="profile" class="profile-section">
       <div class="profile-field">
-        <div class="profile-label">NAME</div>
+        <div class="profile-label">Name</div>
         <input type="text" data-mem-name="${tileObj.id}" />
       </div>
       <div class="profile-field">
-        <div class="profile-label">ABOUT</div>
+        <div class="profile-label">About</div>
         <textarea rows="2" data-mem-about="${tileObj.id}"></textarea>
       </div>
       <div class="profile-field">
-        <div class="profile-label">IDENTITY</div>
+        <div class="profile-label">Identity</div>
         <textarea rows="2" data-mem-identity="${tileObj.id}" placeholder="Role, job, background"></textarea>
       </div>
       <div class="profile-field">
-        <div class="profile-label">PERSONALITY</div>
+        <div class="profile-label">Personality</div>
         <textarea rows="2" data-mem-personality="${tileObj.id}" placeholder="Communication style, temperament"></textarea>
       </div>
       <div class="profile-field">
-        <div class="profile-label">GOALS</div>
+        <div class="profile-label">Goals</div>
         <textarea rows="2" data-mem-goals="${tileObj.id}" placeholder="What you're working toward"></textarea>
       </div>
       <div class="profile-field">
-        <div class="profile-label">PREFERENCES</div>
+        <div class="profile-label">Preferences</div>
         <textarea rows="2" data-mem-preferences="${tileObj.id}" placeholder="Likes, dislikes, tool preferences"></textarea>
       </div>
       <div class="profile-field">
-        <div class="profile-label">CURRENT FOCUS</div>
+        <div class="profile-label">Current focus</div>
         <textarea rows="2" data-mem-currentstate="${tileObj.id}" placeholder="What you're currently doing"></textarea>
       </div>
       <div class="profile-field">
-        <div class="profile-label">PATTERNS</div>
+        <div class="profile-label">Patterns</div>
         <textarea rows="2" data-mem-patterns="${tileObj.id}" placeholder="Recurring behaviors or habits"></textarea>
       </div>
       <div class="profile-field">
-        <div class="profile-label">NOTES</div>
+        <div class="profile-label">Notes</div>
         <textarea rows="3" data-mem-profile="${tileObj.id}" placeholder="Additional notes"></textarea>
       </div>
       <button class="form-btn" data-mem-save="${tileObj.id}">Save Profile</button>
     </div>
-    <div data-memory-view="entities" class="hidden" style="padding:6px;">
+    <div data-memory-view="entities" class="hidden p-2">
       <div style="padding:6px 6px 0;">
-        <div class="form-row" style="margin-bottom:8px;">
-          <input type="text" placeholder="Kind" data-ent-kind="${tileObj.id}" style="width:100px" />
+        <div class="form-row mb-2">
+          <input type="text" placeholder="Kind" data-ent-kind="${tileObj.id}" style="width:100px;" />
           <input type="text" placeholder="Name" data-ent-name="${tileObj.id}" />
         </div>
-        <input type="text" placeholder="Aliases (comma-separated)" data-ent-aliases="${tileObj.id}" style="margin-bottom:6px;" />
-        <textarea rows="2" placeholder="Summary" data-ent-summary="${tileObj.id}" style="margin-bottom:6px;"></textarea>
-        <div class="form-row" style="margin-bottom:8px;">
+        <input class="mb-2" type="text" placeholder="Aliases (comma-separated)" data-ent-aliases="${tileObj.id}" />
+        <textarea class="mb-2" rows="2" placeholder="Summary" data-ent-summary="${tileObj.id}"></textarea>
+        <div class="form-row mb-2">
           <button class="form-btn" data-ent-save="${tileObj.id}">Save Entity</button>
           <button class="form-btn" data-ent-reset="${tileObj.id}">Reset</button>
         </div>
       </div>
-      <div class="memory-section-label">RELATIONSHIPS</div>
+      <div class="memory-section-label">Relationships</div>
       <div class="memory-list" data-relationships-list="${tileObj.id}"></div>
-      <div class="memory-section-label">ENTITIES</div>
+      <div class="memory-section-label">Entities</div>
       <div class="memory-list" data-entities-list="${tileObj.id}"></div>
     </div>
-    <div data-memory-view="timeline" class="hidden" style="padding:6px;">
+    <div data-memory-view="timeline" class="hidden p-2">
       <div style="padding:6px 6px 0;">
-        <div class="form-row" style="margin-bottom:6px;">
+        <div class="form-row mb-2">
           <input type="text" placeholder="Description" data-ep-desc="${tileObj.id}" />
-          <input type="text" placeholder="Timestamp" data-ep-time="${tileObj.id}" style="width:140px" />
+          <input type="text" placeholder="Timestamp" data-ep-time="${tileObj.id}" style="width:140px;" />
           <button class="form-btn" data-ep-add="${tileObj.id}">Add</button>
         </div>
       </div>
       <div class="memory-list" data-episodes-list="${tileObj.id}"></div>
     </div>
-    <div data-memory-view="history" class="hidden" style="padding:6px;">
+    <div data-memory-view="history" class="hidden p-2">
       <div style="padding:6px 6px 0;">
-        <div class="form-row" style="margin-bottom:6px;">
+        <div class="form-row mb-2">
           <input type="text" placeholder="Search messages..." data-hist-search="${tileObj.id}" />
           <button class="form-btn" data-hist-go="${tileObj.id}">Search</button>
         </div>
@@ -187,7 +188,7 @@ export function renderMemoryTile(tileObj, body) {
     list.innerHTML = "";
 
     if (!items.length) {
-      list.innerHTML = `<div class="feed-empty">No entities yet</div>`;
+      list.replaceChildren(emptyState({ icon: "database", text: "No entities yet" }));
       return;
     }
 
@@ -241,7 +242,7 @@ export function renderMemoryTile(tileObj, body) {
     list.innerHTML = "";
 
     if (!items.length) {
-      list.innerHTML = `<div class="feed-empty">No relationships yet</div>`;
+      list.replaceChildren(emptyState({ icon: "grid", text: "No relationships yet" }));
       return;
     }
 
@@ -289,7 +290,7 @@ export function renderMemoryTile(tileObj, body) {
     list.innerHTML = "";
 
     if (!items.length) {
-      list.innerHTML = `<div class="feed-empty">No timeline events yet</div>`;
+      list.replaceChildren(emptyState({ icon: "list-checks", text: "No timeline events yet" }));
       return;
     }
 
@@ -343,7 +344,7 @@ export function renderMemoryTile(tileObj, body) {
 
     histList.innerHTML = "";
     if (!sessions.length) {
-      histList.innerHTML = `<div class="feed-empty">${query ? "No matches" : "No conversations yet"}</div>`;
+      histList.replaceChildren(emptyState({ icon: query ? "search" : "message-square", text: query ? "No matches" : "No conversations yet" }));
       return;
     }
 

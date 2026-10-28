@@ -32,7 +32,7 @@ export async function setupEventListeners() {
       const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       turn.innerHTML = `
         <div class="turn-header">
-          <span class="turn-label muninn">MUNINN</span>
+          <span class="turn-label muninn">Muninn</span>
           <span class="turn-time">${time}</span>
         </div>
         <div class="turn-body"></div>
@@ -490,7 +490,7 @@ export async function setupEventListeners() {
     el.className = "turn image-turn";
     el.innerHTML = `
       <div class="turn-header">
-        <span class="turn-label muninn">MUNINN</span>
+        <span class="turn-label muninn">Muninn</span>
         <span class="turn-time">${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
       </div>
       <div class="turn-body">
@@ -524,7 +524,7 @@ export async function setupEventListeners() {
     el.className = "turn image-turn";
     el.innerHTML = `
       <div class="turn-header">
-        <span class="turn-label muninn">MUNINN</span>
+        <span class="turn-label muninn">Muninn</span>
         <span class="turn-time">${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
       </div>
       <div class="turn-body">

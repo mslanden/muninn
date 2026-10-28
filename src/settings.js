@@ -31,14 +31,14 @@ export function renderSettingsTile(tileObj, body) {
           <div class="settings-page active" data-s-page="main"><div class="settings-section">
             <div class="settings-group">
               <h3>Profile</h3>
-              <input type="text" placeholder="Your name" data-s-name="${tileObj.id}" style="margin-bottom:6px;" />
+              <input class="mb-2" type="text" placeholder="Your name" data-s-name="${tileObj.id}" />
               <textarea rows="2" placeholder="About you" data-s-about="${tileObj.id}"></textarea>
-              <input type="text" placeholder="Your location (e.g. Mountain Center, CA)" data-s-location="${tileObj.id}" style="margin-top:6px;" />
+              <input class="mt-2" type="text" placeholder="Your location (e.g. Mountain Center, CA)" data-s-location="${tileObj.id}" />
             </div>
             <div class="settings-group">
               <h3>Model</h3>
-              <div class="form-row" style="margin-bottom:6px;">
-                <select data-s-provider="${tileObj.id}" style="flex:1; min-width:0;">
+              <div class="form-row mb-2">
+                <select class="grow min-w-0" data-s-provider="${tileObj.id}">
                   <option value="minimax">MiniMax (Anthropic-compatible)</option>
                   <option value="openai">OpenAI</option>
                   <option value="anthropic">Anthropic</option>
@@ -58,22 +58,22 @@ export function renderSettingsTile(tileObj, body) {
                 <button class="form-btn" data-s-fetch-models="${tileObj.id}">Fetch models</button>
               </div>
               <datalist id="s-model-list-${tileObj.id}" data-s-model-list="${tileObj.id}"></datalist>
-              <input type="text" placeholder="http://localhost:11434/v1" data-s-custombase="${tileObj.id}" style="margin-bottom:4px; display:none;" />
-              <input type="password" placeholder="API key for the selected provider" data-s-provkey="${tileObj.id}" style="margin-bottom:4px;" />
-              <span class="muted" data-s-prov-hint="${tileObj.id}" style="font-size:10px;"></span>
-              <div class="form-row" style="margin-top:6px; align-items:center;">
+              <input class="mb-1" type="text" placeholder="http://localhost:11434/v1" data-s-custombase="${tileObj.id}" style="display:none;" />
+              <input class="mb-1" type="password" placeholder="API key for the selected provider" data-s-provkey="${tileObj.id}" />
+              <span class="muted text-xs" data-s-prov-hint="${tileObj.id}"></span>
+              <div class="form-row mt-2 items-center">
                 <button class="form-btn" data-s-test-llm="${tileObj.id}">Test</button>
-                <span class="muted" data-s-model-status="${tileObj.id}" style="font-size:10px;"></span>
+                <span class="muted text-xs" data-s-model-status="${tileObj.id}"></span>
               </div>
-              <div class="form-row" style="margin-top:8px;">
-                <input type="number" min="1" step="1024" placeholder="Max response tokens (e.g. 40960)" data-s-maxtokens="${tileObj.id}" style="flex:1;" />
+              <div class="form-row mt-2">
+                <input class="grow" type="number" min="1" step="1024" placeholder="Max response tokens (e.g. 40960)" data-s-maxtokens="${tileObj.id}" />
               </div>
-              <span class="muted" style="font-size:10px;">Output-token ceiling per response. Blank = 40960.</span>
+              <span class="muted text-xs">Output-token ceiling per response. Blank = 40960.</span>
             </div>
             <div class="settings-group">
               <h3>Fallback</h3>
               <div class="form-row">
-                <select data-s-fbprovider="${tileObj.id}" style="flex:1; min-width:0;">
+                <select class="grow min-w-0" data-s-fbprovider="${tileObj.id}">
                   <option value="">No fallback provider</option>
                   <option value="minimax">MiniMax (Anthropic-compatible)</option>
                   <option value="openai">OpenAI</option>
@@ -92,8 +92,8 @@ export function renderSettingsTile(tileObj, body) {
                 </select>
                 <input type="text" placeholder="Fallback model" data-s-fbmodel="${tileObj.id}" style="flex:1.3; min-width:120px;" />
               </div>
-              <span class="muted" style="font-size:10px;">Retried automatically when the primary model fails.</span>
-              <label class="checkbox-inline" style="margin-top:6px;">
+              <span class="muted text-xs">Retried automatically when the primary model fails.</span>
+              <label class="checkbox-inline mt-2">
                 <input type="checkbox" data-s-keyfallback="${tileObj.id}" /> Use the OpenAI key for providers without their own key
               </label>
             </div>
@@ -111,63 +111,63 @@ export function renderSettingsTile(tileObj, body) {
             <div class="settings-group">
               <h3>Service keys</h3>
               <p class="settings-hint">Model-provider keys live under Main → Model. These cover everything else.</p>
-              <input type="password" placeholder="Groq API key (voice transcription)" data-s-groq="${tileObj.id}" style="margin-bottom:6px;" />
-              <input type="password" placeholder="Web search API key" data-s-search="${tileObj.id}" style="margin-bottom:6px;" />
-              <input type="password" placeholder="Together AI key (images)" data-s-together="${tileObj.id}" style="margin-bottom:6px;" />
-              <input type="password" placeholder="Mapbox API key (maps)" data-s-mapbox="${tileObj.id}" style="margin-bottom:6px;" />
-              <input type="password" placeholder="Fish Audio API key (TTS)" data-s-fishaudio="${tileObj.id}" style="margin-bottom:6px;" />
+              <input class="mb-2" type="password" placeholder="Groq API key (voice transcription)" data-s-groq="${tileObj.id}" />
+              <input class="mb-2" type="password" placeholder="Web search API key" data-s-search="${tileObj.id}" />
+              <input class="mb-2" type="password" placeholder="Together AI key (images)" data-s-together="${tileObj.id}" />
+              <input class="mb-2" type="password" placeholder="Mapbox API key (maps)" data-s-mapbox="${tileObj.id}" />
+              <input class="mb-2" type="password" placeholder="Fish Audio API key (TTS)" data-s-fishaudio="${tileObj.id}" />
             </div>
           </div></div>
 
           <div class="settings-page" data-s-page="voice"><div class="settings-section">
             <div class="settings-group">
               <h3>Voice</h3>
-              <div class="form-row" style="margin-bottom:6px;">
-                <select data-s-ttsprov="${tileObj.id}" style="flex:1; min-width:0;">
+              <div class="form-row mb-2">
+                <select class="grow min-w-0" data-s-ttsprov="${tileObj.id}">
                   <option value="minimax">MiniMax</option>
                   <option value="fishaudio">Fish Audio</option>
                   <option value="fishspeech">FishSpeech (local)</option>
                 </select>
-                <input type="text" placeholder="TTS model (e.g. speech-2.8-hd)" data-s-ttsmodel="${tileObj.id}" style="flex:2; min-width:0;" />
+                <input class="grow-2 min-w-0" type="text" placeholder="TTS model (e.g. speech-2.8-hd)" data-s-ttsmodel="${tileObj.id}" />
               </div>
-              <div class="form-row" style="margin-bottom:6px; align-items:center;">
-                <input type="text" placeholder="Voice ID (MiniMax voice or Fish Audio reference id)" data-s-voiceid="${tileObj.id}" style="flex:1;" />
+              <div class="form-row mb-2 items-center">
+                <input class="grow" type="text" placeholder="Voice ID (MiniMax voice or Fish Audio reference id)" data-s-voiceid="${tileObj.id}" />
                 <button class="form-btn" data-s-tts-preview="${tileObj.id}" title="Preview voice">▶</button>
               </div>
-              <span class="muted" data-s-tts-status="${tileObj.id}" style="font-size:10px;"></span>
-              <div class="form-row" style="margin-top:6px;">
-                <select data-s-sttprov="${tileObj.id}" style="flex:1;">
+              <span class="muted text-xs" data-s-tts-status="${tileObj.id}"></span>
+              <div class="form-row mt-2">
+                <select class="grow" data-s-sttprov="${tileObj.id}">
                   <option value="auto">Automatic (Groq → OpenAI)</option>
                   <option value="groq">Groq</option>
                   <option value="openai">OpenAI</option>
                 </select>
               </div>
-              <span class="muted" style="font-size:10px;">Speech-to-text provider for voice input.</span>
-              <label class="checkbox-inline" style="margin-top:8px;">
+              <span class="muted text-xs">Speech-to-text provider for voice input.</span>
+              <label class="checkbox-inline mt-2">
                 <input type="checkbox" data-s-localtranscribe="${tileObj.id}" /> On-device transcription (Apple Speech)
               </label>
-              <span class="muted" style="font-size:10px;">Voice input and video analysis transcribe on your Mac — no key, audio never leaves the device. Falls back to cloud whisper.</span>
+              <span class="muted text-xs">Voice input and video analysis transcribe on your Mac — no key, audio never leaves the device. Falls back to cloud whisper.</span>
             </div>
             <div class="settings-group">
               <h3>Images</h3>
-              <div class="form-row" style="margin-bottom:6px;">
+              <div class="form-row mb-2">
                 <select data-s-imgprov="${tileObj.id}">
                   <option value="">None</option>
                   <option value="minimax">MiniMax</option>
                   <option value="together">Together</option>
                   <option value="openai">OpenAI</option>
                 </select>
-                <select data-s-imgmodel="${tileObj.id}" style="flex:1;"></select>
+                <select class="grow" data-s-imgmodel="${tileObj.id}"></select>
                 <button class="form-btn" data-s-fetch-img-models="${tileObj.id}">Fetch</button>
               </div>
-              <span class="muted" data-s-img-status="${tileObj.id}" style="font-size:10px;"></span>
+              <span class="muted text-xs" data-s-img-status="${tileObj.id}"></span>
             </div>
             <div class="settings-group">
               <h3>Video</h3>
               <label class="checkbox-inline">
                 <input type="checkbox" data-s-hwencode="${tileObj.id}" /> Hardware video encoding (VideoToolbox)
               </label>
-              <span class="muted" style="font-size:10px;">Faster renders on the Mac's hardware encoder; falls back to software automatically.</span>
+              <span class="muted text-xs">Faster renders on the Mac's hardware encoder; falls back to software automatically.</span>
             </div>
           </div></div>
 
@@ -194,20 +194,20 @@ export function renderSettingsTile(tileObj, body) {
               <label class="checkbox-inline">
                 <input type="checkbox" data-s-autostart="${tileObj.id}" /> Launch at login
               </label>
-              <div class="form-row" style="margin-top:6px;">
-                <input type="text" placeholder="Quick-ask shortcut (e.g. cmd+shift+space)" data-s-qashortcut="${tileObj.id}" style="flex:1;" />
+              <div class="form-row mt-2">
+                <input class="grow" type="text" placeholder="Quick-ask shortcut (e.g. cmd+shift+space)" data-s-qashortcut="${tileObj.id}" />
               </div>
-              <span class="muted" style="font-size:10px;">Shortcut changes take effect after restarting Muninn.</span>
+              <span class="muted text-xs">Shortcut changes take effect after restarting Muninn.</span>
             </div>
             <div class="settings-group">
               <h3>Safety</h3>
               <label class="checkbox-inline">
                 <input type="checkbox" data-s-autoverify="${tileObj.id}" /> Auto-verify dangerous commands (LLM reviews before asking you)
               </label>
-              <div class="form-row" style="margin-top:6px;">
-                <input type="number" min="15" max="3600" step="1" placeholder="120" data-s-approvaltimeout="${tileObj.id}" style="flex:1;" />
+              <div class="form-row mt-2">
+                <input class="grow" type="number" min="15" max="3600" step="1" placeholder="120" data-s-approvaltimeout="${tileObj.id}" />
               </div>
-              <span class="muted" style="font-size:10px;">Seconds before a verified command is deferred (15–3600).</span>
+              <span class="muted text-xs">Seconds before a verified command is deferred (15–3600).</span>
             </div>
           </div></div>
 
@@ -215,24 +215,24 @@ export function renderSettingsTile(tileObj, body) {
             <div class="settings-group">
               <h3>Remote access (phone)</h3>
               <p class="settings-hint">Run a local server to chat with Muninn from your phone on the same Wi-Fi.</p>
-              <div class="form-row" style="margin-bottom:6px; align-items:center;">
+              <div class="form-row mb-2 items-center">
                 <button class="form-btn" data-s-mobile-toggle="${tileObj.id}">Enable</button>
-                <span class="muted" data-s-mobile-state="${tileObj.id}" style="font-size:10px;"></span>
+                <span class="muted text-xs" data-s-mobile-state="${tileObj.id}"></span>
               </div>
-              <div class="form-row" style="margin-bottom:4px; align-items:center;">
-                <input type="number" min="1" max="65535" step="1" placeholder="8737" data-s-mobile-port="${tileObj.id}" style="flex:1;" />
-                <span class="muted" style="font-size:10px; white-space:nowrap;">applies on next start</span>
+              <div class="form-row mb-1 items-center">
+                <input class="grow" type="number" min="1" max="65535" step="1" placeholder="8737" data-s-mobile-port="${tileObj.id}" />
+                <span class="muted text-xs nowrap">applies on next start</span>
               </div>
-              <span class="muted" data-s-mobile-error="${tileObj.id}" style="font-size:10px; color:var(--red);"></span>
-              <div class="mobile-pairing" data-s-mobile-pairing="${tileObj.id}" style="display:none; margin-top:10px;">
+              <span class="muted text-xs text-danger" data-s-mobile-error="${tileObj.id}"></span>
+              <div class="mobile-pairing mt-3" data-s-mobile-pairing="${tileObj.id}" style="display:none;">
                 <div class="mobile-qr" data-s-mobile-qr="${tileObj.id}"></div>
                 <div class="mobile-urls" data-s-mobile-urls="${tileObj.id}"></div>
-                <div class="form-row" style="margin-top:8px;">
+                <div class="form-row mt-2">
                   <button class="form-btn danger" data-s-mobile-regen="${tileObj.id}">Regenerate token</button>
                 </div>
-                <p class="settings-hint" style="margin-top:8px;">Works on your Wi-Fi. For access from anywhere, install Tailscale on both devices — the URL then works over it too.</p>
+                <p class="settings-hint mt-2">Works on your Wi-Fi. For access from anywhere, install Tailscale on both devices — the URL then works over it too.</p>
               </div>
-              <p class="settings-hint" style="margin-top:8px; color:var(--red);">Anyone with this URL can chat and run commands as Muninn. Keep it private.</p>
+              <p class="settings-hint mt-2 text-danger">Anyone with this URL can chat and run commands as Muninn. Keep it private.</p>
             </div>
           </div></div>
 
@@ -241,10 +241,10 @@ export function renderSettingsTile(tileObj, body) {
               <h3>MCP Servers</h3>
               <p class="settings-hint">Connect Model Context Protocol servers — their tools become available to Muninn in chat and agent runs. One JSON entry per server.</p>
               <textarea rows="6" spellcheck="false" placeholder='[{"name": "github", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "..."}}]' data-s-mcp="${tileObj.id}"></textarea>
-              <div class="form-row" style="margin-top:6px;">
+              <div class="form-row mt-2">
                 <button class="form-btn" data-s-mcp-reload="${tileObj.id}">Reload Servers</button>
               </div>
-              <div class="muted" data-s-mcp-status="${tileObj.id}" style="font-size:10px; white-space:pre-line;"></div>
+              <div class="muted text-xs" data-s-mcp-status="${tileObj.id}" style="white-space:pre-line;"></div>
             </div>
           </div></div>
 

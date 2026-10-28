@@ -30,6 +30,21 @@ newChatBtn.addEventListener("click", async () => {
 });
 makeDragSource(newChatBtn, { type: "chat" });
 
+// Copy buttons on rendered code blocks (renderMarkdown emits them everywhere).
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".code-copy");
+  if (!btn) return;
+  const code = btn.closest(".code-block")?.querySelector("pre");
+  if (!code) return;
+  try {
+    await navigator.clipboard.writeText(code.innerText);
+    btn.textContent = "Copied";
+  } catch {
+    btn.textContent = "Failed";
+  }
+  setTimeout(() => { btn.textContent = "Copy"; }, 1200);
+});
+
 navSettingsBtn.addEventListener("click", () => {
   if (isSettingsModalOpen()) closeSettingsModal();
   else openSettingsModal();

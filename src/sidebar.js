@@ -101,8 +101,8 @@ function renderAppsRail() {
 
     const btn = document.createElement("button");
     btn.className = `apps-rail-btn${isOpen ? " open" : ""}`;
-    btn.title = def.label;
-    btn.setAttribute("aria-label", def.label);
+    btn.dataset.tip = def.label;
+    btn.setAttribute("aria-label", isOpen ? `${def.label} (open)` : def.label);
     btn.innerHTML = icon(APPS_ICONS[type] || "grid", 15);
 
     btn.addEventListener("click", () => {
@@ -134,20 +134,22 @@ export async function refreshAgentsList() {
   const enabled = agents.filter((a) => field(a, "enabled", "enabled"));
   sidebarAgentsList.innerHTML = "";
 
-  sidebarAgentsList.appendChild(sectionHeader("agents", "Agents", enabled.length));
+  const header = sectionHeader("agents", "Agents", enabled.length, {
+    icon: "settings",
+    title: "Manage agents",
+    onClick: () => openTileForType("agents"),
+  });
+  makeDragSource(header.querySelector(".section-action"), { type: "agents" });
+  sidebarAgentsList.appendChild(header);
   if (isSecCollapsed("agents")) return;
 
-  // Manage link always present.
-  const manage = document.createElement("button");
-  manage.className = "nav-item agents-manage";
-  manage.title = "Manage agents";
-  manage.innerHTML = `
-    <span class="nav-dot ${getTilesByType("agents").length ? "blue" : "off"}"></span>
-    Manage agents
-  `;
-  manage.addEventListener("click", () => openTileForType("agents"));
-  makeDragSource(manage, { type: "agents" });
-  sidebarAgentsList.appendChild(manage);
+  if (!enabled.length) {
+    const empty = document.createElement("button");
+    empty.className = "agent-shortcut agent-shortcut-empty";
+    empty.innerHTML = `${icon("plus", 13)}<span class="agent-shortcut-name">Create an agent</span>`;
+    empty.addEventListener("click", () => openTileForType("agents"));
+    sidebarAgentsList.appendChild(empty);
+  }
 
   for (const a of enabled.slice(0, 8)) {
     const name = field(a, "name", "name") || "Agent";
@@ -156,6 +158,7 @@ export async function refreshAgentsList() {
     btn.className = "agent-shortcut";
     btn.title = slash ? `Run /${slash}` : `Open ${name}`;
     btn.innerHTML = `
+      ${icon("bot", 13)}
       <span class="agent-shortcut-name">${escapeHtml(name)}</span>
       ${slash ? `<span class="agent-shortcut-slash">/${escapeHtml(slash)}</span>` : ""}
     `;
@@ -227,17 +230,17 @@ function sessionRow(s, index) {
   row.dataset.sessionId = sid;
   row.dataset.projectPath = pp;
 
+  const when = timeOf(s);
+  row.title = when ? `${label} · ${when}` : label;
+
   const projectTag = pp
-    ? `<span class="session-project" title="${escapeHtml(pp)}">${escapeHtml(projectLabel(pp))}</span>`
+    ? `<span class="session-meta"><span class="session-project" title="${escapeHtml(pp)}">${escapeHtml(projectLabel(pp))}</span></span>`
     : "";
 
   row.innerHTML = `
     <div class="session-main">
       <span class="session-label">${escapeHtml(label)}</span>
-      <span class="session-meta">
-        <span class="session-time">${escapeHtml(timeOf(s))}</span>
-        ${projectTag}
-      </span>
+      ${projectTag}
     </div>
     <div class="session-item-actions">
       <button class="session-act session-pin${pinned ? " pinned" : ""}" data-act="pin" title="${pinned ? "Unpin" : "Pin"}" aria-label="${pinned ? "Unpin" : "Pin"}">${icon("pin", 13)}</button>
@@ -325,17 +328,31 @@ function startRename(row, sid, currentLabel) {
   input.addEventListener("blur", () => { if (renaming === sid) commit(); });
 }
 
-function sectionHeader(id, text, count) {
+function sectionHeader(id, text, count, action) {
   const h = document.createElement("button");
   h.type = "button";
   h.className = `session-section${isSecCollapsed(id) ? " collapsed" : ""}`;
+  h.setAttribute("aria-expanded", String(!isSecCollapsed(id)));
   h.innerHTML = `
-    <span class="section-caret">${icon("chevron-down", 10)}</span>
     <span class="section-text">${escapeHtml(text)}</span>
+    <span class="section-caret">${icon("chevron-down", 10)}</span>
     ${Number.isFinite(count) && count > 0 ? `<span class="section-count">${count}</span>` : ""}
   `;
   h.addEventListener("click", () => toggleSection(id));
-  return h;
+  if (!action) return h;
+
+  // A header with a trailing action (buttons can't nest, so wrap both).
+  const row = document.createElement("div");
+  row.className = "section-row";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "section-action";
+  btn.title = action.title;
+  btn.setAttribute("aria-label", action.title);
+  btn.innerHTML = icon(action.icon, 13);
+  btn.addEventListener("click", action.onClick);
+  row.append(h, btn);
+  return row;
 }
 
 /** Bucket a session by its last activity for the grouped Recent list. */
@@ -544,6 +561,8 @@ export function updateSidebar() {
 
 export function initSidebar() {
   if (navSettingsBtn) navSettingsBtn.innerHTML = icon("settings", 15);
+  const newChatBtn = document.getElementById("new-chat-btn");
+  if (newChatBtn) newChatBtn.innerHTML = `${icon("plus", 14)}<span>New chat</span>`;
   wireSearch();
   wireCollapse();
   wirePopoverDismiss();

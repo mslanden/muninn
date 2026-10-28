@@ -110,32 +110,32 @@ function renderMediaSection(el, id) {
     <input type="text" class="studio-tone" placeholder="Tone for this batch (optional, on top of brand voice)" data-st-tone="${id}" />
     <div class="studio-actions">
       <button class="form-btn" data-st-gen-copy="${id}">Generate copy</button>
-      <span class="muted" data-st-copy-status="${id}" style="font-size:10px;"></span>
+      <span class="muted text-xs" data-st-copy-status="${id}"></span>
     </div>
 
     <div class="studio-results" data-st-results="${id}"></div>
 
     <div class="studio-image-block">
       <h4 class="studio-h">Image</h4>
-      <div class="form-row" style="gap:6px; margin-bottom:6px;">
-        <input type="text" class="studio-img-prompt" placeholder="Image prompt (defaults to the topic)" data-st-img-prompt="${id}" style="flex:1;" />
+      <div class="form-row mb-2">
+        <input type="text" class="studio-img-prompt grow" placeholder="Image prompt (defaults to the topic)" data-st-img-prompt="${id}" />
         <button class="form-btn" data-st-gen-img="${id}">Generate image</button>
       </div>
-      <span class="muted" data-st-img-status="${id}" style="font-size:10px;"></span>
+      <span class="muted text-xs" data-st-img-status="${id}"></span>
       <div class="studio-image-preview" data-st-img-preview="${id}"></div>
     </div>
 
     <div class="studio-image-block">
       <h4 class="studio-h">Carousel / Graphic</h4>
-      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
-        <select data-st-car-aspect="${id}" style="width:auto;">
+      <div class="form-row items-center wrap">
+        <select class="w-auto" data-st-car-aspect="${id}">
           ${Object.entries(ASPECTS).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join("")}
         </select>
-        <label class="muted" style="font-size:11px;">Slides <input type="number" min="1" max="10" value="5" data-st-car-slides="${id}" style="width:56px; margin-left:6px;" /></label>
+        <label class="muted text-sm">Slides <input class="ml-2" type="number" min="1" max="10" value="5" data-st-car-slides="${id}" style="width:56px;" /></label>
         <button class="form-btn" data-st-car-gen="${id}">Generate carousel</button>
         <button class="hint-chip" data-st-car-saveall="${id}" style="display:none;">Save all to Content</button>
       </div>
-      <span class="muted" data-st-car-status="${id}" style="font-size:10px;"></span>
+      <span class="muted text-xs" data-st-car-status="${id}"></span>
       <div class="studio-carousel-grid" data-st-car-grid="${id}"></div>
     </div>
   `;
@@ -318,14 +318,14 @@ function renderWritingSection(el, id) {
     <div class="studio-write-actions" data-st-write-actions="${id}">
       ${WRITING_ACTIONS.map((a, i) => `<button class="hint-chip" data-st-wact="${i}">${escapeHtml(a.label)}</button>`).join("")}
     </div>
-    <div class="form-row" style="gap:6px; margin-top:6px;">
-      <input type="text" class="studio-write-instr" placeholder="Or tell the AI what to do (e.g. 'rewrite as a LinkedIn post', 'make it punchier')" data-st-write-instr="${id}" style="flex:1;" />
+    <div class="form-row mt-2">
+      <input type="text" class="studio-write-instr grow" placeholder="Or tell the AI what to do (e.g. 'rewrite as a LinkedIn post', 'make it punchier')" data-st-write-instr="${id}" />
       <button class="form-btn" data-st-write-apply="${id}">Apply</button>
     </div>
-    <div class="studio-actions" style="margin-top:6px;">
+    <div class="studio-actions mt-2">
       <button class="hint-chip" data-st-write-undo="${id}" style="display:none;">Undo</button>
       <button class="hint-chip" data-st-write-copy="${id}">Copy all</button>
-      <span class="muted" data-st-write-status="${id}" style="font-size:10px;"></span>
+      <span class="muted text-xs" data-st-write-status="${id}"></span>
     </div>
   `;
 
@@ -382,13 +382,13 @@ function renderDocsSection(el, id) {
       <button class="studio-seg-btn" data-st-dt="document">Document</button>
     </div>
     <textarea class="studio-topic" rows="3" placeholder="What should the document cover? (topic, outline, key points)" data-st-doc-topic="${id}"></textarea>
-    <div class="form-row" style="gap:6px; align-items:center;">
-      <label class="muted" style="font-size:11px;">Slides <input type="number" min="3" max="20" value="7" data-st-doc-slides="${id}" style="width:60px; margin-left:6px;" /></label>
+    <div class="form-row items-center">
+      <label class="muted text-sm">Slides <input class="ml-2" type="number" min="3" max="20" value="7" data-st-doc-slides="${id}" style="width:60px;" /></label>
       <button class="form-btn" data-st-doc-gen="${id}">Generate</button>
-      <span class="muted" data-st-doc-status="${id}" style="font-size:10px;"></span>
+      <span class="muted text-xs" data-st-doc-status="${id}"></span>
     </div>
     <div class="studio-doc-result" data-st-doc-result="${id}" style="display:none;">
-      <div class="studio-actions" style="margin-bottom:6px;">
+      <div class="studio-actions mb-2">
         <button class="form-btn" data-st-doc-open="${id}">Open in browser → ⌘P → Save as PDF</button>
         <button class="hint-chip" data-st-doc-copy="${id}">Copy HTML</button>
       </div>
@@ -511,66 +511,66 @@ function mergeMainWithInserts(newMains, oldSegments) {
 
 function renderVideoSection(el, id) {
   el.innerHTML = `
-    <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+    <div class="form-row items-center wrap">
       <button class="form-btn" data-vd-pick="${id}">Choose video…</button>
-      <span class="muted" data-vd-info="${id}" style="font-size:11px;"></span>
+      <span class="muted text-sm" data-vd-info="${id}"></span>
     </div>
     <div class="studio-filmstrip" data-vd-strip="${id}"></div>
 
     <div class="vp-mount" data-vd-preview="${id}" style="display:none;"></div>
 
-    <div class="form-row" style="gap:6px; align-items:center;">
+    <div class="form-row items-center">
       <button class="form-btn" data-vd-analyze="${id}" disabled>Analyze speech &amp; silence</button>
-      <span class="muted" data-vd-an-status="${id}" style="font-size:10px;"></span>
+      <span class="muted text-xs" data-vd-an-status="${id}"></span>
     </div>
     <div class="studio-transcript" data-vd-transcript="${id}" style="display:none;"></div>
 
-    <h4 class="studio-h" style="margin-top:8px;">Auto-shorts</h4>
-    <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
-      <label class="muted" style="font-size:11px;">Clips
-        <select data-vd-shorts-count="${id}" style="width:auto; margin-left:4px;">
+    <h4 class="studio-h mt-2">Auto-shorts</h4>
+    <div class="form-row items-center wrap">
+      <label class="muted text-sm">Clips
+        <select class="w-auto ml-1" data-vd-shorts-count="${id}">
           <option value="1">1</option><option value="2">2</option>
           <option value="3" selected>3</option><option value="4">4</option><option value="5">5</option>
         </select>
       </label>
-      <input type="text" placeholder="Optional focus (e.g. 'the pricing discussion')" data-vd-shorts-brief="${id}" style="flex:1; min-width:160px;" />
+      <input class="grow" type="text" placeholder="Optional focus (e.g. 'the pricing discussion')" data-vd-shorts-brief="${id}" style="min-width:160px;" />
       <button class="form-btn" data-vd-shorts-go="${id}" disabled title="Transcribe, pick the best moments, and render captioned 9:16 shorts">Make shorts</button>
       <button class="hint-chip" data-vd-shorts-cancel="${id}" style="display:none;">Cancel</button>
-      <span class="muted" data-vd-shorts-status="${id}" style="font-size:10px;"></span>
+      <span class="muted text-xs" data-vd-shorts-status="${id}"></span>
     </div>
     <div class="studio-progress" data-vd-shorts-progwrap="${id}" style="display:none;">
       <div class="studio-progress-bar" data-vd-shorts-prog="${id}"></div>
     </div>
     <div class="studio-shorts-out" data-vd-shorts-out="${id}"></div>
 
-    <h4 class="studio-h" style="margin-top:8px;">Compile clips</h4>
-    <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+    <h4 class="studio-h mt-2">Compile clips</h4>
+    <div class="form-row items-center wrap">
       <button class="form-btn" data-vd-cm-add="${id}">Add clips…</button>
-      <span class="muted" data-vd-cm-hint="${id}" style="font-size:11px;"></span>
+      <span class="muted text-sm" data-vd-cm-hint="${id}"></span>
     </div>
     <div class="studio-compile-list" data-vd-cm-list="${id}"></div>
-    <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
-      <select data-vd-cm-mode="${id}" style="width:auto;">
+    <div class="form-row items-center wrap">
+      <select class="w-auto" data-vd-cm-mode="${id}">
         <option value="auto">Auto-detect</option>
         <option value="takes">Best takes (same content)</option>
         <option value="montage">Montage (different content)</option>
       </select>
-      <input type="text" placeholder="e.g. 2-minute recap, prioritize the demo" data-vd-cm-brief="${id}" style="flex:1; min-width:160px;" />
+      <input class="grow" type="text" placeholder="e.g. 2-minute recap, prioritize the demo" data-vd-cm-brief="${id}" style="min-width:160px;" />
       <input type="number" min="1" step="1" placeholder="target secs" data-vd-cm-target="${id}" style="width:90px;" />
       <label class="studio-chip"><input type="checkbox" data-vd-cm-captions="${id}" checked /> Captions</label>
     </div>
-    <div class="form-row" style="gap:6px; align-items:center;">
+    <div class="form-row items-center">
       <button class="form-btn" data-vd-cm-go="${id}" disabled title="Pick 2–10 clips to compile">Compile</button>
       <button class="hint-chip" data-vd-cm-cancel="${id}" style="display:none;">Cancel</button>
-      <span class="muted" data-vd-cm-status="${id}" style="font-size:10px;"></span>
+      <span class="muted text-xs" data-vd-cm-status="${id}"></span>
     </div>
     <div class="studio-progress" data-vd-cm-progwrap="${id}" style="display:none;">
       <div class="studio-progress-bar" data-vd-cm-prog="${id}"></div>
     </div>
     <div class="studio-compile-out" data-vd-cm-out="${id}"></div>
 
-    <h4 class="studio-h" style="margin-top:8px;">Edit</h4>
-    <div class="form-row" style="gap:6px;">
+    <h4 class="studio-h mt-2">Edit</h4>
+    <div class="form-row">
       <textarea class="studio-topic" rows="2" style="flex:1;"
         placeholder="Describe the edit (e.g. 'keep the best 30s, cut the dead air, add a title, make it punchy for TikTok')"
         data-vd-instr="${id}"></textarea>
@@ -579,13 +579,13 @@ function renderVideoSection(el, id) {
 
     <div class="studio-plan" data-vd-planbox="${id}"></div>
 
-    <div class="form-row" style="gap:6px; align-items:center; margin-top:4px;">
+    <div class="form-row items-center mt-1">
       <button class="form-btn" data-vd-render="${id}" disabled>Render</button>
       <button class="hint-chip" data-vd-cancel="${id}" style="display:none;">Cancel</button>
       <div class="studio-progress" data-vd-progwrap="${id}" style="display:none;">
         <div class="studio-progress-bar" data-vd-prog="${id}"></div>
       </div>
-      <span class="muted" data-vd-status="${id}" style="font-size:10px;"></span>
+      <span class="muted text-xs" data-vd-status="${id}"></span>
     </div>
     <div class="studio-video-out" data-vd-out="${id}"></div>
   `;
@@ -862,19 +862,19 @@ function renderVideoSection(el, id) {
       analysis = await invoke("video_analyze", { req: { path: srcPath } });
       const parts = [];
       if (analysis.silences.length) {
-        parts.push(`<div class="muted" style="font-size:10px;">${analysis.silences.length} silence${analysis.silences.length === 1 ? "" : "s"} detected — "Cut silences" below removes them.</div>`);
+        parts.push(`<div class="muted text-xs">${analysis.silences.length} silence${analysis.silences.length === 1 ? "" : "s"} detected — "Cut silences" below removes them.</div>`);
       }
       if (analysis.filler_ranges?.length) {
-        parts.push(`<div class="muted" style="font-size:10px;">${analysis.filler_ranges.length} filler word${analysis.filler_ranges.length === 1 ? "" : "s"}/stutter${analysis.filler_ranges.length === 1 ? "" : "s"} detected — "Cut filler words" below removes them.</div>`);
+        parts.push(`<div class="muted text-xs">${analysis.filler_ranges.length} filler word${analysis.filler_ranges.length === 1 ? "" : "s"}/stutter${analysis.filler_ranges.length === 1 ? "" : "s"} detected — "Cut filler words" below removes them.</div>`);
       }
       if (analysis.transcript && analysis.transcript.segments.length) {
         parts.push(analysis.transcript.segments.map(s =>
           `<div class="studio-tr-line"><span class="studio-tr-time">${fmtT(s.start)}–${fmtT(s.end)}</span> ${escapeHtml(s.text)}</div>`
         ).join(""));
       } else if (analysis.transcript_error) {
-        parts.push(`<div class="muted" style="font-size:10px;">Transcript unavailable: ${escapeHtml(analysis.transcript_error)}</div>`);
+        parts.push(`<div class="muted text-xs">Transcript unavailable: ${escapeHtml(analysis.transcript_error)}</div>`);
       } else {
-        parts.push(`<div class="muted" style="font-size:10px;">No speech found.</div>`);
+        parts.push(`<div class="muted text-xs">No speech found.</div>`);
       }
       transcriptEl.innerHTML = parts.join("");
       transcriptEl.style.display = "";
@@ -936,60 +936,60 @@ function renderVideoSection(el, id) {
       : dur;
     const outDur = kept / (plan.speed || 1);
     planBox.innerHTML = `
-      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+      <div class="form-row items-center wrap">
         <button class="hint-chip" data-vd-cutsil>Cut silences</button>
         <button class="hint-chip" data-vd-clearsegs>Keep everything</button>
         <button class="hint-chip" data-vd-addinsert title="Splice in a b-roll clip or a still-image title card after the current spot">Insert clip/image…</button>
         <label class="studio-chip" title="${fillerCount ? "Cut detected filler words (um, uh, ...) and repeated-word stutters" : "Analyze speech first to find filler words"}">
           <input type="checkbox" data-vd-fillers ${cutFillers ? "checked" : ""} ${fillerCount ? "" : "disabled"} /> Cut filler words (${fillerCount} found)
         </label>
-        <span class="muted" style="font-size:10px;">
+        <span class="muted text-xs">
           ${plan.segments.length ? `${plan.segments.length} segment${plan.segments.length === 1 ? "" : "s"} kept` : "keeping the whole video"}${probe ? ` · output ≈ ${fmtT(outDur)}s` : ""}
         </span>
       </div>
       <div class="studio-segs" data-vd-segs></div>
-      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
-        <select data-vd-filter style="width:auto;">
+      <div class="form-row items-center wrap">
+        <select class="w-auto" data-vd-filter>
           ${presets.map(p => `<option value="${escapeHtml(p.key)}" ${p.key === plan.filter ? "selected" : ""}>${escapeHtml(p.label)}</option>`).join("")}
         </select>
-        <select data-vd-aspect style="width:auto;">
+        <select class="w-auto" data-vd-aspect>
           ${VIDEO_ASPECTS.map(([v, l]) => `<option value="${v}" ${v === plan.aspect ? "selected" : ""}>${l}</option>`).join("")}
         </select>
         <label class="studio-chip" title="${plan.aspect ? "Track faces so speakers stay in frame instead of a static center-crop (only when cropping to a narrower aspect)" : "Choose an aspect ratio first"}">
           <input type="checkbox" data-vd-reframe ${plan.smartReframe ? "checked" : ""} ${plan.aspect ? "" : "disabled"} /> Keep subject in frame
         </label>
-        <label class="muted" style="font-size:11px;">Speed
-          <input type="number" min="0.25" max="4" step="0.25" value="${plan.speed}" data-vd-speed style="width:64px; margin-left:4px;" />
+        <label class="muted text-sm">Speed
+          <input class="ml-1" type="number" min="0.25" max="4" step="0.25" value="${plan.speed}" data-vd-speed style="width:64px;" />
         </label>
         <label class="studio-chip"><input type="checkbox" data-vd-mute ${plan.mute ? "checked" : ""} /> Mute</label>
       </div>
-      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+      <div class="form-row items-center wrap">
         <label class="studio-chip" title="${hasTranscript ? "Burn word-timed subtitles from the transcript" : "Analyze speech first to enable captions"}">
           <input type="checkbox" data-vd-captions ${plan.captions ? "checked" : ""} ${hasTranscript ? "" : "disabled"} /> Burn captions
         </label>
-        <select data-vd-capstyle style="width:auto;" ${hasTranscript && plan.captions ? "" : "disabled"}>
+        <select class="w-auto" data-vd-capstyle ${hasTranscript && plan.captions ? "" : "disabled"}>
           ${CAPTION_STYLES.map(([v, l]) => `<option value="${v}" ${v === plan.captionStyle ? "selected" : ""}>${l}</option>`).join("")}
         </select>
         <button class="hint-chip" data-vd-exportsrt ${hasTranscript ? "" : "disabled"}>Export SRT</button>
-        ${hasTranscript ? "" : `<span class="muted" style="font-size:10px;">Analyze speech to enable captions.</span>`}
+        ${hasTranscript ? "" : `<span class="muted text-xs">Analyze speech to enable captions.</span>`}
       </div>
-      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
+      <div class="form-row items-center wrap">
         <label class="studio-chip" title="Loudness-normalize the mix for publishable audio (EBU R128, -14 LUFS)">
           <input type="checkbox" data-vd-normalize ${plan.normalizeAudio ? "checked" : ""} /> Normalize loudness
         </label>
         <label class="studio-chip" title="Reduce background hiss/hum/fan noise">
           <input type="checkbox" data-vd-denoise ${plan.denoise ? "checked" : ""} /> Reduce noise
         </label>
-        <label class="muted" style="font-size:11px;" title="Fade in/out at the start and end of the clip (video + audio)">Fade (s)
-          <input type="number" min="0.1" max="5" step="0.1" placeholder="none" value="${plan.fade ?? ""}" data-vd-fade style="width:64px; margin-left:4px;" />
+        <label class="muted text-sm" title="Fade in/out at the start and end of the clip (video + audio)">Fade (s)
+          <input class="ml-1" type="number" min="0.1" max="5" step="0.1" placeholder="none" value="${plan.fade ?? ""}" data-vd-fade style="width:64px;" />
         </label>
       </div>
       <div class="studio-texts" data-vd-texts></div>
-      <div class="form-row" style="gap:6px; align-items:center; flex-wrap:wrap;">
-        <input type="text" placeholder="Overlay text (optional)" data-vd-newtext style="flex:1; min-width:140px;" />
+      <div class="form-row items-center wrap">
+        <input class="grow" type="text" placeholder="Overlay text (optional)" data-vd-newtext style="min-width:140px;" />
         <input type="number" min="0" step="0.5" placeholder="start s" data-vd-newstart style="width:70px;" />
         <input type="number" min="0" step="0.5" placeholder="end s" data-vd-newend style="width:70px;" />
-        <select data-vd-newpos style="width:auto;">
+        <select class="w-auto" data-vd-newpos>
           <option value="bottom">Bottom</option><option value="center">Center</option><option value="top">Top</option>
         </select>
         <button class="hint-chip" data-vd-addtext>Add text</button>
@@ -1212,8 +1212,8 @@ function renderVideoSection(el, id) {
       <div class="studio-short-item">
         <div class="studio-short-meta">
           <strong>${escapeHtml(r.title)}</strong>
-          <span class="muted" style="font-size:10px;"> · ${fmtT(r.duration_s)}s</span>
-          ${r.hook ? `<div class="muted" style="font-size:10px;">Hook: ${escapeHtml(r.hook)}</div>` : ""}
+          <span class="muted text-xs"> · ${fmtT(r.duration_s)}s</span>
+          ${r.hook ? `<div class="muted text-xs">Hook: ${escapeHtml(r.hook)}</div>` : ""}
         </div>
         <video controls preload="none" src="${convertFileSrc(r.path)}" class="studio-video-preview"></video>
       </div>
@@ -1335,11 +1335,11 @@ function renderVideoSection(el, id) {
         <div class="studio-compile-result-meta">
           <strong>${escapeHtml(r.title)}</strong>
           <span class="studio-compile-badge">${escapeHtml(modeLabel)}</span>
-          <span class="muted" style="font-size:10px;"> · ${fmtT(r.duration_s)}s</span>
+          <span class="muted text-xs"> · ${fmtT(r.duration_s)}s</span>
         </div>
-        ${r.notes ? `<div class="muted" style="font-size:10px;">${escapeHtml(r.notes)}</div>` : ""}
+        ${r.notes ? `<div class="muted text-xs">${escapeHtml(r.notes)}</div>` : ""}
         <video controls preload="none" src="${convertFileSrc(r.path)}" class="studio-video-preview"></video>
-        <div class="studio-actions" style="margin-top:4px;">
+        <div class="studio-actions mt-1">
           <button class="hint-chip" data-vd-cm-open>Open in editor</button>
         </div>
       </div>

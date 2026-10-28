@@ -2,6 +2,7 @@ import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
 import { ui } from "./state.js";
 import { escapeHtml, field, parseAllowedTools } from "./utils.js";
+import { emptyState } from "./uikit.js";
 import { refreshAgentsList } from "./sidebar.js";
 
 // ========== AGENTS TILE ==========
@@ -97,7 +98,7 @@ export function renderAgentsTile(tileObj, body) {
     list.innerHTML = "";
 
     if (!items.length) {
-      list.innerHTML = `<div class="feed-empty">No agents configured</div>`;
+      list.replaceChildren(emptyState({ icon: "bot", text: "No agents yet — create one with + New" }));
       return;
     }
 

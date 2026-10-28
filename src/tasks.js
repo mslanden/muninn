@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { ui } from "./state.js";
 import { escapeHtml, field, formatNextRun, renderMarkdown } from "./utils.js";
+import { emptyState } from "./uikit.js";
 import { renderScheduleWidget } from "./schedule.js";
 import { addChatTile } from "./chat.js";
 
@@ -247,7 +248,7 @@ export function renderTasksTile(tileObj, body) {
 
     list.innerHTML = "";
     if (!filtered.length) {
-      list.innerHTML = `<div class="feed-empty">No tasks</div>`;
+      list.replaceChildren(emptyState({ icon: "list-checks", text: "No tasks yet — schedule one with + New" }));
       return;
     }
 

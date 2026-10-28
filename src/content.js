@@ -2,6 +2,7 @@ import { registerTileRenderer } from "./registry.js";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { escapeHtml, field, formatFileSize, formatModifiedAt } from "./utils.js";
 import { icon } from "./icons.js";
+import { emptyState } from "./uikit.js";
 
 // ========== CONTENT TILE ==========
 // SVG markup for each kind. Built once at module load so render stays cheap.
@@ -26,7 +27,7 @@ export function renderContentTile(tileObj, body) {
         <option value="text">Text</option>
       </select>
       <span class="tasks-spacer"></span>
-      <span class="muted" data-content-path="${tileObj.id}" style="font-size:10px;"></span>
+      <span class="muted text-xs" data-content-path="${tileObj.id}"></span>
       <button class="tile-btn" data-content-open="${tileObj.id}" title="Open folder">&#128193;</button>
       <button class="tile-btn" data-content-refresh="${tileObj.id}" title="Refresh">&#8635;</button>
     </div>
@@ -65,7 +66,7 @@ export function renderContentTile(tileObj, body) {
 
     listEl.innerHTML = "";
     if (!filtered.length) {
-      listEl.innerHTML = `<div class="feed-empty">${filter === "all" ? "Drop files here or add to content folder" : `No ${filter} files`}</div>`;
+      listEl.replaceChildren(emptyState({ icon: "file", text: filter === "all" ? "Drop files here or add them to the content folder" : `No ${filter} files` }));
       return;
     }
 
@@ -136,7 +137,7 @@ export function showContentPreview(item) {
   overlay.innerHTML = `
     <div class="content-preview-header">
       <span>${escapeHtml(name)}</span>
-      <div style="display:flex;gap:6px;">
+      <div class="form-row">
         <button data-preview-open>Open in App</button>
         <button data-preview-close>Close</button>
       </div>
@@ -175,7 +176,7 @@ export function showContentPreview(item) {
       pre.textContent = field(resp, "content", "content");
     }).catch(() => { pre.textContent = "Failed to load file."; });
   } else {
-    previewBody.innerHTML = `<div style="color:var(--muted);text-align:center;padding:40px;">No preview available — use "Open in App" to view this file.</div>`;
+    previewBody.replaceChildren(emptyState({ icon: "file-text", text: "No preview available — use \"Open in App\" to view this file." }));
   }
 
   document.addEventListener("keydown", escHandler);

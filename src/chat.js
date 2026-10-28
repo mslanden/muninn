@@ -88,11 +88,8 @@ export async function addChatTile(existingSessionId, projectPath, opts = {}) {
     }
   }
 
-  const subtitle = pp ? projectLabel(pp) : chatSessionId.slice(0, 8);
-
   const tileObj = addTile("chat", {
     chatId: chatSessionId,
-    subtitle,
     projectPath: pp,
     autoVoice: !!opts.autoVoice
   });
@@ -369,6 +366,14 @@ export function renderChatTile(tileObj, body) {
         saveLayout();
       });
       spacer.before(sel);
+      // Conversation-level actions live in the header, not the composer.
+      const actions = document.createElement("div");
+      actions.className = "chat-header-actions";
+      actions.innerHTML = `
+        <button class="tile-btn" data-chat-search-btn="${tileObj.id}" title="Search this conversation" aria-label="Search conversation">${icon("search", 13)}</button>
+        <button class="tile-btn" data-chat-export="${tileObj.id}" title="Copy conversation as Markdown" aria-label="Export conversation">${icon("download", 13)}</button>
+      `;
+      spacer.after(actions);
     }
   }
 
@@ -381,27 +386,24 @@ export function renderChatTile(tileObj, body) {
       <span class="goal-banner-status" data-goal-status="${tileObj.id}"></span>
       <button class="goal-banner-x" data-goal-clear="${tileObj.id}" title="Clear goal" aria-label="Clear goal">${icon("x")}</button>
     </div>
-    <div class="context-bar" data-context-bar="${tileObj.id}">
-      <div class="context-fill" data-context-fill="${tileObj.id}"></div>
-      <span class="context-label" data-context-label="${tileObj.id}"></span>
-    </div>
     <div class="composer-box">
       <div class="composer-attachments" data-chat-attachments="${tileObj.id}" style="display:none;"></div>
-      <textarea rows="1" placeholder="Message... (paste or drag an image to share a screenshot)" data-chat-input="${tileObj.id}"></textarea>
+      <textarea rows="1" placeholder="Message Muninn…" title="Paste or drop an image to share a screenshot" data-chat-input="${tileObj.id}"></textarea>
       <div class="composer-bar">
         <div class="composer-left">
           <button class="hint-chip chip-labeled" data-chat-folder="${tileObj.id}" title="Set working folder for this chat" aria-label="Set working folder">${icon("folder")}<span class="chip-label" data-folder-label="${tileObj.id}"></span></button>
           <button class="hint-chip" data-chat-attach="${tileObj.id}" title="Attach an image / screenshot" aria-label="Attach">${icon("paperclip")}</button>
           <button class="hint-chip" data-chat-mic="${tileObj.id}" title="Voice input" aria-label="Voice input">${icon("mic")}</button>
           <button class="hint-chip${tileObj.autoVoice ? " active" : ""}" data-chat-autovoice="${tileObj.id}" title="Voice auto-respond: send the transcript immediately and read the reply aloud" aria-label="Toggle voice auto-respond" aria-pressed="${!!tileObj.autoVoice}">${icon("volume")}</button>
-          <button class="hint-chip" data-chat-search-btn="${tileObj.id}" title="Search this conversation" aria-label="Search conversation">${icon("search")}</button>
-          <button class="hint-chip" data-chat-export="${tileObj.id}" title="Copy conversation as Markdown" aria-label="Export conversation">${icon("download")}</button>
-          <button class="hint-chip" data-hint="slash" aria-label="Slash commands">/</button>
+          <button class="hint-chip" data-hint="slash" title="Slash commands" aria-label="Slash commands">/</button>
           <input type="file" accept="image/*" multiple data-chat-file="${tileObj.id}" style="display:none;" />
         </div>
         <div class="composer-right">
+          <span class="context-ring" data-context-bar="${tileObj.id}" hidden>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><circle class="context-track" cx="10" cy="10" r="8"/><circle class="context-fill" data-context-fill="${tileObj.id}" cx="10" cy="10" r="8" pathLength="100"/></svg>
+          </span>
           <button class="hint-chip chip-labeled" data-chat-model="${tileObj.id}" title="Switch model" aria-label="Switch model"><span class="chip-label"></span></button>
-          <button class="send-btn" data-chat-send="${tileObj.id}">SEND</button>
+          <button class="send-btn" data-chat-send="${tileObj.id}" title="Send (Enter)" aria-label="Send">${icon("arrow-up", 16)}</button>
         </div>
       </div>
     </div>
@@ -572,7 +574,7 @@ export function renderChatTile(tileObj, body) {
     searchCount.textContent = hits.length ? `${hits.length} match${hits.length === 1 ? "" : "es"}` : "no matches";
     if (hits.length) hits[0].scrollIntoView({ block: "center", behavior: "smooth" });
   }
-  composer.querySelector(`[data-chat-search-btn="${tileObj.id}"]`).addEventListener("click", () => {
+  tileObj.el.querySelector(`[data-chat-search-btn="${tileObj.id}"]`).addEventListener("click", () => {
     searchBar.hidden = !searchBar.hidden;
     if (!searchBar.hidden) { searchInput.focus(); }
     else { searchInput.value = ""; clearSearch(); searchCount.textContent = ""; }
@@ -586,7 +588,7 @@ export function renderChatTile(tileObj, body) {
   });
 
   // ---- Export conversation as Markdown (copy to clipboard) ----
-  const exportBtn = composer.querySelector(`[data-chat-export="${tileObj.id}"]`);
+  const exportBtn = tileObj.el.querySelector(`[data-chat-export="${tileObj.id}"]`);
   exportBtn.addEventListener("click", async () => {
     const stream = chatStreams[tileObj.id];
     if (!stream || !stream.sessionId) return;
@@ -594,10 +596,10 @@ export function renderChatTile(tileObj, body) {
     try {
       const md = await invoke("export_session_markdown", { sessionId: stream.sessionId });
       await navigator.clipboard.writeText(md);
-      exportBtn.innerHTML = icon("check");
+      exportBtn.innerHTML = icon("check", 13);
     } catch (err) {
       console.error("export error:", err);
-      exportBtn.innerHTML = icon("x");
+      exportBtn.innerHTML = icon("x", 13);
     }
     setTimeout(() => { exportBtn.innerHTML = original; }, 1200);
   });
@@ -927,7 +929,7 @@ export function maybeAutoSpeak(tileObj, text) {
 
 export function addTurn(chatLog, role, text, images = []) {
   const turn = document.createElement("div");
-  turn.className = "turn";
+  turn.className = `turn ${role}`;
   const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const speakBtn = role === "muninn" ? `<button class="tts-btn" title="Read aloud" aria-label="Read aloud">${icon("play", 12)}</button>` : "";
   const imagesHtml = (images && images.length)
@@ -935,7 +937,7 @@ export function addTurn(chatLog, role, text, images = []) {
     : "";
   turn.innerHTML = `
     <div class="turn-header">
-      <span class="turn-label ${role}">${role === "you" ? "YOU" : "MUNINN"}</span>
+      <span class="turn-label ${role}">${role === "you" ? "You" : "Muninn"}</span>
       <span class="turn-time">${time}</span>
       ${speakBtn}
     </div>
@@ -1295,26 +1297,18 @@ export function parseSlashCommand(text) {
 export const CONTEXT_WINDOW = 1000000;
 
 export function updateContextBar(tileId, tokens) {
-  const bar = document.querySelector(`[data-context-bar="${tileId}"]`);
+  const ring = document.querySelector(`[data-context-bar="${tileId}"]`);
   const fill = document.querySelector(`[data-context-fill="${tileId}"]`);
-  const label = document.querySelector(`[data-context-label="${tileId}"]`);
-  if (!bar || !fill || !label) return;
+  if (!ring || !fill) return;
 
   const pct = Math.min((tokens / CONTEXT_WINDOW) * 100, 100);
-  fill.style.width = `${pct}%`;
-
-  if (pct > 85) {
-    fill.style.background = "var(--red)";
-  } else if (pct > 60) {
-    fill.style.background = "var(--warn)";
-  } else {
-    fill.style.background = "var(--gold)";
-  }
+  fill.style.strokeDasharray = `${pct} 100`;
+  fill.style.stroke = pct > 85 ? "var(--red)" : pct > 60 ? "var(--warn)" : "var(--muted)";
 
   const used = tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : `${tokens}`;
   const max = `${(CONTEXT_WINDOW / 1000).toFixed(0)}k`;
-  label.textContent = `${used} / ${max} tokens (${pct.toFixed(0)}%)`;
-  bar.style.display = tokens > 0 ? "block" : "none";
+  ring.title = `Context: ${used} / ${max} tokens (${pct.toFixed(0)}%)`;
+  ring.hidden = tokens <= 0;
 }
 
 export function estimateContextFromMessages(tileId, chatLog) {

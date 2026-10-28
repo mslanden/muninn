@@ -30,35 +30,123 @@ export function normalizeWebUrl(input) {
   }
 }
 
+// Block-level Markdown -> HTML. The input is escaped up front, so every tag in
+// the output is produced here and the result is safe for innerHTML sinks.
+// Covers what models actually emit: paragraphs, headings, lists, quotes, rules,
+// GFM tables and fenced code (an unclosed fence mid-stream renders as code).
 export function renderMarkdown(text) {
   if (!text) return "";
-  let html = text
+  const lines = String(text)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-  // Extract code blocks before other processing
-  const codeBlocks = [];
-  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-    const idx = codeBlocks.length;
-    codeBlocks.push(`<pre><code>${code}</code></pre>`);
-    return `\x00CB${idx}\x00`;
-  });
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-  html = html
-    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-    .replace(/^# (.+)$/gm, '<h1>$1</h1>');
-  // Wrap consecutive <li> runs into <ul> (non-greedy, per group)
-  html = html
-    .replace(/^\* (.+)$/gm, '<li>$1</li>');
-  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
-  html = html
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.+?)\*/g, '<em>$1</em>');
-  html = html.replace(/\n/g, '<br>');
-  // Restore code blocks (after <br> replacement so code stays clean)
-  html = html.replace(/\x00CB(\d+)\x00/g, (_, idx) => codeBlocks[parseInt(idx)]);
-  return html;
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .split("\n");
+
+  const out = [];
+  let para = [];
+  let quote = [];
+  let list = null; // { tag, start, items }
+  const flushPara = () => {
+    if (para.length) out.push(`<p>${para.map(renderInline).join("<br>")}</p>`);
+    para = [];
+  };
+  const flushQuote = () => {
+    if (quote.length) out.push(`<blockquote>${quote.map(renderInline).join("<br>")}</blockquote>`);
+    quote = [];
+  };
+  const flushList = () => {
+    if (!list) return;
+    const start = list.tag === "ol" && list.start !== 1 ? ` start="${list.start}"` : "";
+    out.push(`<${list.tag}${start}>${list.items.map(i => `<li>${renderInline(i)}</li>`).join("")}</${list.tag}>`);
+    list = null;
+  };
+  const flush = () => { flushPara(); flushQuote(); flushList(); };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    const fence = line.match(/^\s*```\s*([\w+#.-]*)\s*$/);
+    if (fence) {
+      flush();
+      const code = [];
+      for (i++; i < lines.length && !/^\s*```\s*$/.test(lines[i]); i++) code.push(lines[i]);
+      out.push(codeBlock(fence[1], code.join("\n")));
+      continue;
+    }
+
+    if (!line.trim()) { flush(); continue; }
+
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      flush();
+      const level = Math.min(heading[1].length, 3);
+      out.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
+      continue;
+    }
+
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); out.push("<hr>"); continue; }
+
+    const q = line.match(/^\s*&gt;\s?(.*)$/);
+    if (q) { flushPara(); flushList(); quote.push(q[1]); continue; }
+    flushQuote();
+
+    if (/^\s*\|/.test(line) && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
+      flush();
+      const head = splitRow(line);
+      const rows = [];
+      for (i += 2; i < lines.length && /^\s*\|/.test(lines[i]); i++) rows.push(splitRow(lines[i]));
+      i--;
+      out.push(`<div class="md-table"><table><thead><tr>${head.map(c => `<th>${renderInline(c)}</th>`).join("")}</tr></thead>`
+        + `<tbody>${rows.map(r => `<tr>${head.map((_, j) => `<td>${renderInline(r[j] || "")}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`);
+      continue;
+    }
+
+    const ul = line.match(/^\s*[-*+]\s+(.+)$/);
+    const ol = line.match(/^\s*(\d+)[.)]\s+(.+)$/);
+    if (ul || ol) {
+      flushPara();
+      const tag = ul ? "ul" : "ol";
+      if (list && list.tag !== tag) flushList();
+      if (!list) list = { tag, start: ol ? parseInt(ol[1], 10) : 1, items: [] };
+      list.items.push(ul ? ul[1] : ol[2]);
+      continue;
+    }
+
+    // Indented continuation of the previous list item.
+    if (list && /^\s+\S/.test(line)) {
+      list.items[list.items.length - 1] += " " + line.trim();
+      continue;
+    }
+
+    flushList();
+    para.push(line);
+  }
+  flush();
+  return out.join("");
+}
+
+function renderInline(s) {
+  const spans = [];
+  s = s.replace(/`([^`]+)`/g, (_, c) => { spans.push(c); return `\x00IC${spans.length - 1}\x00`; });
+  s = s
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*\w])\*(?=\S)([^*]+?)\*(?!\w)/g, "$1<em>$2</em>")
+    .replace(/~~(.+?)~~/g, "<del>$1</del>");
+  return s.replace(/\x00IC(\d+)\x00/g, (_, i) => `<code>${spans[i]}</code>`);
+}
+
+function codeBlock(lang, code) {
+  return `<div class="code-block"><div class="code-head"><span class="code-lang">${lang}</span>`
+    + `<button class="code-copy" type="button">Copy</button></div><pre><code>${code}</code></pre></div>`;
+}
+
+function isTableDivider(line) {
+  return /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
+}
+
+function splitRow(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim());
 }
 
 export function feedTimeAgo(dateStr) {
