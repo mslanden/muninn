@@ -505,7 +505,7 @@ export function renderSettingsTile(tileObj, body) {
   // Suggested model placeholder per provider (shown when the model field is empty).
   const MODEL_PLACEHOLDERS = {
     minimax: "MiniMax-M3",
-    meta: "muse-spark-1.1",
+    meta: "muse-spark-1.3",
     openai: "gpt-4.1-mini",
     anthropic: "claude-sonnet-4-5",
     groq: "llama-3.3-70b-versatile",
@@ -529,7 +529,7 @@ export function renderSettingsTile(tileObj, body) {
     if (prov === "minimax") {
       provHint.textContent = "Your current setup. Anthropic-compatible MiniMax endpoint.";
     } else if (prov === "meta") {
-      provHint.textContent = "muse-spark-1.1 — $1.25/M in, $4.25/M out";
+      provHint.textContent = "muse-spark-1.3 (recommended) — 1M context, $1.25/M in, $4.25/M out";
     } else if (prov === "custom") {
       provHint.textContent = "Local or self-hosted OpenAI-compatible server; API key optional.";
     } else {

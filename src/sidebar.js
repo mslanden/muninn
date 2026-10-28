@@ -477,7 +477,7 @@ function placePopover(anchor, el) {
 
 const MODEL_PRESETS = [
   { provider: "minimax", model: "MiniMax-M3", label: "MiniMax M3" },
-  { provider: "meta", model: "muse-spark-1.1", label: "Muse Spark 1.1" },
+  { provider: "meta", model: "muse-spark-1.3", label: "Muse Spark 1.3" },
   { provider: "openai", model: "gpt-4.1", label: "GPT-4.1" },
   { provider: "openai", model: "gpt-4o", label: "GPT-4o" },
   { provider: "anthropic", model: "claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
