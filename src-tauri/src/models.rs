@@ -255,51 +255,6 @@ pub struct AgentRecord {
 }
 
 #[derive(Serialize)]
-pub struct MemoryProfileRecord {
-    pub user_name: String,
-    pub user_about: String,
-    pub profile_text: String,
-    pub identity: String,
-    pub personality: String,
-    pub goals: String,
-    pub preferences: String,
-    pub current_state: String,
-    pub patterns: String,
-    pub updated_at: String,
-}
-
-#[derive(Serialize)]
-pub struct EntityRecord {
-    pub id: i64,
-    pub kind: String,
-    pub name: String,
-    pub summary: String,
-    pub aliases: Vec<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Serialize)]
-pub struct RelationshipRecord {
-    pub id: i64,
-    pub from_entity_id: i64,
-    pub to_entity_id: i64,
-    pub from_name: String,
-    pub to_name: String,
-    pub label: String,
-    pub created_at: String,
-}
-
-#[derive(Serialize)]
-pub struct EpisodeRecord {
-    pub id: i64,
-    pub description: String,
-    pub timestamp: String,
-    pub entity_names: Vec<String>,
-    pub created_at: String,
-}
-
-#[derive(Serialize)]
 pub struct MediaItemRecord {
     pub name: String,
     pub path: String,
@@ -522,67 +477,9 @@ pub struct SettingsUpdateRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MemoryProfileUpdateRequest {
-    pub user_name: Option<String>,
-    pub user_about: Option<String>,
-    pub profile_text: Option<String>,
-    pub identity: Option<String>,
-    pub personality: Option<String>,
-    pub goals: Option<String>,
-    pub preferences: Option<String>,
-    pub current_state: Option<String>,
-    pub patterns: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EntityUpsertRequest {
-    pub id: Option<i64>,
-    pub kind: String,
-    pub name: String,
-    pub summary: Option<String>,
-    pub aliases: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RelationshipUpsertRequest {
-    pub from_entity_id: i64,
-    pub to_entity_id: i64,
-    pub label: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RelationshipIdRequest {
-    pub id: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SearchMessagesRequest {
     pub query: String,
     pub limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EntityIdRequest {
-    pub id: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EpisodeCreateRequest {
-    pub description: String,
-    pub timestamp: Option<String>,
-    pub entity_names: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EpisodeIdRequest {
-    pub id: i64,
 }
 
 #[derive(Deserialize)]

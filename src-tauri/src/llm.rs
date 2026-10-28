@@ -1,4 +1,3 @@
-use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use tauri::{AppHandle, Emitter};
@@ -132,8 +131,7 @@ fn tool_result_summary(blocks: &[Value]) -> String {
     }
 }
 use crate::tools::{
-    enabled_tool_ids, execute_agent_tool, log_tool, parse_tool_code_block,
-    truncate_chars, WorkspaceScope,
+    enabled_tool_ids, execute_agent_tool, log_tool, parse_tool_code_block, WorkspaceScope,
 };
 
 /// Reply text `run_tool_loop` returns when the user stops generation mid-turn. The goal
@@ -149,160 +147,6 @@ pub(crate) fn check_stop_requested(state: &AppState, session_id: &str) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     stops.remove(session_id)
-}
-
-// --- Embeddings & Semantic Retrieval ---
-
-fn f32_vec_to_blob(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|f| f.to_le_bytes()).collect()
-}
-
-fn blob_to_f32_vec(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-/// Call OpenAI embeddings API to get a vector for the given text.
-pub(crate) async fn embed_text(state: &AppState, text: &str) -> Result<Vec<f32>, String> {
-    let api_key = first_non_empty_setting(state, &["llm/openai_api_key"])
-        .ok()
-        .flatten()
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        .ok_or_else(|| "OpenAI API key required for embeddings".to_string())?;
-
-    let body = json!({
-        "model": "text-embedding-3-small",
-        "input": truncate_chars(text, 8000)
-    });
-
-    let resp = state
-        .http
-        .post("https://api.openai.com/v1/embeddings")
-        .bearer_auth(&api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Embeddings request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Embeddings API error: {}", resp.status()));
-    }
-
-    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let embedding = json
-        .get("data")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.first())
-        .and_then(|d| d.get("embedding"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Invalid embeddings response".to_string())?;
-
-    Ok(embedding
-        .iter()
-        .filter_map(|v| v.as_f64().map(|f| f as f32))
-        .collect())
-}
-
-/// Store an embedding for an entity or episode.
-pub(crate) fn store_embedding(state: &AppState, source_type: &str, source_id: i64, content: &str, embedding: &[f32]) {
-    let blob = f32_vec_to_blob(embedding);
-    let _ = with_db(state, |db| {
-        db.execute(
-            r#"INSERT INTO embeddings (source_type, source_id, content, embedding, updated_at)
-               VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
-               ON CONFLICT(source_type, source_id) DO UPDATE SET
-                 content = excluded.content,
-                 embedding = excluded.embedding,
-                 updated_at = CURRENT_TIMESTAMP"#,
-            params![source_type, source_id, content, blob],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    });
-}
-
-/// Cosine similarity against a query whose magnitude is already known. Lets the
-/// retrieval loop avoid recomputing the (large, fixed) query magnitude once per
-/// candidate entity. Returns 0 on dimension mismatch.
-fn cosine_with_query_mag(query: &[f32], query_mag: f32, b: &[f32]) -> f32 {
-    if query_mag == 0.0 || query.len() != b.len() || b.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0f32;
-    let mut mag_b_sq = 0.0f32;
-    for (x, y) in query.iter().zip(b) {
-        dot += x * y;
-        mag_b_sq += y * y;
-    }
-    let mag_b = mag_b_sq.sqrt();
-    if mag_b == 0.0 { 0.0 } else { dot / (query_mag * mag_b) }
-}
-
-/// Retrieve top-k entity IDs most relevant to the query embedding.
-///
-/// SQLite has no native vector index, so we still scan the `entity` embeddings
-/// (the `UNIQUE(source_type, source_id)` constraint indexes the `source_type`
-/// filter). The hot path is kept tight: the query magnitude is computed once
-/// rather than per row, decoding/scoring happens in a single pass, and we select
-/// the top-k with an O(n) partial sort instead of a full O(n log n) sort.
-pub(crate) fn retrieve_relevant_entity_ids(state: &AppState, query_embedding: &[f32], top_k: usize) -> Vec<(i64, f32)> {
-    if query_embedding.is_empty() || top_k == 0 {
-        return Vec::new();
-    }
-    let query_mag: f32 = query_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if query_mag == 0.0 {
-        return Vec::new();
-    }
-
-    let mut scored: Vec<(i64, f32)> = with_db(state, |db| {
-        let mut stmt = db
-            .prepare("SELECT source_id, embedding FROM embeddings WHERE source_type = 'entity'")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        for row in rows.flatten() {
-            let (id, blob) = row;
-            let emb = blob_to_f32_vec(&blob);
-            out.push((id, cosine_with_query_mag(query_embedding, query_mag, &emb)));
-        }
-        Ok(out)
-    })
-    .unwrap_or_default();
-
-    if scored.len() > top_k {
-        scored.select_nth_unstable_by(top_k - 1, |a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(top_k);
-    }
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored
-}
-
-/// Retrieve relevant entities for a user message. Returns formatted context string.
-pub(crate) async fn retrieve_relevant_memory(state: &AppState, user_message: &str) -> Option<Vec<(i64, f32)>> {
-    // Check if we have any embeddings at all
-    let count: i64 = with_db(state, |db| {
-        db.query_row("SELECT COUNT(*) FROM embeddings WHERE source_type = 'entity'", [], |row| row.get(0))
-            .map_err(|e| e.to_string())
-    })
-    .unwrap_or(0);
-
-    if count == 0 {
-        return None;
-    }
-
-    let query_embedding = embed_text(state, user_message).await.ok()?;
-    let relevant = retrieve_relevant_entity_ids(state, &query_embedding, 15);
-
-    if relevant.is_empty() {
-        None
-    } else {
-        Some(relevant)
-    }
 }
 
 /// Resolved configuration for a one-shot (non-streaming) helper LLM call.
@@ -497,97 +341,6 @@ pub(crate) fn resolve_stt(
             }
         }
     }
-}
-
-/// Compact an entity summary that has grown too long.
-pub(crate) async fn compact_entity_summary(
-    state: &AppState,
-    entity_id: i64,
-    entity_name: &str,
-    current_summary: &str,
-) -> Option<String> {
-    // Only compact if summary is long enough to warrant it
-    if current_summary.len() < 500 {
-        return None;
-    }
-
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state).ok()?;
-
-    let prompt = format!(
-        "This entity has accumulated history over time. Rewrite it as a concise current-state summary (2-4 sentences), \
-        keeping only what's still relevant and important. Preserve key dates for major milestones.\n\n\
-        Entity: {entity_name}\nHistory:\n{current_summary}\n\n\
-        Respond with ONLY the compacted summary text, no explanation."
-    );
-
-    let request_body = if is_anthropic {
-        json!({
-            "model": model,
-            "max_tokens": 512,
-            "stream": false,
-            "system": "You are a concise summarizer. Respond with only the summary text.",
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model,
-            "max_tokens": 512,
-            "stream": false,
-            "messages": [
-                {"role": "system", "content": "You are a concise summarizer. Respond with only the summary text."},
-                {"role": "user", "content": prompt}
-            ]
-        })
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.ok()?
-    } else {
-        state.http.post(&endpoint)
-            .bearer_auth(&api_key)
-            .json(&request_body)
-            .send().await.ok()?
-    };
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let body: Value = resp.json().await.ok()?;
-    let text = if is_anthropic {
-        body.get("content")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text"))
-            .and_then(Value::as_str)?
-            .to_string()
-    } else {
-        body.get("choices")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)?
-            .to_string()
-    };
-
-    // Update the entity in DB
-    let compacted = text.trim().to_string();
-    let eid = entity_id;
-    let _ = with_db(state, |db| {
-        db.execute(
-            "UPDATE entities SET summary = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-            params![compacted, eid],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    });
-
-    Some(compacted)
 }
 
 /// Evaluate a chained task's natural-language gate condition against the upstream task's
@@ -1933,54 +1686,14 @@ pub(crate) async fn generate_compilation_specs(
     Err(format!("Could not get a usable compilation from the model: {last_err}"))
 }
 
-/// Backfill embeddings for entities that don't have one yet.
-/// Called once on startup to handle entities created before embeddings were added.
-pub(crate) async fn backfill_embeddings(state: &AppState) {
-    let unembedded: Vec<(i64, String, String)> = with_db(state, |db| {
-        let mut stmt = db
-            .prepare(
-                "SELECT e.id, e.name, e.summary FROM entities e \
-                 WHERE e.id NOT IN (SELECT source_id FROM embeddings WHERE source_type = 'entity')"
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        for row in rows {
-            if let Ok(r) = row { out.push(r); }
-        }
-        Ok(out)
-    })
-    .unwrap_or_default();
-
-    if unembedded.is_empty() {
-        return;
-    }
-
-    eprintln!("[Memory] Backfilling embeddings for {} entities", unembedded.len());
-    for (id, name, summary) in &unembedded {
-        let content = format!("{}: {}", name, summary);
-        match embed_text(state, &content).await {
-            Ok(emb) => store_embedding(state, "entity", *id, &content, &emb),
-            Err(e) => {
-                eprintln!("[Memory] Backfill embed failed for '{}': {}", name, e);
-                break; // Stop on first error (likely API key issue)
-            }
-        }
-    }
-}
-
-/// Build system prompt. If `relevant_entity_ids` is Some, only include those entities.
-/// If None, falls back to loading all entities (legacy behavior for agents, etc.).
+/// Build the general (non-project) system prompt, including the memory index.
 /// Used by the custom-agent path, which is always user-invoked → interactive = true.
 pub(crate) fn build_system_prompt(state: &AppState) -> String {
-    build_system_prompt_with_context(state, None, true)
+    build_system_prompt_with_context(state, true)
 }
 
 pub(crate) fn build_system_prompt_with_context(
     state: &AppState,
-    relevant_entity_ids: Option<&[(i64, f32)]>,
     interactive: bool,
 ) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -2197,136 +1910,9 @@ buttons; otherwise it's free-text.",
         );
     }
 
-    // User profile context
-    let profile_ctx = with_db(state, |db| {
-        db.query_row(
-            "SELECT user_name, user_about, profile_text FROM memory_profile WHERE id = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|e| e.to_string())
-    })
-    .ok()
-    .flatten();
-
-    if let Some((name, about, text)) = &profile_ctx {
-        let has_content = !name.is_empty() || !about.is_empty() || !text.is_empty();
-        if has_content {
-            prompt.push_str("\n## User Profile");
-            if !name.is_empty() {
-                prompt.push_str(&format!("\nName: {}", name));
-            }
-            if !about.is_empty() {
-                prompt.push_str(&format!("\nAbout: {}", about));
-            }
-            if !text.is_empty() {
-                prompt.push_str(&format!("\n{}", text));
-            }
-        }
-    }
-
-    // Known entities from memory — filtered by relevance if embeddings available
-    let entities_ctx: Vec<(String, String, String, String)> = if let Some(relevant) = relevant_entity_ids {
-        // Load only the relevant entities by ID
-        let ids: Vec<i64> = relevant.iter().map(|(id, _)| *id).collect();
-        with_db(state, |db| {
-            let mut out = Vec::new();
-            for id in &ids {
-                if let Ok(row) = db.query_row(
-                    "SELECT kind, name, summary, aliases_json FROM entities WHERE id = ?1",
-                    params![id],
-                    |row| Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    )),
-                ) {
-                    out.push(row);
-                }
-            }
-            Ok(out)
-        })
-        .unwrap_or_default()
-    } else {
-        // Fallback: load all entities (for agents or when no embeddings exist)
-        with_db(state, |db| {
-            let mut stmt = db
-                .prepare("SELECT kind, name, summary, aliases_json FROM entities")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })
-                .map_err(|e| e.to_string())?;
-            let mut out = Vec::new();
-            for row in rows {
-                if let Ok(r) = row {
-                    out.push(r);
-                }
-            }
-            Ok(out)
-        })
-        .unwrap_or_default()
-    };
-
-    if !entities_ctx.is_empty() {
-        prompt.push_str("\n\n## Known People, Places & Things");
-        for (kind, name, summary, aliases_json) in &entities_ctx {
-            let aliases: Vec<String> = serde_json::from_str(aliases_json).unwrap_or_default();
-            let alias_str = if aliases.is_empty() {
-                String::new()
-            } else {
-                format!(" [aka {}]", aliases.join(", "))
-            };
-            if summary.is_empty() {
-                prompt.push_str(&format!("\n- {} ({}){}", name, kind, alias_str));
-            } else {
-                prompt.push_str(&format!("\n- {} ({}){}: {}", name, kind, alias_str, summary));
-            }
-        }
-    }
-
-    // Add structured profile fields
-    let profile_extra: Option<(String, String, String, String, String, String)> = with_db(state, |db| {
-        db.query_row(
-            "SELECT identity, personality, goals, preferences, current_state, patterns FROM memory_profile WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-        )
-        .optional()
-        .map_err(|e| e.to_string())
-    })
-    .ok()
-    .flatten();
-
-    if let Some((identity, personality, goals, preferences, current_state, patterns)) = &profile_extra {
-        let fields = [
-            ("Identity", identity), ("Personality", personality),
-            ("Goals", goals), ("Preferences", preferences),
-            ("Current focus", current_state), ("Patterns", patterns),
-        ];
-        let has_extra = fields.iter().any(|(_, v)| !v.is_empty());
-        if has_extra {
-            for (label, value) in &fields {
-                if !value.is_empty() {
-                    prompt.push_str(&format!("\n{}: {}", label, value));
-                }
-            }
-        }
-    }
+    // Long-term memory: the user's own profile settings, the pinned about-me note,
+    // and a capped index of the model-managed notes (see memory.rs).
+    prompt.push_str(&crate::memory::prompt_section(state, enabled.contains("memory")));
 
     // Registered projects summaries
     let projects: Vec<(String, String, String)> = with_db(state, |db| {
@@ -2499,6 +2085,8 @@ permission for every step or to avoid easy judgment calls. One pending \
 question per session; call blocks until answered, 10-minute timeout.",
         );
     }
+
+    prompt.push_str(&crate::memory::prompt_section(state, enabled.contains("memory")));
 
     if !agents_md.is_empty() {
         prompt.push_str(&format!("\n\n## Project Description (AGENTS.md)\n{}", agents_md));
@@ -3259,6 +2847,25 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
             }),
         ));
     }
+    if enabled.contains("memory") {
+        defs.push((
+            "memory",
+            "Long-term memory that persists across chats: a set of short markdown notes, each with a name and a one-line description. The system prompt lists them; use this tool to read details, save what you learn, and keep notes accurate. Actions: `list`; `read` (name); `write` (name, content, description — creates or replaces the whole note; description is kept if omitted on an update); `edit` (name, old_text, new_text — replace one exact occurrence); `delete` (name); `search` (query — case-insensitive text search across all notes). Facts about the user themselves go in the note named `about-me`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "read", "write", "edit", "delete", "search"]},
+                    "name": {"type": "string", "description": "Note name, e.g. 'about-me' or 'project-krinon'. Lowercase letters, digits, '-' and '_'."},
+                    "description": {"type": "string", "description": "One specific line saying what the note holds (write only)."},
+                    "content": {"type": "string", "description": "Full markdown body of the note (write only)."},
+                    "old_text": {"type": "string", "description": "Exact text to replace (edit only)."},
+                    "new_text": {"type": "string", "description": "Replacement text (edit only)."},
+                    "query": {"type": "string", "description": "Text to look for (search only)."}
+                },
+                "required": ["action"]
+            }),
+        ));
+    }
     if interactive && enabled.contains("ask_user") {
         defs.push((
             "ask_user",
@@ -3713,19 +3320,16 @@ impl Provider {
 }
 
 /// System prompt for a regular chat turn: the project prompt when scoped, otherwise
-/// the memory-augmented prompt built from the latest user message.
-async fn resolve_chat_system_prompt(
+/// the general prompt. Both carry the memory index.
+fn resolve_chat_system_prompt(
     state: &AppState,
-    history: &[HistoryMessage],
     scope: Option<&WorkspaceScope>,
     interactive: bool,
 ) -> String {
     if let Some(s) = scope {
         build_project_system_prompt(state, &s.root.display().to_string(), interactive)
     } else {
-        let user_msg = history.last().map(|h| h.plain_text()).unwrap_or_default();
-        let relevant = retrieve_relevant_memory(state, &user_msg).await;
-        build_system_prompt_with_context(state, relevant.as_deref(), interactive)
+        build_system_prompt_with_context(state, interactive)
     }
 }
 
@@ -4136,7 +3740,7 @@ pub(crate) async fn chat_with_openai(
 ) -> Result<(String, Vec<Value>), String> {
     let (provider, model) = provider_or_fallback(state, Provider::openai(state), model)?;
     let enabled_tools = enabled_tool_ids(state)?;
-    let system_prompt = resolve_chat_system_prompt(state, history, scope, interactive).await;
+    let system_prompt = resolve_chat_system_prompt(state, scope, interactive);
     run_tool_loop(
         app, state, session_id, &provider, &model, &system_prompt,
         history, &enabled_tools, scope, interactive, None,
@@ -4156,7 +3760,7 @@ pub(crate) async fn chat_with_minimax_anthropic(
     let (provider, model) =
         provider_or_fallback(state, Provider::minimax_anthropic(state), model)?;
     let enabled_tools = enabled_tool_ids(state)?;
-    let system_prompt = resolve_chat_system_prompt(state, history, scope, interactive).await;
+    let system_prompt = resolve_chat_system_prompt(state, scope, interactive);
     run_tool_loop(
         app, state, session_id, &provider, &model, &system_prompt,
         history, &enabled_tools, scope, interactive, None,
@@ -4181,7 +3785,7 @@ pub(crate) async fn chat_dynamic(
     let (provider, model) =
         provider_or_fallback(state, Provider::from_provider_name(state, provider_name), model)?;
     let enabled_tools = enabled_tool_ids(state)?;
-    let system_prompt = resolve_chat_system_prompt(state, history, scope, interactive).await;
+    let system_prompt = resolve_chat_system_prompt(state, scope, interactive);
     run_tool_loop(
         app, state, session_id, &provider, &model, &system_prompt,
         history, &enabled_tools, scope, interactive, None,
@@ -4244,7 +3848,13 @@ pub(crate) async fn run_agent(
             enabled_tool_ids(state)?
         } else {
             let enabled = enabled_tool_ids(state)?;
-            parsed.into_iter().filter(|t| enabled.contains(t)).collect()
+            let mut allowed: HashSet<String> = parsed.into_iter().filter(|t| enabled.contains(t)).collect();
+            // Memory is shared context about the user, not a capability: every agent
+            // gets it (when enabled) so it matches the memory section of its prompt.
+            if enabled.contains("memory") {
+                allowed.insert("memory".to_string());
+            }
+            allowed
         }
     };
 
@@ -4347,635 +3957,9 @@ pub(crate) async fn run_project_init(
     Ok(text)
 }
 
-pub(crate) async fn run_extraction(app: &AppHandle, state: &AppState, user_msg: &str, assistant_msg: &str) {
-    if user_msg.len() + assistant_msg.len() < 50 {
-        return;
-    }
-
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = match resolve_llm_config(state) {
-        Ok(cfg) => cfg,
-        Err(_) => return,
-    };
-
-    let entities: Vec<(i64, String, String, String, String)> = with_db(state, |db| {
-        let mut stmt = db
-            .prepare("SELECT id, kind, name, summary, aliases_json FROM entities")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        for row in rows {
-            if let Ok(r) = row {
-                out.push(r);
-            }
-        }
-        Ok(out)
-    })
-    .unwrap_or_default();
-
-    let profile: Option<(String, String, String, String, String, String, String, String, String)> = with_db(state, |db| {
-        db.query_row(
-            "SELECT user_name, user_about, profile_text, identity, personality, goals, preferences, current_state, patterns FROM memory_profile WHERE id = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|e| e.to_string())
-    })
-    .ok()
-    .flatten();
-
-    let mut existing_context = String::new();
-    if !entities.is_empty() {
-        existing_context.push_str("Known entities:\n");
-        for (_id, kind, name, summary, aliases_json) in &entities {
-            let aliases: Vec<String> = serde_json::from_str(aliases_json).unwrap_or_default();
-            if aliases.is_empty() {
-                existing_context.push_str(&format!("- {} ({}): {}\n", name, kind, summary));
-            } else {
-                existing_context.push_str(&format!("- {} [aka {}] ({}): {}\n", name, aliases.join(", "), kind, summary));
-            }
-        }
-        existing_context.push('\n');
-    }
-
-    if let Some((name, about, text, identity, personality, goals, preferences, current_state, patterns)) = &profile {
-        let fields = [
-            ("Name", name), ("About", about), ("Identity", identity),
-            ("Personality", personality), ("Goals", goals), ("Preferences", preferences),
-            ("Current state", current_state), ("Patterns", patterns), ("Notes", text),
-        ];
-        let has_content = fields.iter().any(|(_, v)| !v.is_empty());
-        if has_content {
-            existing_context.push_str("Current user profile:\n");
-            for (label, value) in &fields {
-                if !value.is_empty() {
-                    existing_context.push_str(&format!("{}: {}\n", label, value));
-                }
-            }
-            existing_context.push('\n');
-        }
-    }
-
-    let user_trunc = truncate_chars(user_msg, 2000);
-    let assistant_trunc = truncate_chars(assistant_msg, 2000);
-
-    let today = chrono::Local::now().format("%Y-%m").to_string();
-
-    let extraction_prompt = format!(
-        "Analyze this conversation exchange and extract structured information.\n\n\
-{existing_context}--- EXCHANGE ---\n\
-User: {user_trunc}\n\n\
-Assistant: {assistant_trunc}\n\
---- END EXCHANGE ---\n\n\
-Return a JSON object with these optional fields (omit any that have no updates):\n\
-{{\n\
-  \"profile_updates\": {{\n\
-    \"identity\": {{ \"value\": \"who the user is\", \"mode\": \"append|replace\" }},\n\
-    \"personality\": {{ \"value\": \"...\", \"mode\": \"append|replace\" }},\n\
-    \"goals\": {{ \"value\": \"...\", \"mode\": \"append|replace\" }},\n\
-    \"preferences\": {{ \"value\": \"...\", \"mode\": \"append|replace\" }},\n\
-    \"current_state\": {{ \"value\": \"...\", \"mode\": \"append|replace\" }},\n\
-    \"patterns\": {{ \"value\": \"...\", \"mode\": \"append|replace\" }}\n\
-  }},\n\
-  \"entities\": [\n\
-    {{\n\
-      \"name\": \"entity name\",\n\
-      \"type\": \"person|place|project|organization|concept|thing\",\n\
-      \"summary\": \"what changed or new info (will be appended to history)\",\n\
-      \"aliases\": [\"nickname\", \"abbreviation\"]\n\
-    }}\n\
-  ],\n\
-  \"merge_entities\": [\n\
-    {{ \"old_name\": \"duplicate entity name\", \"into\": \"canonical entity name\" }}\n\
-  ],\n\
-  \"delete_entities\": [\"entity name to remove if no longer relevant\"],\n\
-  \"relationships\": [\n\
-    {{\n\
-      \"from\": \"entity name\",\n\
-      \"to\": \"entity name\",\n\
-      \"label\": \"relationship type (e.g. works_at, uses, part_of)\"\n\
-    }}\n\
-  ],\n\
-  \"episode\": {{\n\
-    \"description\": \"what was discussed\",\n\
-    \"entity_names\": [\"entities involved\"]\n\
-  }}\n\
-}}\n\n\
-Rules:\n\
-- Only extract genuinely meaningful information, not small talk\n\
-- For existing entities, use their exact name from the known entities list\n\
-- Entity summaries are APPENDED as dated history — write what's NEW or CHANGED, not the full summary\n\
-- Use merge_entities when you notice two entities that refer to the same thing (e.g. \"JS\" and \"JavaScript\")\n\
-- Use delete_entities only for entities that are clearly wrong, trivial, or no longer relevant\n\
-- Profile update mode: use \"replace\" when the new value supersedes the old (e.g. new job, new focus), use \"append\" when adding additional info\n\
-- Omit profile fields that haven't changed\n\
-- If nothing meaningful to extract, return {{}}\n\
-- Respond with ONLY valid JSON, no markdown fences, no explanation"
-    );
-
-    let request_body = if is_anthropic {
-        json!({
-            "model": model,
-            "max_tokens": 1024,
-            "stream": false,
-            "system": "You are an entity extraction system. Always respond with valid JSON only. No markdown.",
-            "messages": [{"role": "user", "content": extraction_prompt}]
-        })
-    } else {
-        json!({
-            "model": model,
-            "max_tokens": 1024,
-            "temperature": 0.1,
-            "stream": false,
-            "messages": [
-                {"role": "system", "content": "You are an entity extraction system. Always respond with valid JSON only. No markdown."},
-                {"role": "user", "content": extraction_prompt}
-            ]
-        })
-    };
-
-    let response = if is_anthropic {
-        state
-            .http
-            .post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send()
-            .await
-    } else {
-        state
-            .http
-            .post(&endpoint)
-            .bearer_auth(&api_key)
-            .json(&request_body)
-            .send()
-            .await
-    };
-
-    let response = match response {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[Memory] Extraction request failed: {}", e);
-            return;
-        }
-    };
-
-    if !response.status().is_success() {
-        eprintln!("[Memory] Extraction API error: {}", response.status());
-        return;
-    }
-
-    let body: Value = match response.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[Memory] Failed to parse extraction response: {}", e);
-            return;
-        }
-    };
-
-    let content = if is_anthropic {
-        body.get("content")
-            .and_then(Value::as_array)
-            .and_then(|arr| {
-                arr.iter()
-                    .find(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                    .and_then(|b| b.get("text"))
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("")
-            .to_string()
-    } else {
-        body.get("choices")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-
-    if content.is_empty() {
-        return;
-    }
-
-    let mut cleaned = content.trim().to_string();
-    if let Some(pos) = cleaned.find("</think>") {
-        cleaned = cleaned[pos + 8..].trim().to_string();
-    } else if cleaned.starts_with("<think>") {
-        if let Some(pos) = cleaned.find('{') {
-            cleaned = cleaned[pos..].to_string();
-        }
-    }
-    if cleaned.starts_with("```") {
-        if let Some(nl) = cleaned.find('\n') {
-            if let Some(last_fence) = cleaned.rfind("```") {
-                if last_fence > nl {
-                    cleaned = cleaned[nl + 1..last_fence].trim().to_string();
-                }
-            }
-        }
-    }
-
-    let parsed: Value = match serde_json::from_str(&cleaned) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    if !parsed.is_object() || parsed.as_object().map_or(true, |o| o.is_empty()) {
-        return;
-    }
-
-    // Apply profile updates (structured fields with append/replace mode)
-    if let Some(profile_obj) = parsed.get("profile_updates") {
-        // Support legacy string format
-        if let Some(profile_str) = profile_obj.as_str() {
-            if !profile_str.trim().is_empty() {
-                let _ = with_db(state, |db| {
-                    let existing: String = db
-                        .query_row("SELECT profile_text FROM memory_profile WHERE id = 1", [], |row| row.get(0))
-                        .unwrap_or_default();
-                    let new_text = if existing.is_empty() { profile_str.to_string() } else { format!("{}\n{}", existing, profile_str) };
-                    db.execute("UPDATE memory_profile SET profile_text = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = 1", params![new_text])
-                        .map_err(|e| e.to_string())?;
-                    Ok(())
-                });
-            }
-        } else if let Some(obj) = profile_obj.as_object() {
-            let fields = ["identity", "personality", "goals", "preferences", "current_state", "patterns"];
-            for field_name in &fields {
-                if let Some(field_val) = obj.get(*field_name) {
-                    // Support both plain string (legacy) and {value, mode} object
-                    let (val, mode) = if let Some(s) = field_val.as_str() {
-                        (s.to_string(), "append".to_string())
-                    } else if let Some(o) = field_val.as_object() {
-                        let v = o.get("value").and_then(Value::as_str).unwrap_or("").to_string();
-                        let m = o.get("mode").and_then(Value::as_str).unwrap_or("append").to_string();
-                        (v, m)
-                    } else {
-                        continue;
-                    };
-
-                    if val.trim().is_empty() {
-                        continue;
-                    }
-
-                    let _ = with_db(state, |db| {
-                        let new_val = if mode == "replace" {
-                            val.clone()
-                        } else {
-                            let existing: String = db
-                                .query_row(
-                                    &format!("SELECT {} FROM memory_profile WHERE id = 1", field_name),
-                                    [],
-                                    |row| row.get(0),
-                                )
-                                .unwrap_or_default();
-                            if existing.is_empty() {
-                                val.clone()
-                            } else {
-                                format!("{}\n{}", existing, val)
-                            }
-                        };
-                        db.execute(
-                            &format!("UPDATE memory_profile SET {} = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = 1", field_name),
-                            params![new_val],
-                        )
-                        .map_err(|e| e.to_string())?;
-                        Ok(())
-                    });
-                }
-            }
-        }
-    }
-
-    // Apply entities with aliases
-    if let Some(ents) = parsed.get("entities").and_then(Value::as_array) {
-        for ent in ents {
-            let name = ent.get("name").and_then(Value::as_str).unwrap_or("").trim();
-            if name.is_empty() {
-                continue;
-            }
-            let kind = ent.get("type").and_then(Value::as_str).unwrap_or("concept");
-            let summary = ent.get("summary").and_then(Value::as_str).unwrap_or("");
-            let new_aliases: Vec<String> = ent
-                .get("aliases")
-                .and_then(Value::as_array)
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                .unwrap_or_default();
-
-            let _ = with_db(state, |db| {
-                // Try to find by name or alias
-                let existing: Option<(i64, String)> = db
-                    .query_row(
-                        "SELECT id, aliases_json FROM entities WHERE name = ?1 COLLATE NOCASE",
-                        params![name],
-                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                    )
-                    .optional()
-                    .map_err(|e| e.to_string())?;
-
-                // If not found by name, search aliases
-                let existing = if existing.is_some() {
-                    existing
-                } else {
-                    let mut stmt = db.prepare("SELECT id, aliases_json FROM entities").map_err(|e| e.to_string())?;
-                    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
-                    let mut found = None;
-                    let name_lower = name.to_lowercase();
-                    for row in rows {
-                        if let Ok((id, aj)) = row {
-                            let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
-                            if aliases.iter().any(|a| a.to_lowercase() == name_lower) {
-                                found = Some((id, aj));
-                                break;
-                            }
-                        }
-                    }
-                    found
-                };
-
-                if let Some((id, existing_aliases_json)) = existing {
-                    // Merge aliases
-                    let mut existing_aliases: Vec<String> = serde_json::from_str(&existing_aliases_json).unwrap_or_default();
-                    for alias in &new_aliases {
-                        let lower = alias.to_lowercase();
-                        if !existing_aliases.iter().any(|a| a.to_lowercase() == lower) {
-                            existing_aliases.push(alias.clone());
-                        }
-                    }
-                    let merged_json = serde_json::to_string(&existing_aliases).unwrap_or_else(|_| "[]".to_string());
-                    if !summary.is_empty() {
-                        // Append summary with date prefix to build entity history
-                        let existing_summary: String = db
-                            .query_row("SELECT summary FROM entities WHERE id = ?1", params![id], |row| row.get(0))
-                            .unwrap_or_default();
-                        let dated_entry = format!("{}: {}", today, summary);
-                        let new_summary = if existing_summary.is_empty() {
-                            dated_entry
-                        } else {
-                            format!("{}\n{}", existing_summary, dated_entry)
-                        };
-                        db.execute(
-                            "UPDATE entities SET summary = ?1, aliases_json = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
-                            params![new_summary, merged_json, id],
-                        ).map_err(|e| e.to_string())?;
-                    } else {
-                        db.execute(
-                            "UPDATE entities SET aliases_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-                            params![merged_json, id],
-                        ).map_err(|e| e.to_string())?;
-                    }
-                } else {
-                    let aliases_json = serde_json::to_string(&new_aliases).unwrap_or_else(|_| "[]".to_string());
-                    db.execute(
-                        "INSERT INTO entities (kind, name, summary, aliases_json) VALUES (?1, ?2, ?3, ?4)",
-                        params![kind, name, summary, aliases_json],
-                    ).map_err(|e| e.to_string())?;
-                }
-                Ok(())
-            });
-        }
-    }
-
-    // Apply relationships
-    if let Some(rels) = parsed.get("relationships").and_then(Value::as_array) {
-        for rel in rels {
-            let from_name = rel.get("from").and_then(Value::as_str).unwrap_or("").trim();
-            let to_name = rel.get("to").and_then(Value::as_str).unwrap_or("").trim();
-            let label = rel.get("label").and_then(Value::as_str).unwrap_or("").trim();
-            if from_name.is_empty() || to_name.is_empty() || label.is_empty() {
-                continue;
-            }
-            let _ = with_db(state, |db| {
-                let from_id: Option<i64> = db
-                    .query_row("SELECT id FROM entities WHERE name = ?1 COLLATE NOCASE", params![from_name], |row| row.get(0))
-                    .optional().map_err(|e| e.to_string())?;
-                let to_id: Option<i64> = db
-                    .query_row("SELECT id FROM entities WHERE name = ?1 COLLATE NOCASE", params![to_name], |row| row.get(0))
-                    .optional().map_err(|e| e.to_string())?;
-                if let (Some(fid), Some(tid)) = (from_id, to_id) {
-                    let _ = db.execute(
-                        "INSERT OR IGNORE INTO relationships (from_entity_id, to_entity_id, label) VALUES (?1, ?2, ?3)",
-                        params![fid, tid, label],
-                    );
-                }
-                Ok(())
-            });
-        }
-    }
-
-    // Apply merge_entities: merge duplicates into canonical entity
-    if let Some(merges) = parsed.get("merge_entities").and_then(Value::as_array) {
-        for merge in merges {
-            let old_name = merge.get("old_name").and_then(Value::as_str).unwrap_or("").trim();
-            let into_name = merge.get("into").and_then(Value::as_str).unwrap_or("").trim();
-            if old_name.is_empty() || into_name.is_empty() || old_name.eq_ignore_ascii_case(into_name) {
-                continue;
-            }
-            let _ = with_db(state, |db| {
-                let old: Option<(i64, String, String)> = db
-                    .query_row(
-                        "SELECT id, summary, aliases_json FROM entities WHERE name = ?1 COLLATE NOCASE",
-                        params![old_name],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .optional().map_err(|e| e.to_string())?;
-                let target: Option<(i64, String, String)> = db
-                    .query_row(
-                        "SELECT id, summary, aliases_json FROM entities WHERE name = ?1 COLLATE NOCASE",
-                        params![into_name],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .optional().map_err(|e| e.to_string())?;
-
-                if let (Some((old_id, old_summary, old_aliases_json)), Some((target_id, target_summary, target_aliases_json))) = (old, target) {
-                    // Merge summaries
-                    let merged_summary = if old_summary.is_empty() {
-                        target_summary
-                    } else if target_summary.is_empty() {
-                        old_summary
-                    } else {
-                        format!("{}\n{}", target_summary, old_summary)
-                    };
-
-                    // Merge aliases (add old name as alias)
-                    let mut target_aliases: Vec<String> = serde_json::from_str(&target_aliases_json).unwrap_or_default();
-                    let old_aliases: Vec<String> = serde_json::from_str(&old_aliases_json).unwrap_or_default();
-                    // Add old entity name as alias
-                    let old_lower = old_name.to_lowercase();
-                    if !target_aliases.iter().any(|a| a.to_lowercase() == old_lower) {
-                        target_aliases.push(old_name.to_string());
-                    }
-                    for alias in old_aliases {
-                        let lower = alias.to_lowercase();
-                        if !target_aliases.iter().any(|a| a.to_lowercase() == lower) {
-                            target_aliases.push(alias);
-                        }
-                    }
-                    let merged_aliases_json = serde_json::to_string(&target_aliases).unwrap_or_else(|_| "[]".to_string());
-
-                    // Update target entity
-                    let _ = db.execute(
-                        "UPDATE entities SET summary = ?1, aliases_json = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
-                        params![merged_summary, merged_aliases_json, target_id],
-                    );
-
-                    // Reassign relationships from old to target
-                    let _ = db.execute("UPDATE OR IGNORE relationships SET from_entity_id = ?1 WHERE from_entity_id = ?2", params![target_id, old_id]);
-                    let _ = db.execute("UPDATE OR IGNORE relationships SET to_entity_id = ?1 WHERE to_entity_id = ?2", params![target_id, old_id]);
-                    let _ = db.execute("UPDATE OR IGNORE episode_entities SET entity_id = ?1 WHERE entity_id = ?2", params![target_id, old_id]);
-
-                    // Delete old entity and its embedding
-                    let _ = db.execute("DELETE FROM entities WHERE id = ?1", params![old_id]);
-                    let _ = db.execute("DELETE FROM embeddings WHERE source_type = 'entity' AND source_id = ?1", params![old_id]);
-                }
-                Ok(())
-            });
-        }
-    }
-
-    // Apply delete_entities: remove stale/wrong entities
-    if let Some(deletes) = parsed.get("delete_entities").and_then(Value::as_array) {
-        for del in deletes {
-            if let Some(name) = del.as_str() {
-                let name = name.trim();
-                if name.is_empty() { continue; }
-                let _ = with_db(state, |db| {
-                    if let Some(id) = db
-                        .query_row("SELECT id FROM entities WHERE name = ?1 COLLATE NOCASE", params![name], |row| row.get::<_, i64>(0))
-                        .optional().map_err(|e| e.to_string())?
-                    {
-                        let _ = db.execute("DELETE FROM entities WHERE id = ?1", params![id]);
-                        let _ = db.execute("DELETE FROM embeddings WHERE source_type = 'entity' AND source_id = ?1", params![id]);
-                        let _ = db.execute("DELETE FROM relationships WHERE from_entity_id = ?1 OR to_entity_id = ?1", params![id]);
-                        let _ = db.execute("DELETE FROM episode_entities WHERE entity_id = ?1", params![id]);
-                    }
-                    Ok(())
-                });
-            }
-        }
-    }
-
-    // Apply episode with entity linking
-    if let Some(ep) = parsed.get("episode").and_then(Value::as_object) {
-        if let Some(desc) = ep.get("description").and_then(Value::as_str) {
-            if !desc.trim().is_empty() {
-                let _ = with_db(state, |db| {
-                    db.execute(
-                        "INSERT INTO episodes (description, timestamp) VALUES (?1, datetime('now'))",
-                        params![desc],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let episode_id = db.last_insert_rowid();
-
-                    // Link entities by name
-                    if let Some(names) = ep.get("entity_names").and_then(Value::as_array) {
-                        for name_val in names {
-                            if let Some(name) = name_val.as_str() {
-                                let entity_id: Option<i64> = db
-                                    .query_row("SELECT id FROM entities WHERE name = ?1 COLLATE NOCASE", params![name.trim()], |row| row.get(0))
-                                    .optional().map_err(|e| e.to_string())?;
-                                if let Some(eid) = entity_id {
-                                    let _ = db.execute("INSERT OR IGNORE INTO episode_entities (episode_id, entity_id) VALUES (?1, ?2)", params![episode_id, eid]);
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                });
-
-                // Embed the episode
-                let episode_id: Option<i64> = with_db(state, |db| {
-                    db.query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
-                        .map_err(|e| e.to_string())
-                }).ok();
-                if let Some(eid) = episode_id {
-                    if let Ok(emb) = embed_text(state, desc).await {
-                        store_embedding(state, "episode", eid, desc, &emb);
-                    }
-                }
-            }
-        }
-    }
-
-    // Embed updated/new entities and run compaction if needed
-    let entities_to_embed: Vec<(i64, String, String)> = with_db(state, |db| {
-        let mut stmt = db
-            .prepare(
-                "SELECT e.id, e.name, e.summary FROM entities e \
-                 WHERE e.updated_at >= datetime('now', '-10 seconds')"
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        for row in rows {
-            if let Ok(r) = row { out.push(r); }
-        }
-        Ok(out)
-    })
-    .unwrap_or_default();
-
-    for (entity_id, entity_name, summary) in &entities_to_embed {
-        // Embed the entity
-        let embed_text_content = format!("{}: {}", entity_name, summary);
-        if let Ok(emb) = embed_text(state, &embed_text_content).await {
-            store_embedding(state, "entity", *entity_id, &embed_text_content, &emb);
-        }
-
-        // Compact if summary is too long
-        if summary.len() > 500 {
-            compact_entity_summary(state, *entity_id, entity_name, summary).await;
-            // Re-embed after compaction
-            let compacted: Option<String> = with_db(state, |db| {
-                db.query_row("SELECT summary FROM entities WHERE id = ?1", params![entity_id], |row| row.get(0))
-                    .optional()
-                    .map_err(|e| e.to_string())
-            }).ok().flatten();
-            if let Some(cs) = compacted {
-                let embed_text_content = format!("{}: {}", entity_name, cs);
-                if let Ok(emb) = embed_text(state, &embed_text_content).await {
-                    store_embedding(state, "entity", *entity_id, &embed_text_content, &emb);
-                }
-            }
-        }
-    }
-
-    let _ = app.emit("memory-updated", json!({}));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn mag(v: &[f32]) -> f32 {
-        v.iter().map(|x| x * x).sum::<f32>().sqrt()
-    }
 
     #[test]
     fn condition_verdict_is_affirmative_only_and_fails_closed() {
@@ -5058,42 +4042,4 @@ mod tests {
         assert!(matches!(parse_command_verdict("ALLOW."), CommandVerdict::Allow(_)));
     }
 
-    #[test]
-    fn cosine_identical_vectors_is_one() {
-        let q = [3.0f32, 4.0];
-        let s = cosine_with_query_mag(&q, mag(&q), &[3.0, 4.0]);
-        assert!((s - 1.0).abs() < 1e-6, "got {}", s);
-    }
-
-    #[test]
-    fn cosine_orthogonal_vectors_is_zero() {
-        let q = [1.0f32, 0.0];
-        let s = cosine_with_query_mag(&q, mag(&q), &[0.0, 1.0]);
-        assert!(s.abs() < 1e-6, "got {}", s);
-    }
-
-    #[test]
-    fn cosine_opposite_vectors_is_negative_one() {
-        let q = [1.0f32, 0.0];
-        let s = cosine_with_query_mag(&q, mag(&q), &[-1.0, 0.0]);
-        assert!((s + 1.0).abs() < 1e-6, "got {}", s);
-    }
-
-    #[test]
-    fn cosine_handles_degenerate_inputs() {
-        let q = [1.0f32, 2.0];
-        // Dimension mismatch → 0.
-        assert_eq!(cosine_with_query_mag(&q, mag(&q), &[1.0, 2.0, 3.0]), 0.0);
-        // Empty candidate → 0.
-        assert_eq!(cosine_with_query_mag(&q, mag(&q), &[]), 0.0);
-        // Zero query magnitude → 0.
-        assert_eq!(cosine_with_query_mag(&[0.0, 0.0], 0.0, &[1.0, 1.0]), 0.0);
-    }
-
-    #[test]
-    fn blob_roundtrip_preserves_vector() {
-        let v = vec![0.5f32, -1.25, 3.0, 0.0];
-        let restored = blob_to_f32_vec(&f32_vec_to_blob(&v));
-        assert_eq!(v, restored);
-    }
 }

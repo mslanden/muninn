@@ -712,6 +712,12 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             "checklist",
         ),
         (
+            "memory",
+            "Memory",
+            "Read and write long-term memory notes that persist across chats.",
+            "brain",
+        ),
+        (
             "ask_user",
             "Ask User",
             "Pause mid-turn and ask the user a clarifying question (interactive sessions only).",

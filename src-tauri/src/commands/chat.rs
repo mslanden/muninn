@@ -282,17 +282,6 @@ pub(crate) async fn chat_core(app: &AppHandle, state: &AppState, req: ChatReques
         }
     }
 
-    // Only run extraction for main chat (no project)
-    if session_project_path.is_empty() {
-        let extraction_app = app.clone();
-        let extraction_user_msg = req.message.clone();
-        let extraction_reply = reply.clone();
-        tauri::async_runtime::spawn(async move {
-            let state = extraction_app.state::<AppState>();
-            run_extraction(&extraction_app, &state, &extraction_user_msg, &extraction_reply).await;
-        });
-    }
-
     // Auto-title: if the session has no title yet, name it from this exchange in the
     // background (best-effort; never blocks the turn). The guarded UPDATE means a manual
     // rename that lands in the meantime always wins.

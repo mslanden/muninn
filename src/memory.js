@@ -1,83 +1,42 @@
 import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
-import { escapeHtml, field } from "./utils.js";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { escapeHtml, field, formatModifiedAt } from "./utils.js";
 import { emptyState } from "./uikit.js";
+import { icon } from "./icons.js";
+
+// The note that is always in the model's context (memory.rs PINNED_NOTE).
+const PINNED = "about-me";
 
 // ========== MEMORY TILE ==========
+// Notes: the model-managed memory folder (one markdown note per topic), browsable
+// and hand-editable. History: past conversations.
 export function renderMemoryTile(tileObj, body) {
   body.innerHTML = `
     <div class="memory-tabs">
-      <button class="memory-tab active" data-mtab="profile">Profile</button>
-      <button class="memory-tab" data-mtab="entities">Entities</button>
-      <button class="memory-tab" data-mtab="timeline">Timeline</button>
+      <button class="memory-tab active" data-mtab="notes">Notes</button>
       <button class="memory-tab" data-mtab="history">History</button>
     </div>
-    <div data-memory-view="profile" class="profile-section">
-      <div class="profile-field">
-        <div class="profile-label">Name</div>
-        <input type="text" data-mem-name="${tileObj.id}" />
-      </div>
-      <div class="profile-field">
-        <div class="profile-label">About</div>
-        <textarea rows="2" data-mem-about="${tileObj.id}"></textarea>
-      </div>
-      <div class="profile-field">
-        <div class="profile-label">Identity</div>
-        <textarea rows="2" data-mem-identity="${tileObj.id}" placeholder="Role, job, background"></textarea>
-      </div>
-      <div class="profile-field">
-        <div class="profile-label">Personality</div>
-        <textarea rows="2" data-mem-personality="${tileObj.id}" placeholder="Communication style, temperament"></textarea>
-      </div>
-      <div class="profile-field">
-        <div class="profile-label">Goals</div>
-        <textarea rows="2" data-mem-goals="${tileObj.id}" placeholder="What you're working toward"></textarea>
-      </div>
-      <div class="profile-field">
-        <div class="profile-label">Preferences</div>
-        <textarea rows="2" data-mem-preferences="${tileObj.id}" placeholder="Likes, dislikes, tool preferences"></textarea>
-      </div>
-      <div class="profile-field">
-        <div class="profile-label">Current focus</div>
-        <textarea rows="2" data-mem-currentstate="${tileObj.id}" placeholder="What you're currently doing"></textarea>
-      </div>
-      <div class="profile-field">
-        <div class="profile-label">Patterns</div>
-        <textarea rows="2" data-mem-patterns="${tileObj.id}" placeholder="Recurring behaviors or habits"></textarea>
-      </div>
-      <div class="profile-field">
-        <div class="profile-label">Notes</div>
-        <textarea rows="3" data-mem-profile="${tileObj.id}" placeholder="Additional notes"></textarea>
-      </div>
-      <button class="form-btn" data-mem-save="${tileObj.id}">Save Profile</button>
-    </div>
-    <div data-memory-view="entities" class="hidden p-2">
-      <div style="padding:6px 6px 0;">
-        <div class="form-row mb-2">
-          <input type="text" placeholder="Kind" data-ent-kind="${tileObj.id}" style="width:100px;" />
-          <input type="text" placeholder="Name" data-ent-name="${tileObj.id}" />
+    <div data-memory-view="notes" class="memory-notes">
+      <div class="memory-notes-side">
+        <div class="memory-notes-toolbar">
+          <input type="text" placeholder="Filter notes…" data-mem-filter="${tileObj.id}" />
+          <button class="tile-btn" data-mem-new="${tileObj.id}" title="New note" aria-label="New note">${icon("plus", 14)}</button>
+          <button class="tile-btn" data-mem-folder="${tileObj.id}" title="Open memory folder in Finder" aria-label="Open memory folder">${icon("folder", 14)}</button>
         </div>
-        <input class="mb-2" type="text" placeholder="Aliases (comma-separated)" data-ent-aliases="${tileObj.id}" />
-        <textarea class="mb-2" rows="2" placeholder="Summary" data-ent-summary="${tileObj.id}"></textarea>
-        <div class="form-row mb-2">
-          <button class="form-btn" data-ent-save="${tileObj.id}">Save Entity</button>
-          <button class="form-btn" data-ent-reset="${tileObj.id}">Reset</button>
+        <div class="memory-note-list" data-mem-list="${tileObj.id}"></div>
+      </div>
+      <div class="memory-editor" data-mem-editor="${tileObj.id}">
+        <input type="text" class="memory-editor-name" placeholder="note-name" data-mem-name="${tileObj.id}" spellcheck="false" />
+        <input type="text" class="memory-editor-desc" placeholder="One-line description — what this note holds" data-mem-desc="${tileObj.id}" />
+        <textarea class="memory-editor-body" placeholder="Markdown…" data-mem-body="${tileObj.id}"></textarea>
+        <div class="memory-editor-actions">
+          <span class="muted text-xs" data-mem-status="${tileObj.id}"></span>
+          <span class="tile-spacer"></span>
+          <button class="form-btn" data-mem-delete="${tileObj.id}">Delete</button>
+          <button class="form-btn" data-mem-save="${tileObj.id}">Save</button>
         </div>
       </div>
-      <div class="memory-section-label">Relationships</div>
-      <div class="memory-list" data-relationships-list="${tileObj.id}"></div>
-      <div class="memory-section-label">Entities</div>
-      <div class="memory-list" data-entities-list="${tileObj.id}"></div>
-    </div>
-    <div data-memory-view="timeline" class="hidden p-2">
-      <div style="padding:6px 6px 0;">
-        <div class="form-row mb-2">
-          <input type="text" placeholder="Description" data-ep-desc="${tileObj.id}" />
-          <input type="text" placeholder="Timestamp" data-ep-time="${tileObj.id}" style="width:140px;" />
-          <button class="form-btn" data-ep-add="${tileObj.id}">Add</button>
-        </div>
-      </div>
-      <div class="memory-list" data-episodes-list="${tileObj.id}"></div>
     </div>
     <div data-memory-view="history" class="hidden p-2">
       <div style="padding:6px 6px 0;">
@@ -91,236 +50,160 @@ export function renderMemoryTile(tileObj, body) {
     </div>
   `;
 
-  let activeTab = "profile";
-  let editingEntityId = null;
-
   const tabs = body.querySelectorAll(".memory-tab");
   const views = {
-    profile: body.querySelector('[data-memory-view="profile"]'),
-    entities: body.querySelector('[data-memory-view="entities"]'),
-    timeline: body.querySelector('[data-memory-view="timeline"]'),
-    history: body.querySelector('[data-memory-view="history"]')
+    notes: body.querySelector('[data-memory-view="notes"]'),
+    history: body.querySelector('[data-memory-view="history"]'),
   };
-
   tabs.forEach(tab => {
     tab.addEventListener("click", () => {
-      activeTab = tab.dataset.mtab;
-      tabs.forEach(t => t.classList.toggle("active", t.dataset.mtab === activeTab));
-      Object.entries(views).forEach(([k, v]) => v.classList.toggle("hidden", k !== activeTab));
+      const active = tab.dataset.mtab;
+      tabs.forEach(t => t.classList.toggle("active", t.dataset.mtab === active));
+      Object.entries(views).forEach(([k, v]) => v.classList.toggle("hidden", k !== active));
+      if (active === "history") refreshHistory();
     });
   });
 
-  // Profile
-  const memName = body.querySelector(`[data-mem-name="${tileObj.id}"]`);
-  const memAbout = body.querySelector(`[data-mem-about="${tileObj.id}"]`);
-  const memProfile = body.querySelector(`[data-mem-profile="${tileObj.id}"]`);
-  const memIdentity = body.querySelector(`[data-mem-identity="${tileObj.id}"]`);
-  const memPersonality = body.querySelector(`[data-mem-personality="${tileObj.id}"]`);
-  const memGoals = body.querySelector(`[data-mem-goals="${tileObj.id}"]`);
-  const memPreferences = body.querySelector(`[data-mem-preferences="${tileObj.id}"]`);
-  const memCurrentState = body.querySelector(`[data-mem-currentstate="${tileObj.id}"]`);
-  const memPatterns = body.querySelector(`[data-mem-patterns="${tileObj.id}"]`);
+  // ---- Notes ----
+  const q = (attr) => body.querySelector(`[data-${attr}="${tileObj.id}"]`);
+  const filterInput = q("mem-filter");
+  const listEl = q("mem-list");
+  const editorEl = q("mem-editor");
+  const nameInput = q("mem-name");
+  const descInput = q("mem-desc");
+  const bodyInput = q("mem-body");
+  const statusEl = q("mem-status");
+  const deleteBtn = q("mem-delete");
+  const saveBtn = q("mem-save");
 
-  body.querySelector(`[data-mem-save="${tileObj.id}"]`).addEventListener("click", async () => {
-    await invoke("set_memory_profile", {
-      req: {
-        userName: memName.value.trim(),
-        userAbout: memAbout.value.trim(),
-        profileText: memProfile.value.trim(),
-        identity: memIdentity.value.trim(),
-        personality: memPersonality.value.trim(),
-        goals: memGoals.value.trim(),
-        preferences: memPreferences.value.trim(),
-        currentState: memCurrentState.value.trim(),
-        patterns: memPatterns.value.trim(),
+  let notes = [];
+  let current = null; // name of the note open in the editor (null = new/unsaved)
+  let dirty = false;
+
+  const setStatus = (text) => { statusEl.textContent = text; };
+  const markDirty = () => { dirty = true; setStatus("Unsaved changes"); };
+  [nameInput, descInput, bodyInput].forEach(el => el.addEventListener("input", markDirty));
+
+  function openEditor(note) {
+    current = note ? note.name : null;
+    nameInput.value = note ? note.name : "";
+    descInput.value = note ? (note.description || "") : "";
+    bodyInput.value = note ? (note.body || "") : "";
+    dirty = false;
+    deleteBtn.hidden = !current;
+    editorEl.classList.remove("is-empty");
+    setStatus(note && note.updatedAt ? `Updated ${formatModifiedAt(String(note.updatedAt))}` : "");
+    renderList();
+  }
+
+  function showEditorPlaceholder() {
+    current = null;
+    dirty = false;
+    editorEl.classList.add("is-empty");
+    renderList();
+  }
+
+  async function selectNote(name) {
+    if (dirty && !(await ask("Discard unsaved changes to this note?", { title: "Unsaved changes", kind: "warning" }))) return;
+    try {
+      const note = await invoke("memory_read_note", { name });
+      openEditor(note);
+    } catch {
+      // The pinned note may not exist yet — open it blank, ready to write.
+      if (name === PINNED) {
+        openEditor(null);
+        nameInput.value = PINNED;
+        descInput.value = "Facts about the user";
       }
-    });
-    refreshProfile();
-  });
-
-  async function refreshProfile() {
-    let profile;
-    try { profile = await invoke("get_memory_profile"); } catch { return; }
-    memName.value = field(profile, "userName", "user_name") || "";
-    memAbout.value = field(profile, "userAbout", "user_about") || "";
-    memProfile.value = field(profile, "profileText", "profile_text") || "";
-    memIdentity.value = field(profile, "identity", "identity") || "";
-    memPersonality.value = field(profile, "personality", "personality") || "";
-    memGoals.value = field(profile, "goals", "goals") || "";
-    memPreferences.value = field(profile, "preferences", "preferences") || "";
-    memCurrentState.value = field(profile, "currentState", "current_state") || "";
-    memPatterns.value = field(profile, "patterns", "patterns") || "";
-  }
-
-  // Entities
-  const entKind = body.querySelector(`[data-ent-kind="${tileObj.id}"]`);
-  const entName = body.querySelector(`[data-ent-name="${tileObj.id}"]`);
-  const entSummary = body.querySelector(`[data-ent-summary="${tileObj.id}"]`);
-  const entAliases = body.querySelector(`[data-ent-aliases="${tileObj.id}"]`);
-
-  body.querySelector(`[data-ent-save="${tileObj.id}"]`).addEventListener("click", async () => {
-    const kind = entKind.value.trim();
-    const name = entName.value.trim();
-    if (!kind || !name) return;
-    const aliases = entAliases.value.trim() ? entAliases.value.split(",").map(a => a.trim()).filter(Boolean) : [];
-    await invoke("upsert_entity", { req: { id: editingEntityId, kind, name, summary: entSummary.value.trim(), aliases } });
-    editingEntityId = null;
-    entKind.value = "";
-    entName.value = "";
-    entSummary.value = "";
-    entAliases.value = "";
-    refreshEntities();
-    refreshRelationships();
-  });
-
-  body.querySelector(`[data-ent-reset="${tileObj.id}"]`).addEventListener("click", () => {
-    editingEntityId = null;
-    entKind.value = "";
-    entName.value = "";
-    entSummary.value = "";
-    entAliases.value = "";
-  });
-
-  async function refreshEntities() {
-    const list = body.querySelector(`[data-entities-list="${tileObj.id}"]`);
-    let items;
-    try { items = await invoke("get_entities"); } catch { items = []; }
-    list.innerHTML = "";
-
-    if (!items.length) {
-      list.replaceChildren(emptyState({ icon: "database", text: "No entities yet" }));
-      return;
-    }
-
-    for (const item of items) {
-      const id = field(item, "id", "id");
-      const kind = field(item, "kind", "kind");
-      const name = field(item, "name", "name");
-      const summary = field(item, "summary", "summary");
-      const aliases = field(item, "aliases", "aliases") || [];
-
-      const kindMap = { person: "person", place: "place", project: "project", organization: "organization", concept: "concept", tool: "tool", thing: "concept" };
-      const kindClass = kindMap[kind] || "concept";
-
-      const card = document.createElement("div");
-      card.className = "entity-card";
-      card.innerHTML = `
-        <div class="entity-top">
-          <span class="entity-kind ${kindClass}">${escapeHtml(kind)}</span>
-          <span class="entity-name">${escapeHtml(name)}</span>
-          <span class="entity-delete" title="Delete entity">&times;</span>
-        </div>
-        ${aliases.length ? `<div class="entity-aliases">aka ${escapeHtml(aliases.join(", "))}</div>` : ""}
-        <div class="entity-summary">${escapeHtml(summary) || "No summary"}</div>
-      `;
-
-      card.querySelector(".entity-delete").addEventListener("click", async (e) => {
-        e.stopPropagation();
-        await invoke("delete_entity", { req: { id } });
-        refreshEntities();
-        refreshRelationships();
-      });
-
-      card.addEventListener("click", (e) => {
-        if (e.target.classList.contains("entity-delete")) return;
-        editingEntityId = id;
-        entKind.value = kind;
-        entName.value = name;
-        entSummary.value = summary || "";
-        entAliases.value = aliases.join(", ");
-      });
-
-      list.appendChild(card);
     }
   }
 
-  // Relationships
-  async function refreshRelationships() {
-    const list = body.querySelector(`[data-relationships-list="${tileObj.id}"]`);
-    let items;
-    try { items = await invoke("get_relationships"); } catch { items = []; }
-    list.innerHTML = "";
+  function renderList() {
+    const f = filterInput.value.trim().toLowerCase();
+    const matches = (n) => !f || n.name.includes(f) || (n.description || "").toLowerCase().includes(f);
+    const pinned = notes.find(n => n.name === PINNED) || { name: PINNED, description: "Not written yet — facts about you", missing: true };
+    const others = notes.filter(n => n.name !== PINNED && matches(n));
 
-    if (!items.length) {
-      list.replaceChildren(emptyState({ icon: "grid", text: "No relationships yet" }));
-      return;
-    }
+    listEl.innerHTML = "";
+    if (matches(pinned)) listEl.appendChild(noteRow(pinned, true));
+    for (const n of others) listEl.appendChild(noteRow(n, false));
 
-    for (const item of items) {
-      const id = field(item, "id", "id");
-      const fromName = field(item, "fromName", "from_name");
-      const toName = field(item, "toName", "to_name");
-      const label = field(item, "label", "label");
-
-      const el = document.createElement("div");
-      el.className = "relationship-card";
-      el.innerHTML = `
-        <span class="rel-from">${escapeHtml(fromName)}</span>
-        <span class="rel-arrow">&rarr;</span>
-        <span class="rel-label">${escapeHtml(label)}</span>
-        <span class="rel-arrow">&rarr;</span>
-        <span class="rel-to">${escapeHtml(toName)}</span>
-        <span class="entity-delete" title="Delete">&times;</span>
-      `;
-      el.querySelector(".entity-delete").addEventListener("click", async () => {
-        await invoke("delete_relationship", { req: { id } });
-        refreshRelationships();
-      });
-      list.appendChild(el);
+    if (!notes.filter(n => n.name !== PINNED).length && !f) {
+      listEl.appendChild(emptyState({ icon: "brain", iconSize: 20, text: "No memories yet. Muninn saves what's worth remembering as you chat." }));
+    } else if (!others.length && f) {
+      listEl.appendChild(emptyState({ icon: "search", iconSize: 20, text: "No notes match." }));
     }
   }
 
-  // Episodes
-  const epDesc = body.querySelector(`[data-ep-desc="${tileObj.id}"]`);
-  const epTime = body.querySelector(`[data-ep-time="${tileObj.id}"]`);
+  function noteRow(n, isPinned) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `memory-note-item${n.name === current ? " active" : ""}${isPinned ? " pinned" : ""}${n.missing ? " missing" : ""}`;
+    row.innerHTML = `
+      <span class="memory-note-name">${isPinned ? icon("pin", 11) : ""}${escapeHtml(n.name)}</span>
+      <span class="memory-note-desc">${escapeHtml(n.description || "")}</span>
+    `;
+    row.addEventListener("click", () => selectNote(n.name));
+    return row;
+  }
 
-  body.querySelector(`[data-ep-add="${tileObj.id}"]`).addEventListener("click", async () => {
-    const description = epDesc.value.trim();
-    if (!description) return;
-    await invoke("add_episode", { req: { description, timestamp: epTime.value.trim() } });
-    epDesc.value = "";
-    epTime.value = "";
-    refreshEpisodes();
+  async function refreshNotes() {
+    try { notes = await invoke("memory_list_notes"); } catch { notes = []; }
+    renderList();
+  }
+
+  // Called when the model (or another window) changes memory. Leave an in-progress
+  // edit alone; otherwise reload the open note so the editor never shows stale text.
+  tileObj.refreshMemory = async () => {
+    await refreshNotes();
+    if (!current || dirty) return;
+    if (!notes.some(n => n.name === current)) { showEditorPlaceholder(); return; }
+    try { openEditor(await invoke("memory_read_note", { name: current })); } catch {}
+  };
+
+  filterInput.addEventListener("input", renderList);
+
+  q("mem-new").addEventListener("click", async () => {
+    if (dirty && !(await ask("Discard unsaved changes to this note?", { title: "Unsaved changes", kind: "warning" }))) return;
+    openEditor(null);
+    nameInput.focus();
   });
 
-  async function refreshEpisodes() {
-    const list = body.querySelector(`[data-episodes-list="${tileObj.id}"]`);
-    let items;
-    try { items = await invoke("get_episodes"); } catch { items = []; }
-    list.innerHTML = "";
+  q("mem-folder").addEventListener("click", () => { invoke("memory_open_folder").catch(() => {}); });
 
-    if (!items.length) {
-      list.replaceChildren(emptyState({ icon: "list-checks", text: "No timeline events yet" }));
-      return;
-    }
-
-    for (const item of items) {
-      const id = field(item, "id", "id");
-      const description = field(item, "description", "description");
-      const timestamp = field(item, "timestamp", "timestamp");
-      const createdAt = field(item, "createdAt", "created_at");
-      const entityNames = field(item, "entityNames", "entity_names") || [];
-
-      const el = document.createElement("div");
-      el.className = "entity-card";
-      el.innerHTML = `
-        <div class="entity-top">
-          <span class="entity-name">${escapeHtml(description)}</span>
-          <span class="entity-delete" title="Delete">&times;</span>
-        </div>
-        <div class="entity-summary">${escapeHtml(timestamp || createdAt)}</div>
-        ${entityNames.length ? `<div class="episode-entities">${entityNames.map(n => `<span class="episode-entity-tag">${escapeHtml(n)}</span>`).join("")}</div>` : ""}
-      `;
-      el.querySelector(".entity-delete").addEventListener("click", async (e) => {
-        e.stopPropagation();
-        await invoke("delete_episode", { req: { id } });
-        refreshEpisodes();
+  saveBtn.addEventListener("click", async () => {
+    const name = nameInput.value.trim();
+    if (!name) { setStatus("Give the note a name first"); nameInput.focus(); return; }
+    try {
+      const saved = await invoke("memory_save_note", {
+        name,
+        description: descInput.value,
+        body: bodyInput.value,
+        previousName: current,
       });
-      list.appendChild(el);
+      dirty = false;
+      await refreshNotes();
+      openEditor(await invoke("memory_read_note", { name: saved }));
+      setStatus("Saved");
+    } catch (e) {
+      setStatus(String(e));
     }
-  }
+  });
 
-  // History
+  deleteBtn.addEventListener("click", async () => {
+    if (!current) return;
+    const yes = await ask(`Delete the memory note "${current}"?`, { title: "Delete note", kind: "warning" });
+    if (!yes) return;
+    try {
+      await invoke("memory_delete_note", { name: current });
+      await refreshNotes();
+      showEditorPlaceholder();
+    } catch (e) {
+      setStatus(String(e));
+    }
+  });
+
+  // ---- History ----
   const histSearch = body.querySelector(`[data-hist-search="${tileObj.id}"]`);
   const histList = body.querySelector(`[data-history-list="${tileObj.id}"]`);
   const histDetail = body.querySelector(`[data-history-detail="${tileObj.id}"]`);
@@ -361,7 +244,7 @@ export function renderMemoryTile(tileObj, body) {
           <span class="entity-name">${escapeHtml(preview.substring(0, 80)) || "Empty session"}</span>
           <span class="entity-delete" title="Delete session">&times;</span>
         </div>
-        <div class="entity-summary">${lastAt} &middot; ${msgCount} msgs</div>
+        <div class="entity-summary">${escapeHtml(lastAt)} &middot; ${msgCount} msgs</div>
       `;
 
       row.querySelector(".entity-delete").addEventListener("click", async (e) => {
@@ -389,11 +272,8 @@ export function renderMemoryTile(tileObj, body) {
     }
   }
 
-  refreshProfile();
-  refreshEntities();
-  refreshRelationships();
-  refreshEpisodes();
-  refreshHistory();
+  showEditorPlaceholder();
+  refreshNotes();
 }
 
 

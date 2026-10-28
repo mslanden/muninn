@@ -2800,6 +2800,13 @@ pub(crate) async fn execute_agent_tool(
                 .map_err(|e| format!("invalid items: {}", e))?;
             crate::todos::write_todos(app, state, session_id, items)
         }
+        "memory" => {
+            let (text, changed) = crate::memory::run_tool(&state.memory_dir, arguments)?;
+            if changed {
+                let _ = app.emit("memory-changed", ());
+            }
+            Ok(text)
+        }
         "ask_user" => {
             if !interactive {
                 return Err(

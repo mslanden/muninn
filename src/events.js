@@ -5,7 +5,6 @@ import { escapeHtml, renderMarkdown } from "./utils.js";
 import { getTilesByType, getChatTileBySessionId } from "./tilesys.js";
 import { playTts, maybeAutoSpeak, updateModelChips, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn } from "./chat.js";
 import { renderTasksTile } from "./tasks.js";
-import { renderMemoryTile } from "./memory.js";
 import { renderContentTile } from "./content.js";
 import { isDarkTheme, applyTheme } from "./theme.js";
 import { renderSettingsTile, refreshSettingsModalIfOpen } from "./settings.js";
@@ -306,12 +305,11 @@ export async function setupEventListeners() {
     }, 100);
   });
 
-  await listen("memory-updated", () => {
-    // Refresh any open memory tiles
-    const memTiles = getTilesByType("memory");
-    for (const t of memTiles) {
-      const body = t.el.querySelector(".tile-body");
-      if (body) renderMemoryTile(t, body);
+  await listen("memory-changed", () => {
+    // The model (or the Memory tile) saved/edited/deleted a note — refresh open tiles
+    // in place so an in-progress edit isn't thrown away.
+    for (const t of getTilesByType("memory")) {
+      if (typeof t.refreshMemory === "function") t.refreshMemory();
     }
   });
 

@@ -8,6 +8,7 @@ mod interactive;
 mod llm;
 mod mail;
 mod mcp;
+mod memory;
 mod mobile;
 mod models;
 mod notify_user;
@@ -50,6 +51,8 @@ pub struct AppState {
     /// (media_type, base64). Drained per tool call by the chat loop. Side-channel because the
     /// tool dispatch returns plain text — see `tools::execute_agent_tool`.
     pub captured_images: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// Folder of model-managed memory notes (`app_data_dir()/memory`). See memory.rs.
+    pub memory_dir: PathBuf,
 }
 
 /// Show/hide the frameless quick-ask overlay (created on first use). Lives at
@@ -153,6 +156,7 @@ pub fn run() {
                 pending_questions: Mutex::new(HashMap::new()),
                 mcp: mcp::McpManager::default(),
                 captured_images: Mutex::new(HashMap::new()),
+                memory_dir: data_dir.join("memory"),
             });
 
             // Plugins
@@ -261,15 +265,6 @@ pub fn run() {
                 }
             }
 
-            // Backfill embeddings for entities created before embeddings were added
-            let embed_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                // Small delay to let the app finish starting
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let state: tauri::State<'_, AppState> = embed_handle.state();
-                llm::backfill_embeddings(state.inner()).await;
-            });
-
             // Watch the content directory for changes
             let watcher_handle = app.handle().clone();
             let content_dir = data_dir.join("content");
@@ -334,17 +329,11 @@ pub fn run() {
             commands::set_app_settings,
             commands::fetch_models,
             commands::test_llm_connection,
-            commands::get_memory_profile,
-            commands::set_memory_profile,
-            commands::get_entities,
-            commands::upsert_entity,
-            commands::delete_entity,
-            commands::get_episodes,
-            commands::add_episode,
-            commands::delete_episode,
-            commands::get_relationships,
-            commands::upsert_relationship,
-            commands::delete_relationship,
+            commands::memory_list_notes,
+            commands::memory_read_note,
+            commands::memory_save_note,
+            commands::memory_delete_note,
+            commands::memory_open_folder,
             commands::search_messages,
             commands::open_content_dir,
             commands::get_content_path,
