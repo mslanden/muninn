@@ -35,9 +35,6 @@ export async function bootQuickAsk() {
   const answer = document.body.querySelector(".qa-answer");
   const status = document.body.querySelector(".qa-status");
 
-  let settings = {};
-  try { settings = await invoke("get_app_settings"); } catch {}
-
   let streaming = false;
   let text = "";
 
@@ -83,12 +80,8 @@ export async function bootQuickAsk() {
     input.disabled = true;
 
     try {
-      const req = {
-        sessionId: SESSION_ID,
-        message,
-        provider: "minimax",
-        model: settings["llm/model"] || "MiniMax-M3",
-      };
+      // Backend uses the saved llm/provider + llm/model (see chat.js).
+      const req = { sessionId: SESSION_ID, message };
       await invoke("chat", { req });
       if (text) answer.innerHTML = renderMarkdown(text);
     } catch (error) {

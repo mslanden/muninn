@@ -745,12 +745,9 @@ export function renderChatTile(tileObj, body) {
 
     try {
       showThinking(tileObj.id, agentName ? `${agentName} thinking` : undefined);
-      const req = {
-        sessionId: stream.sessionId,
-        message,
-        provider: "minimax",
-        model: ui.loadedSettings["llm/model"] || "MiniMax-M3"
-      };
+      // Provider + model are deliberately omitted: the backend reads the saved
+      // llm/provider + llm/model, so the request can never disagree with Settings.
+      const req = { sessionId: stream.sessionId, message };
       if (agentId) req.agentId = agentId;
       if (attachments.length) req.attachments = attachments.map(a => ({ mediaType: a.mediaType, data: a.data }));
       await invoke("chat", { req });
