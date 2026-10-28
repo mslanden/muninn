@@ -11,12 +11,12 @@ import "./agents.js";
 import "./memory.js";
 import "./content.js";
 import "./studio.js";
-import "./settings.js";
+import { openSettingsModal, closeSettingsModal, isSettingsModalOpen } from "./settings.js";
 
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { workspace, newChatBtn, navSettingsBtn, ui } from "./state.js";
-import { addTile, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav, openTileForType, replaceSingleTileIfAlone, makeDragSource } from "./tilesys.js";
+import { addTile, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav, replaceSingleTileIfAlone, makeDragSource } from "./tilesys.js";
 import { addChatTile, updateModelChips } from "./chat.js";
 import { initSidebar, refreshSessionList } from "./sidebar.js";
 import { setupEventListeners } from "./events.js";
@@ -30,8 +30,10 @@ newChatBtn.addEventListener("click", async () => {
 });
 makeDragSource(newChatBtn, { type: "chat" });
 
-navSettingsBtn.addEventListener("click", () => openTileForType("settings"));
-makeDragSource(navSettingsBtn, { type: "settings" });
+navSettingsBtn.addEventListener("click", () => {
+  if (isSettingsModalOpen()) closeSettingsModal();
+  else openSettingsModal();
+});
 
 // ==================== BOOT ====================
 async function bootPopout() {
@@ -95,7 +97,7 @@ async function bootMain() {
       if (item.type === "chat") {
         await addChatTile(item.chatId || "", item.projectPath || "", { autoVoice: !!item.autoVoice });
       } else if (item.type === "settings") {
-        addTile("settings");
+        continue; // settings is a modal now — don't restore old settings tiles
       } else {
         addTile(item.type, { webUrl: item.webUrl || "" });
       }

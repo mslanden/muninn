@@ -8,7 +8,7 @@ import { renderTasksTile } from "./tasks.js";
 import { renderMemoryTile } from "./memory.js";
 import { renderContentTile } from "./content.js";
 import { isDarkTheme, applyTheme } from "./theme.js";
-import { renderSettingsTile } from "./settings.js";
+import { renderSettingsTile, refreshSettingsModalIfOpen } from "./settings.js";
 import { renderAgentsTile } from "./agents.js";
 
 // ==================== TAURI EVENT LISTENERS ====================
@@ -331,6 +331,7 @@ export async function setupEventListeners() {
     // Settings tiles so the UI doesn't show stale values.
     try { ui.loadedSettings = await invoke("get_app_settings"); } catch { /* keep old cache */ }
     updateModelChips();
+    refreshSettingsModalIfOpen();
     const settingsTiles = getTilesByType("settings");
     for (const t of settingsTiles) {
       const body = t.el.querySelector(".tile-body");

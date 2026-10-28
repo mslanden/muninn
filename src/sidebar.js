@@ -32,6 +32,7 @@ import {
   replaceSingleTileIfAlone,
 } from "./tilesys.js";
 import { addChatTile, updateModelChips } from "./chat.js";
+import { openSettingsModal } from "./settings.js";
 
 // ==================== APP RAIL ====================
 // App tile types shown as icons in the footer rail (Logs & Tools live under
@@ -516,7 +517,7 @@ async function showModelPopover(anchor) {
   custom.innerHTML = `${icon("settings", 13)} Open Settings…`;
   custom.addEventListener("click", () => {
     closePopover();
-    openTileForType("settings");
+    openSettingsModal("main");
   });
   list.appendChild(custom);
 
@@ -539,11 +540,6 @@ export function updateSidebar() {
   refreshSessionList();
   refreshAgentsList();
   renderAppsRail();
-
-  const settingsOpen = getTilesByType("settings").length > 0;
-  if (navSettingsBtn) {
-    navSettingsBtn.classList.toggle("open", settingsOpen);
-  }
 }
 
 export function initSidebar() {

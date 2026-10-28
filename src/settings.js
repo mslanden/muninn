@@ -1,7 +1,7 @@
 import { registerTileRenderer } from "./registry.js";
 import { invoke } from "@tauri-apps/api/core";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
-import { ui } from "./state.js";
+import { ui, navSettingsBtn } from "./state.js";
 import { updateModelChips } from "./chat.js";
 import { applyTheme, THEMES } from "./theme.js";
 import { field, escapeHtml } from "./utils.js";
@@ -14,235 +14,266 @@ import { renderToolsTile } from "./toolspanel.js";
 export function renderSettingsTile(tileObj, body) {
   body.innerHTML = `
     <div class="settings-layout">
-      <div class="settings-tabs" data-s-tabs="${tileObj.id}">
-        <button type="button" class="settings-tab active" data-s-tab="general">General</button>
+      <nav class="settings-nav" data-s-tabs="${tileObj.id}">
+        <button type="button" class="settings-tab active" data-s-tab="main">Main</button>
+        <button type="button" class="settings-tab" data-s-tab="keys">API Keys</button>
+        <button type="button" class="settings-tab" data-s-tab="voice">Voice &amp; Media</button>
+        <button type="button" class="settings-tab" data-s-tab="ui">UI</button>
+        <button type="button" class="settings-tab" data-s-tab="system">System</button>
+        <button type="button" class="settings-tab" data-s-tab="remote">Remote</button>
+        <button type="button" class="settings-tab" data-s-tab="mcp">MCP</button>
         <button type="button" class="settings-tab" data-s-tab="activity">Activity</button>
         <button type="button" class="settings-tab" data-s-tab="tools">Tools</button>
-      </div>
-      <div class="settings-pages">
-        <div class="settings-page active" data-s-page="general">
-    <div class="settings-section">
-      <div class="settings-group">
-        <h3>Profile</h3>
-        <input type="text" placeholder="Your name" data-s-name="${tileObj.id}" style="margin-bottom:6px;" />
-        <textarea rows="2" placeholder="About you" data-s-about="${tileObj.id}"></textarea>
-        <input type="text" placeholder="Your location (e.g. Mountain Center, CA)" data-s-location="${tileObj.id}" style="margin-top:6px;" />
-      </div>
-      <div class="settings-group">
-        <h3>Model</h3>
-        <div class="form-row" style="margin-bottom:6px;">
-          <select data-s-provider="${tileObj.id}" style="flex:1; min-width:0;">
-            <option value="minimax">MiniMax (Anthropic-compatible)</option>
-            <option value="openai">OpenAI</option>
-            <option value="anthropic">Anthropic</option>
-            <option value="groq">Groq</option>
-            <option value="deepseek">DeepSeek</option>
-            <option value="xai">xAI (Grok)</option>
-            <option value="google">Google (Gemini)</option>
-            <option value="mistral">Mistral</option>
-            <option value="together">Together</option>
-            <option value="fireworks">Fireworks</option>
-            <option value="openrouter">OpenRouter</option>
-            <option value="cohere">Cohere</option>
-            <option value="meta">Meta (Muse Spark)</option>
-            <option value="custom">Custom (OpenAI-compatible)</option>
-          </select>
-          <input type="text" placeholder="Model name (e.g. MiniMax-M3)" list="s-model-list-${tileObj.id}" data-s-model="${tileObj.id}" style="flex:1.3; min-width:120px;" />
-          <button class="form-btn" data-s-fetch-models="${tileObj.id}">Fetch models</button>
-        </div>
-        <datalist id="s-model-list-${tileObj.id}" data-s-model-list="${tileObj.id}"></datalist>
-        <input type="text" placeholder="http://localhost:11434/v1" data-s-custombase="${tileObj.id}" style="margin-bottom:4px; display:none;" />
-        <input type="password" placeholder="API key for the selected provider" data-s-provkey="${tileObj.id}" style="margin-bottom:4px;" />
-        <span class="muted" data-s-prov-hint="${tileObj.id}" style="font-size:10px;"></span>
-        <div class="form-row" style="margin-top:6px; align-items:center;">
-          <button class="form-btn" data-s-test-llm="${tileObj.id}">Test</button>
-          <span class="muted" data-s-model-status="${tileObj.id}" style="font-size:10px;"></span>
-        </div>
-        <div class="form-row" style="margin-top:8px;">
-          <input type="number" min="1" step="1024" placeholder="Max response tokens (e.g. 40960)" data-s-maxtokens="${tileObj.id}" style="flex:1;" />
-        </div>
-        <span class="muted" style="font-size:10px;">Output-token ceiling per response. Too low truncates long file writes mid-call. Blank = 40960.</span>
-        <div class="form-row" style="margin-top:8px;">
-          <select data-s-fbprovider="${tileObj.id}" style="flex:1; min-width:0;">
-            <option value="">No fallback provider</option>
-            <option value="minimax">MiniMax (Anthropic-compatible)</option>
-            <option value="openai">OpenAI</option>
-            <option value="anthropic">Anthropic</option>
-            <option value="groq">Groq</option>
-            <option value="deepseek">DeepSeek</option>
-            <option value="xai">xAI (Grok)</option>
-            <option value="google">Google (Gemini)</option>
-            <option value="mistral">Mistral</option>
-            <option value="together">Together</option>
-            <option value="fireworks">Fireworks</option>
-            <option value="openrouter">OpenRouter</option>
-            <option value="cohere">Cohere</option>
-            <option value="meta">Meta (Muse Spark)</option>
-            <option value="custom">Custom (OpenAI-compatible)</option>
-          </select>
-          <input type="text" placeholder="Fallback model" data-s-fbmodel="${tileObj.id}" style="flex:1.3; min-width:120px;" />
-        </div>
-        <span class="muted" style="font-size:10px;">Retried automatically when the primary model's first request fails. Blank model = the fallback provider's remembered model.</span>
-        <label class="checkbox-inline" style="margin-top:6px;">
-          <input type="checkbox" data-s-keyfallback="${tileObj.id}" /> Allow the OpenAI key as a stand-in for providers without their own key
-        </label>
-      </div>
-      <div class="settings-group">
-        <h3>API Keys</h3>
-        <span class="muted" style="font-size:10px;">LLM provider keys are set in the Model section above.</span>
-        <input type="password" placeholder="Groq API key (voice transcription)" data-s-groq="${tileObj.id}" style="margin-bottom:6px; margin-top:6px;" />
-        <input type="password" placeholder="Web search API key" data-s-search="${tileObj.id}" style="margin-bottom:6px;" />
-        <input type="password" placeholder="Together AI key (images)" data-s-together="${tileObj.id}" style="margin-bottom:6px;" />
-        <input type="password" placeholder="Mapbox API key (maps)" data-s-mapbox="${tileObj.id}" style="margin-bottom:6px;" />
-      </div>
-      <div class="settings-group">
-        <h3>Voice</h3>
-        <div class="form-row" style="margin-bottom:6px;">
-          <select data-s-ttsprov="${tileObj.id}" style="flex:1; min-width:0;">
-            <option value="minimax">MiniMax</option>
-            <option value="fishaudio">Fish Audio</option>
-            <option value="fishspeech">FishSpeech (local)</option>
-          </select>
-          <input type="text" placeholder="speech-2.8-hd" data-s-ttsmodel="${tileObj.id}" style="flex:2; min-width:0;" />
-        </div>
-        <div class="form-row" style="margin-bottom:6px; align-items:center;">
-          <input type="text" placeholder="Voice ID (MiniMax voice or Fish Audio reference id)" data-s-voiceid="${tileObj.id}" style="flex:1;" />
-          <button class="form-btn" data-s-tts-preview="${tileObj.id}" title="Preview voice">▶</button>
-        </div>
-        <input type="password" placeholder="Fish Audio API key" data-s-fishaudio="${tileObj.id}" style="margin-bottom:6px;" />
-        <span class="muted" data-s-tts-status="${tileObj.id}" style="font-size:10px;"></span>
-        <div class="form-row" style="margin-top:6px;">
-          <select data-s-sttprov="${tileObj.id}" style="flex:1;">
-            <option value="auto">Automatic (Groq → OpenAI)</option>
-            <option value="groq">Groq</option>
-            <option value="openai">OpenAI</option>
-          </select>
-        </div>
-        <span class="muted" style="font-size:10px;">Speech-to-text transcription provider for voice input.</span>
-      </div>
-      <div class="settings-group">
-        <h3>Image Generation</h3>
-        <div class="form-row" style="margin-bottom:6px;">
-          <select data-s-imgprov="${tileObj.id}">
-            <option value="">None</option>
-            <option value="minimax">MiniMax</option>
-            <option value="together">Together</option>
-            <option value="openai">OpenAI</option>
-          </select>
-          <select data-s-imgmodel="${tileObj.id}" style="flex:1;"></select>
-          <button class="form-btn" data-s-fetch-img-models="${tileObj.id}">Fetch</button>
-        </div>
-        <span class="muted" data-s-img-status="${tileObj.id}" style="font-size:10px;"></span>
-      </div>
-      <div class="settings-group">
-        <h3>Video</h3>
-        <label class="checkbox-inline">
-          <input type="checkbox" data-s-localtranscribe="${tileObj.id}" /> On-device transcription (Apple Speech)
-        </label>
-        <span class="muted" style="font-size:10px;">Chat voice input and Studio video analysis transcribe on your Mac — no API key, audio never leaves the device. Falls back to cloud whisper (Groq/OpenAI) if it fails. First use downloads a speech model.</span>
-        <label class="checkbox-inline" style="margin-top:6px;">
-          <input type="checkbox" data-s-hwencode="${tileObj.id}" /> Hardware video encoding (VideoToolbox)
-        </label>
-        <span class="muted" style="font-size:10px;">Uses your Mac's hardware encoder for faster renders when available. Falls back to software encoding automatically if it's unsupported or fails.</span>
-      </div>
-      <div class="settings-group">
-        <h3>Default directory</h3>
-        <p class="settings-hint">The folder a chat operates in when no project folder is picked. Use the ${icon("folder", 12)} button in a chat to scope it to a specific folder.</p>
-        <div class="form-row" style="margin-bottom:6px;">
-          <input type="text" placeholder="Default directory path" data-s-workspace="${tileObj.id}" />
-          <button class="form-btn" data-s-setws="${tileObj.id}">Set</button>
-        </div>
-      </div>
-      <div class="settings-group">
-        <h3>Appearance</h3>
-        <div class="form-row" style="margin-bottom:6px;">
-          <select data-s-theme="${tileObj.id}">
-            ${THEMES.map((t) => `<option value="${t.id}">${t.label}</option>`).join("")}
-          </select>
-        </div>
-      </div>
-      <div class="settings-group">
-        <h3>System</h3>
-        <label class="checkbox-inline">
-          <input type="checkbox" data-s-autostart="${tileObj.id}" /> Launch at login
-        </label>
-        <label class="checkbox-inline">
-          <input type="checkbox" data-s-notify="${tileObj.id}" /> Desktop notifications
-        </label>
-        <div class="form-row" style="margin-top:6px;">
-          <input type="text" placeholder="Quick-ask shortcut (e.g. cmd+shift+space)" data-s-qashortcut="${tileObj.id}" style="flex:1;" />
-        </div>
-        <span class="muted" style="font-size:10px;">Shortcut changes take effect after restarting Muninn.</span>
-      </div>
-      <div class="settings-group">
-        <h3>Safety</h3>
-        <label class="checkbox-inline">
-          <input type="checkbox" data-s-autoverify="${tileObj.id}" /> Auto-verify dangerous commands (LLM reviews before asking you)
-        </label>
-        <div class="form-row" style="margin-top:6px;">
-          <input type="number" min="15" max="3600" step="1" placeholder="120" data-s-approvaltimeout="${tileObj.id}" style="flex:1;" />
-        </div>
-        <span class="muted" style="font-size:10px;">Approval timeout (seconds) before a verified command is deferred for later. 15–3600.</span>
-      </div>
-      <div class="settings-group">
-        <h3>Remote access (phone)</h3>
-        <p class="settings-hint">Run a local server so you can chat with Muninn from your phone on the same Wi-Fi.</p>
-        <div class="form-row" style="margin-bottom:6px; align-items:center;">
-          <button class="form-btn" data-s-mobile-toggle="${tileObj.id}">Enable</button>
-          <span class="muted" data-s-mobile-state="${tileObj.id}" style="font-size:10px;"></span>
-        </div>
-        <div class="form-row" style="margin-bottom:4px; align-items:center;">
-          <input type="number" min="1" max="65535" step="1" placeholder="8737" data-s-mobile-port="${tileObj.id}" style="flex:1;" />
-          <span class="muted" style="font-size:10px; white-space:nowrap;">applies on next start</span>
-        </div>
-        <span class="muted" data-s-mobile-error="${tileObj.id}" style="font-size:10px; color:var(--red);"></span>
-        <div class="mobile-pairing" data-s-mobile-pairing="${tileObj.id}" style="display:none; margin-top:10px;">
-          <div class="mobile-qr" data-s-mobile-qr="${tileObj.id}"></div>
-          <div class="mobile-urls" data-s-mobile-urls="${tileObj.id}"></div>
-          <div class="form-row" style="margin-top:8px;">
-            <button class="form-btn danger" data-s-mobile-regen="${tileObj.id}">Regenerate token</button>
-          </div>
-          <p class="settings-hint" style="margin-top:8px;">Works on your Wi-Fi. For access from anywhere, install Tailscale on both devices — the URL then works over it too.</p>
-        </div>
-        <p class="settings-hint" style="margin-top:8px; color:var(--red);">Anyone with this URL can chat and run commands as Muninn. Keep it private.</p>
-      </div>
-      <div class="settings-group">
-        <h3>MCP Servers</h3>
-        <textarea rows="4" spellcheck="false" placeholder='[{"name": "github", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "..."}}]' data-s-mcp="${tileObj.id}"></textarea>
-        <div class="form-row" style="margin-top:6px;">
-          <button class="form-btn" data-s-mcp-reload="${tileObj.id}">Reload Servers</button>
-        </div>
-        <div class="muted" data-s-mcp-status="${tileObj.id}" style="font-size:10px; white-space:pre-line;"></div>
-      </div>
-      <div class="form-row" style="margin-top:12px;">
-        <button class="form-btn" data-s-save="${tileObj.id}">Save Settings</button>
-        <span class="muted" data-s-status="${tileObj.id}"></span>
-      </div>
-    </div>
-        </div>
-        <div class="settings-page" data-s-page="activity">
-          <div class="settings-section">
+      </nav>
+      <div class="settings-main">
+        <div class="settings-pages">
+
+          <div class="settings-page active" data-s-page="main"><div class="settings-section">
+            <div class="settings-group">
+              <h3>Profile</h3>
+              <input type="text" placeholder="Your name" data-s-name="${tileObj.id}" style="margin-bottom:6px;" />
+              <textarea rows="2" placeholder="About you" data-s-about="${tileObj.id}"></textarea>
+              <input type="text" placeholder="Your location (e.g. Mountain Center, CA)" data-s-location="${tileObj.id}" style="margin-top:6px;" />
+            </div>
+            <div class="settings-group">
+              <h3>Model</h3>
+              <div class="form-row" style="margin-bottom:6px;">
+                <select data-s-provider="${tileObj.id}" style="flex:1; min-width:0;">
+                  <option value="minimax">MiniMax (Anthropic-compatible)</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Anthropic</option>
+                  <option value="groq">Groq</option>
+                  <option value="deepseek">DeepSeek</option>
+                  <option value="xai">xAI (Grok)</option>
+                  <option value="google">Google (Gemini)</option>
+                  <option value="mistral">Mistral</option>
+                  <option value="together">Together</option>
+                  <option value="fireworks">Fireworks</option>
+                  <option value="openrouter">OpenRouter</option>
+                  <option value="cohere">Cohere</option>
+                  <option value="meta">Meta (Muse Spark)</option>
+                  <option value="custom">Custom (OpenAI-compatible)</option>
+                </select>
+                <input type="text" placeholder="Model name (e.g. MiniMax-M3)" list="s-model-list-${tileObj.id}" data-s-model="${tileObj.id}" style="flex:1.3; min-width:120px;" />
+                <button class="form-btn" data-s-fetch-models="${tileObj.id}">Fetch models</button>
+              </div>
+              <datalist id="s-model-list-${tileObj.id}" data-s-model-list="${tileObj.id}"></datalist>
+              <input type="text" placeholder="http://localhost:11434/v1" data-s-custombase="${tileObj.id}" style="margin-bottom:4px; display:none;" />
+              <input type="password" placeholder="API key for the selected provider" data-s-provkey="${tileObj.id}" style="margin-bottom:4px;" />
+              <span class="muted" data-s-prov-hint="${tileObj.id}" style="font-size:10px;"></span>
+              <div class="form-row" style="margin-top:6px; align-items:center;">
+                <button class="form-btn" data-s-test-llm="${tileObj.id}">Test</button>
+                <span class="muted" data-s-model-status="${tileObj.id}" style="font-size:10px;"></span>
+              </div>
+              <div class="form-row" style="margin-top:8px;">
+                <input type="number" min="1" step="1024" placeholder="Max response tokens (e.g. 40960)" data-s-maxtokens="${tileObj.id}" style="flex:1;" />
+              </div>
+              <span class="muted" style="font-size:10px;">Output-token ceiling per response. Blank = 40960.</span>
+            </div>
+            <div class="settings-group">
+              <h3>Fallback</h3>
+              <div class="form-row">
+                <select data-s-fbprovider="${tileObj.id}" style="flex:1; min-width:0;">
+                  <option value="">No fallback provider</option>
+                  <option value="minimax">MiniMax (Anthropic-compatible)</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Anthropic</option>
+                  <option value="groq">Groq</option>
+                  <option value="deepseek">DeepSeek</option>
+                  <option value="xai">xAI (Grok)</option>
+                  <option value="google">Google (Gemini)</option>
+                  <option value="mistral">Mistral</option>
+                  <option value="together">Together</option>
+                  <option value="fireworks">Fireworks</option>
+                  <option value="openrouter">OpenRouter</option>
+                  <option value="cohere">Cohere</option>
+                  <option value="meta">Meta (Muse Spark)</option>
+                  <option value="custom">Custom (OpenAI-compatible)</option>
+                </select>
+                <input type="text" placeholder="Fallback model" data-s-fbmodel="${tileObj.id}" style="flex:1.3; min-width:120px;" />
+              </div>
+              <span class="muted" style="font-size:10px;">Retried automatically when the primary model fails.</span>
+              <label class="checkbox-inline" style="margin-top:6px;">
+                <input type="checkbox" data-s-keyfallback="${tileObj.id}" /> Use the OpenAI key for providers without their own key
+              </label>
+            </div>
+            <div class="settings-group">
+              <h3>Default directory</h3>
+              <p class="settings-hint">Where a chat operates when no project folder is picked — set per chat with the ${icon("folder", 12)} chip in the composer.</p>
+              <div class="form-row">
+                <input type="text" placeholder="Default directory path" data-s-workspace="${tileObj.id}" />
+                <button class="form-btn" data-s-setws="${tileObj.id}">Set</button>
+              </div>
+            </div>
+          </div></div>
+
+          <div class="settings-page" data-s-page="keys"><div class="settings-section">
+            <div class="settings-group">
+              <h3>Service keys</h3>
+              <p class="settings-hint">Model-provider keys live under Main → Model. These cover everything else.</p>
+              <input type="password" placeholder="Groq API key (voice transcription)" data-s-groq="${tileObj.id}" style="margin-bottom:6px;" />
+              <input type="password" placeholder="Web search API key" data-s-search="${tileObj.id}" style="margin-bottom:6px;" />
+              <input type="password" placeholder="Together AI key (images)" data-s-together="${tileObj.id}" style="margin-bottom:6px;" />
+              <input type="password" placeholder="Mapbox API key (maps)" data-s-mapbox="${tileObj.id}" style="margin-bottom:6px;" />
+              <input type="password" placeholder="Fish Audio API key (TTS)" data-s-fishaudio="${tileObj.id}" style="margin-bottom:6px;" />
+            </div>
+          </div></div>
+
+          <div class="settings-page" data-s-page="voice"><div class="settings-section">
+            <div class="settings-group">
+              <h3>Voice</h3>
+              <div class="form-row" style="margin-bottom:6px;">
+                <select data-s-ttsprov="${tileObj.id}" style="flex:1; min-width:0;">
+                  <option value="minimax">MiniMax</option>
+                  <option value="fishaudio">Fish Audio</option>
+                  <option value="fishspeech">FishSpeech (local)</option>
+                </select>
+                <input type="text" placeholder="TTS model (e.g. speech-2.8-hd)" data-s-ttsmodel="${tileObj.id}" style="flex:2; min-width:0;" />
+              </div>
+              <div class="form-row" style="margin-bottom:6px; align-items:center;">
+                <input type="text" placeholder="Voice ID (MiniMax voice or Fish Audio reference id)" data-s-voiceid="${tileObj.id}" style="flex:1;" />
+                <button class="form-btn" data-s-tts-preview="${tileObj.id}" title="Preview voice">▶</button>
+              </div>
+              <span class="muted" data-s-tts-status="${tileObj.id}" style="font-size:10px;"></span>
+              <div class="form-row" style="margin-top:6px;">
+                <select data-s-sttprov="${tileObj.id}" style="flex:1;">
+                  <option value="auto">Automatic (Groq → OpenAI)</option>
+                  <option value="groq">Groq</option>
+                  <option value="openai">OpenAI</option>
+                </select>
+              </div>
+              <span class="muted" style="font-size:10px;">Speech-to-text provider for voice input.</span>
+              <label class="checkbox-inline" style="margin-top:8px;">
+                <input type="checkbox" data-s-localtranscribe="${tileObj.id}" /> On-device transcription (Apple Speech)
+              </label>
+              <span class="muted" style="font-size:10px;">Voice input and video analysis transcribe on your Mac — no key, audio never leaves the device. Falls back to cloud whisper.</span>
+            </div>
+            <div class="settings-group">
+              <h3>Images</h3>
+              <div class="form-row" style="margin-bottom:6px;">
+                <select data-s-imgprov="${tileObj.id}">
+                  <option value="">None</option>
+                  <option value="minimax">MiniMax</option>
+                  <option value="together">Together</option>
+                  <option value="openai">OpenAI</option>
+                </select>
+                <select data-s-imgmodel="${tileObj.id}" style="flex:1;"></select>
+                <button class="form-btn" data-s-fetch-img-models="${tileObj.id}">Fetch</button>
+              </div>
+              <span class="muted" data-s-img-status="${tileObj.id}" style="font-size:10px;"></span>
+            </div>
+            <div class="settings-group">
+              <h3>Video</h3>
+              <label class="checkbox-inline">
+                <input type="checkbox" data-s-hwencode="${tileObj.id}" /> Hardware video encoding (VideoToolbox)
+              </label>
+              <span class="muted" style="font-size:10px;">Faster renders on the Mac's hardware encoder; falls back to software automatically.</span>
+            </div>
+          </div></div>
+
+          <div class="settings-page" data-s-page="ui"><div class="settings-section">
+            <div class="settings-group">
+              <h3>Appearance</h3>
+              <div class="form-row">
+                <select data-s-theme="${tileObj.id}">
+                  ${THEMES.map((t) => `<option value="${t.id}">${t.label}</option>`).join("")}
+                </select>
+              </div>
+            </div>
+            <div class="settings-group">
+              <h3>Notifications</h3>
+              <label class="checkbox-inline">
+                <input type="checkbox" data-s-notify="${tileObj.id}" /> Desktop notifications
+              </label>
+            </div>
+          </div></div>
+
+          <div class="settings-page" data-s-page="system"><div class="settings-section">
+            <div class="settings-group">
+              <h3>System</h3>
+              <label class="checkbox-inline">
+                <input type="checkbox" data-s-autostart="${tileObj.id}" /> Launch at login
+              </label>
+              <div class="form-row" style="margin-top:6px;">
+                <input type="text" placeholder="Quick-ask shortcut (e.g. cmd+shift+space)" data-s-qashortcut="${tileObj.id}" style="flex:1;" />
+              </div>
+              <span class="muted" style="font-size:10px;">Shortcut changes take effect after restarting Muninn.</span>
+            </div>
+            <div class="settings-group">
+              <h3>Safety</h3>
+              <label class="checkbox-inline">
+                <input type="checkbox" data-s-autoverify="${tileObj.id}" /> Auto-verify dangerous commands (LLM reviews before asking you)
+              </label>
+              <div class="form-row" style="margin-top:6px;">
+                <input type="number" min="15" max="3600" step="1" placeholder="120" data-s-approvaltimeout="${tileObj.id}" style="flex:1;" />
+              </div>
+              <span class="muted" style="font-size:10px;">Seconds before a verified command is deferred (15–3600).</span>
+            </div>
+          </div></div>
+
+          <div class="settings-page" data-s-page="remote"><div class="settings-section">
+            <div class="settings-group">
+              <h3>Remote access (phone)</h3>
+              <p class="settings-hint">Run a local server to chat with Muninn from your phone on the same Wi-Fi.</p>
+              <div class="form-row" style="margin-bottom:6px; align-items:center;">
+                <button class="form-btn" data-s-mobile-toggle="${tileObj.id}">Enable</button>
+                <span class="muted" data-s-mobile-state="${tileObj.id}" style="font-size:10px;"></span>
+              </div>
+              <div class="form-row" style="margin-bottom:4px; align-items:center;">
+                <input type="number" min="1" max="65535" step="1" placeholder="8737" data-s-mobile-port="${tileObj.id}" style="flex:1;" />
+                <span class="muted" style="font-size:10px; white-space:nowrap;">applies on next start</span>
+              </div>
+              <span class="muted" data-s-mobile-error="${tileObj.id}" style="font-size:10px; color:var(--red);"></span>
+              <div class="mobile-pairing" data-s-mobile-pairing="${tileObj.id}" style="display:none; margin-top:10px;">
+                <div class="mobile-qr" data-s-mobile-qr="${tileObj.id}"></div>
+                <div class="mobile-urls" data-s-mobile-urls="${tileObj.id}"></div>
+                <div class="form-row" style="margin-top:8px;">
+                  <button class="form-btn danger" data-s-mobile-regen="${tileObj.id}">Regenerate token</button>
+                </div>
+                <p class="settings-hint" style="margin-top:8px;">Works on your Wi-Fi. For access from anywhere, install Tailscale on both devices — the URL then works over it too.</p>
+              </div>
+              <p class="settings-hint" style="margin-top:8px; color:var(--red);">Anyone with this URL can chat and run commands as Muninn. Keep it private.</p>
+            </div>
+          </div></div>
+
+          <div class="settings-page" data-s-page="mcp"><div class="settings-section">
+            <div class="settings-group">
+              <h3>MCP Servers</h3>
+              <p class="settings-hint">Connect Model Context Protocol servers — their tools become available to Muninn in chat and agent runs. One JSON entry per server.</p>
+              <textarea rows="6" spellcheck="false" placeholder='[{"name": "github", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "..."}}]' data-s-mcp="${tileObj.id}"></textarea>
+              <div class="form-row" style="margin-top:6px;">
+                <button class="form-btn" data-s-mcp-reload="${tileObj.id}">Reload Servers</button>
+              </div>
+              <div class="muted" data-s-mcp-status="${tileObj.id}" style="font-size:10px; white-space:pre-line;"></div>
+            </div>
+          </div></div>
+
+          <div class="settings-page" data-s-page="activity"><div class="settings-section">
             <div class="settings-group">
               <h3>Activity log</h3>
-              <p class="settings-hint">Tool runs, messages, and background events from this session and others.</p>
+              <p class="settings-hint">Tool runs, messages, and background events.</p>
               <div class="settings-embed" data-s-activity-host="${tileObj.id}"></div>
             </div>
-          </div>
-        </div>
-        <div class="settings-page" data-s-page="tools">
-          <div class="settings-section">
+          </div></div>
+
+          <div class="settings-page" data-s-page="tools"><div class="settings-section">
             <div class="settings-group">
               <h3>Tool access</h3>
-              <p class="settings-hint">Enable or disable tools the assistant can call during chat and agent runs.</p>
+              <p class="settings-hint">Enable or disable tools the assistant can call.</p>
               <div class="settings-embed" data-s-tools-host="${tileObj.id}"></div>
             </div>
-          </div>
+          </div></div>
+
+        </div>
+        <div class="settings-footer">
+          <button class="form-btn" data-s-save="${tileObj.id}">Save Settings</button>
+          <span class="muted" data-s-status="${tileObj.id}"></span>
         </div>
       </div>
     </div>
   `;
 
-  // Tab switching — Activity / Tools hosts are filled lazily on first visit.
+  // Section switching — Activity / Tools hosts are filled lazily on first visit.
   const tabsEl = body.querySelector(`[data-s-tabs="${tileObj.id}"]`);
   let activityMounted = false;
   let toolsMounted = false;
@@ -864,5 +895,63 @@ export function renderSettingsTile(tileObj, body) {
   loadS();
 }
 
+
+// ========== SETTINGS MODAL (overlay) ==========
+// Settings opens as a popup over the whole workspace rather than a tile.
+// The tile renderer above still backs it (and legacy pop-out windows) — the
+// modal simply mounts it into an overlay with a fake tile object.
+let settingsOverlay = null;
+
+export function isSettingsModalOpen() {
+  return !!settingsOverlay;
+}
+
+function settingsEscListener(e) {
+  if (e.key === "Escape") closeSettingsModal();
+}
+
+export function closeSettingsModal() {
+  if (!settingsOverlay) return;
+  settingsOverlay.remove();
+  settingsOverlay = null;
+  document.removeEventListener("keydown", settingsEscListener);
+  if (navSettingsBtn) navSettingsBtn.classList.remove("open");
+}
+
+export function openSettingsModal(section) {
+  if (settingsOverlay) {
+    if (section) settingsOverlay.querySelector(`[data-s-tab="${section}"]`)?.click();
+    return;
+  }
+  const overlay = document.createElement("div");
+  overlay.className = "settings-overlay";
+  overlay.innerHTML = `
+    <div class="settings-modal" role="dialog" aria-modal="true" aria-label="Settings">
+      <div class="settings-modal-head">
+        <span class="settings-modal-title">Settings</span>
+        <button class="settings-modal-close" aria-label="Close settings">${icon("x", 14)}</button>
+      </div>
+      <div class="settings-modal-body"></div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  settingsOverlay = overlay;
+  overlay.addEventListener("mousedown", (e) => {
+    if (e.target === overlay) closeSettingsModal();
+  });
+  overlay.querySelector(".settings-modal-close").addEventListener("click", closeSettingsModal);
+  document.addEventListener("keydown", settingsEscListener);
+  renderSettingsTile({ id: "modal", el: overlay }, overlay.querySelector(".settings-modal-body"));
+  if (section) overlay.querySelector(`[data-s-tab="${section}"]`)?.click();
+  if (navSettingsBtn) navSettingsBtn.classList.add("open");
+}
+
+// Re-sync the open modal after out-of-band settings changes (agent set_setting).
+export function refreshSettingsModalIfOpen() {
+  if (!settingsOverlay) return;
+  const active = settingsOverlay.querySelector(".settings-tab.active")?.dataset.sTab;
+  renderSettingsTile({ id: "modal", el: settingsOverlay }, settingsOverlay.querySelector(".settings-modal-body"));
+  if (active && active !== "main") settingsOverlay.querySelector(`[data-s-tab="${active}"]`)?.click();
+}
 
 registerTileRenderer("settings", renderSettingsTile);
