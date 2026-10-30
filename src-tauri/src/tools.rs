@@ -2716,7 +2716,7 @@ pub(crate) async fn execute_agent_tool(
             let limit = arguments
                 .get("limit")
                 .and_then(Value::as_u64)
-                .unwrap_or(20) as u32;
+                .unwrap_or(10) as u32;
             let unread_only = arguments
                 .get("unread_only")
                 .and_then(Value::as_bool)

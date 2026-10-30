@@ -2627,11 +2627,11 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("list_inbox") {
         defs.push((
             "list_inbox",
-            "Read messages from the user's Apple Mail unified inbox (all configured accounts combined). Returns JSON: {count, messages: [{id, date, from, subject, status}, ...]}, newest first. Dates are ISO-8601 local time (YYYY-MM-DDTHH:MM:SS, no timezone). `id` is an opaque handle — pass it to read_mail for the full body. Use for 'what's in my inbox', 'any new mail', or as a starting point before reading a specific message. Supports optional date-range filtering via `since`/`until`. Reads Apple Mail's local cache; does not hit the server. Read-only.",
+            "Read messages from the user's Apple Mail unified inbox (all configured accounts combined). Returns JSON: {count, messages: [{id, date, from, subject, status}, ...]}, newest first. Dates are ISO-8601 local time (YYYY-MM-DDTHH:MM:SS, no timezone). `id` is an opaque handle — pass it to read_mail for the full body. Use for 'what's in my inbox', 'any new mail', or as a starting point before reading a specific message. Supports optional date-range filtering via `since`/`until`; without `since` it covers the last 30 days. Listing can take tens of seconds on large mailboxes — to find specific kinds of mail (receipts, orders, invoices, a person's emails) use search_mail with keywords instead, which is much faster. Reads Apple Mail's local cache; does not hit the server. Read-only.",
             json!({
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "description": "How many messages to return (1–50, default 20)."},
+                    "limit": {"type": "integer", "description": "How many messages to return (1–50, default 10). Larger lists take noticeably longer on big mailboxes."},
                     "unread_only": {"type": "boolean", "description": "If true, skip messages already marked read. Default false."},
                     "since": {"type": "string", "description": "Optional ISO date/datetime (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) — only messages received at or after this moment. Today is a good reference: combine with `until` to filter to a single day. Local time."},
                     "until": {"type": "string", "description": "Optional ISO date/datetime — only messages received strictly before this moment (half-open, so `until=2026-04-22` excludes anything on the 22nd)."}
@@ -2642,7 +2642,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("search_mail") {
         defs.push((
             "search_mail",
-            "Search the user's Apple Mail inbox by subject line OR sender, optionally bounded by date. Returns the same JSON shape as list_inbox. Use when the user names a person, topic, or subject keyword ('did Alice email me?', 'find the AWS receipt from last week'). IMPORTANT: `query` matches Subject and From only, NOT body — if you need body-text search, narrow candidates here then read_mail each. Case-insensitive substring match. Searches the unified inbox (not Sent/Drafts/Trash). At least one of `query`, `since`, `until` must be supplied.",
+            "Search the user's Apple Mail inbox by subject line OR sender, optionally bounded by date. Returns the same JSON shape as list_inbox. Use when the user names a person, topic, or subject keyword ('did Alice email me?', 'find the AWS receipt from last week'). This is the FAST path (a few seconds) — prefer it over list_inbox whenever you can name what you're looking for; for purchases, search several keywords (receipt, order, invoice, payment, confirmation) rather than listing everything. IMPORTANT: `query` matches Subject and From only, NOT body — if you need body-text search, narrow candidates here then read_mail each. Case-insensitive substring match. Searches the unified inbox (not Sent/Drafts/Trash). At least one of `query`, `since`, `until` must be supplied.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2657,7 +2657,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("read_mail") {
         defs.push((
             "read_mail",
-            "Fetch the full plain-text body and headers (From / To / Subject / Date) of one message. Pass the opaque `id` handle that list_inbox or search_mail returned — it encodes the account+mailbox+local message id needed for a direct O(1) lookup. Handles are session-local to Mail.app: if Mail restarts, re-run list/search to get fresh ones. Body is truncated to ~20k chars if longer.",
+            "Fetch the full plain-text body and headers (From / To / Subject / Date) of one message. Pass the opaque `id` handle that list_inbox or search_mail returned — it encodes the account+mailbox+local message id needed for the lookup. If a message can't be opened, don't retry the same handle — use the date/sender/subject from the search results instead. Body is truncated to ~20k chars if longer.",
             json!({
                 "type": "object",
                 "properties": {
@@ -3288,6 +3288,32 @@ fn resolve_chat_system_prompt(
     }
 }
 
+/// When the exact same tool call (name + arguments) fails again in one turn, append a
+/// note telling the model to stop retrying it. Models otherwise loop on a failing call
+/// (e.g. re-reading a mail handle that can't be opened) until the user gives up.
+fn note_repeated_failure(
+    failed: &mut HashMap<String, u32>,
+    name: &str,
+    args: &str,
+    output: String,
+) -> String {
+    let failed_now = output.starts_with("Tool error:") || output.starts_with("ERROR:");
+    if !failed_now {
+        return output;
+    }
+    let key = format!("{}\u{1f}{}", name, args.split_whitespace().collect::<String>());
+    let count = failed.entry(key).or_insert(0);
+    *count += 1;
+    if *count < 2 {
+        return output;
+    }
+    format!(
+        "{}\n\n[This exact {} call has now failed {} times this turn. Do not repeat it — try a \
+         different approach, or tell the user what isn't working.]",
+        output, name, count
+    )
+}
+
 /// Split a round's tool calls into execution groups: each run of consecutive
 /// `subagent` calls becomes one parallel group; every other call is its own group.
 fn group_parallel_calls<'a>(names: impl Iterator<Item = &'a str>) -> Vec<Vec<usize>> {
@@ -3532,6 +3558,8 @@ async fn run_tool_loop(
     // Text the model wrote alongside its latest tool calls — reported if a step
     // limit (subagents) ends the run before a final answer.
     let mut last_text = String::new();
+    // Failure counts per exact (tool, arguments) call this turn — see note_repeated_failure.
+    let mut failed_calls: HashMap<String, u32> = HashMap::new();
 
     loop {
         if check_stop_requested(state, session_id) {
@@ -3672,6 +3700,7 @@ async fn run_tool_loop(
 
             let mut tool_result_blocks: Vec<Value> = Vec::new();
             for (call, (output, images)) in calls.iter().zip(results) {
+                let output = note_repeated_failure(&mut failed_calls, &call.name, &call.args, output);
                 // Attach captured images as sibling image blocks in the tool_result turn so
                 // the vision model sees them this turn; persist only a text placeholder so
                 // reloaded history doesn't carry the (large) base64 forever.
@@ -3978,6 +4007,20 @@ pub(crate) async fn run_project_init(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_identical_failures_get_a_stop_note() {
+        let mut failed = HashMap::new();
+        let err = || "Tool error: Could not open message".to_string();
+        // First failure passes through unchanged.
+        assert_eq!(note_repeated_failure(&mut failed, "read_mail", r#"{"id": "a"}"#, err()), err());
+        // Same call again (whitespace differences ignored) → note appended.
+        let second = note_repeated_failure(&mut failed, "read_mail", r#"{"id":"a"}"#, err());
+        assert!(second.contains("failed 2 times") && second.contains("Do not repeat"));
+        // A different call or a success is untouched.
+        assert_eq!(note_repeated_failure(&mut failed, "read_mail", r#"{"id": "b"}"#, err()), err());
+        assert_eq!(note_repeated_failure(&mut failed, "read_mail", r#"{"id": "a"}"#, "ok".into()), "ok");
+    }
 
     #[test]
     fn consecutive_subagent_calls_group_for_parallel_execution() {
