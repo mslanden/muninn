@@ -27,13 +27,6 @@ function pathBasename(p) {
   return i >= 0 ? s.slice(i + 1) : s;
 }
 
-// Resolve an agent id to its display name via the shared agents cache;
-// falls back to the raw id when the agent is unknown.
-function agentDisplayName(agentId) {
-  const agents = Array.isArray(ui.cachedAgents) ? ui.cachedAgents : [];
-  const a = agents.find(x => String(field(x, "agentId", "agent_id")) === String(agentId));
-  return a ? field(a, "name", "name") : String(agentId);
-}
 
 // ========== TASKS TILE ==========
 export function renderTasksTile(tileObj, body) {
@@ -62,9 +55,9 @@ export function renderTasksTile(tileObj, body) {
         <button class="task-action-btn" data-task-workspace-pick="${tileObj.id}">Choose…</button>
         <button class="task-action-btn" data-task-workspace-clear="${tileObj.id}" title="Clear workspace">✕</button>
       </div>
-      <label class="task-chain-label">Run as (optional)</label>
-      <select data-task-agent="${tileObj.id}">
-        <option value="">Default assistant</option>
+      <label class="task-chain-label">Skill (optional)</label>
+      <select data-task-skill="${tileObj.id}">
+        <option value="">None — default assistant</option>
       </select>
       <div class="form-row">
         <button class="form-btn" data-task-save="${tileObj.id}">Save Task</button>
@@ -129,7 +122,7 @@ export function renderTasksTile(tileObj, body) {
   const workspaceInput = body.querySelector(`[data-task-workspace="${tileObj.id}"]`);
   const workspacePickBtn = body.querySelector(`[data-task-workspace-pick="${tileObj.id}"]`);
   const workspaceClearBtn = body.querySelector(`[data-task-workspace-clear="${tileObj.id}"]`);
-  const agentSelect = body.querySelector(`[data-task-agent="${tileObj.id}"]`);
+  const skillSelect = body.querySelector(`[data-task-skill="${tileObj.id}"]`);
   const saveBtn = body.querySelector(`[data-task-save="${tileObj.id}"]`);
   const resetBtn = body.querySelector(`[data-task-reset="${tileObj.id}"]`);
   const taskSchedContainer = body.querySelector(`[data-task-schedule-widget="${tileObj.id}"]`);
@@ -149,32 +142,30 @@ export function renderTasksTile(tileObj, body) {
     workspaceInput.value = "";
   });
 
-  // Fill the "Run as" select: default assistant + one option per enabled
-  // custom agent (shared ui.cachedAgents cache, fetched on first use — same
-  // pattern as sidebar.js). A selected agent that no longer exists/is
-  // disabled still gets an option so editing doesn't silently drop it.
-  async function populateAgentOptions(selectedId) {
-    let agents = ui.cachedAgents;
-    if (!Array.isArray(agents) || !agents.length) {
+  // Fill the skill select (shared ui.cachedSkills cache, fetched on first use —
+  // same pattern as sidebar.js). A selected skill that no longer exists still gets
+  // an option so editing doesn't silently drop it.
+  async function populateSkillOptions(selected) {
+    let skills = ui.cachedSkills;
+    if (!Array.isArray(skills) || !skills.length) {
       try {
-        agents = await invoke("get_agents");
-        ui.cachedAgents = agents;
-      } catch { agents = []; }
+        skills = await invoke("list_skills");
+        ui.cachedSkills = skills;
+      } catch { skills = []; }
     }
-    if (!Array.isArray(agents)) agents = [];
-    const sel = String(selectedId || "");
-    const enabled = agents.filter(a => field(a, "enabled", "enabled"));
+    if (!Array.isArray(skills)) skills = [];
+    const sel = String(selected || "");
     let found = !sel;
-    const opts = [`<option value="">Default assistant</option>`];
-    for (const a of enabled) {
-      const aid = String(field(a, "agentId", "agent_id"));
-      if (aid === sel) found = true;
-      opts.push(`<option value="${escapeHtml(aid)}"${aid === sel ? " selected" : ""}>${escapeHtml(field(a, "name", "name"))}</option>`);
+    const opts = [`<option value="">None — default assistant</option>`];
+    for (const sk of skills) {
+      const name = String(field(sk, "name"));
+      if (name === sel) found = true;
+      opts.push(`<option value="${escapeHtml(name)}"${name === sel ? " selected" : ""}>${escapeHtml(name)}</option>`);
     }
     if (!found) {
-      opts.push(`<option value="${escapeHtml(sel)}" selected>${escapeHtml(agentDisplayName(sel))}</option>`);
+      opts.push(`<option value="${escapeHtml(sel)}" selected>${escapeHtml(sel)} (missing)</option>`);
     }
-    agentSelect.innerHTML = opts.join("");
+    skillSelect.innerHTML = opts.join("");
   }
 
   newBtn.addEventListener("click", () => {
@@ -183,7 +174,7 @@ export function renderTasksTile(tileObj, body) {
     descInput.value = "";
     condInput.value = "";
     workspaceInput.value = "";
-    populateAgentOptions("");
+    populateSkillOptions("");
     taskSchedWidget.clear();
     populateChainOptions(null, []);
     saveBtn.textContent = "Save Task";
@@ -213,15 +204,15 @@ export function renderTasksTile(tileObj, body) {
     const chainNext = chainIds.length ? JSON.stringify(chainIds) : "";
     const conditions = condInput.value.trim();
     const projectPath = workspaceInput.value.trim();
-    const agentId = agentSelect.value;
+    const skill = skillSelect.value;
     try {
       if (editingTaskId) {
         await invoke("update_task", {
-          req: { id: editingTaskId, name, description: descInput.value.trim(), scheduleConfig, nextRun, chainNext, conditions, projectPath, agentId }
+          req: { id: editingTaskId, name, description: descInput.value.trim(), scheduleConfig, nextRun, chainNext, conditions, projectPath, skill }
         });
       } else {
         await invoke("add_task", {
-          req: { name, description: descInput.value.trim(), scheduleConfig, nextRun, chainNext, conditions, projectPath, agentId }
+          req: { name, description: descInput.value.trim(), scheduleConfig, nextRun, chainNext, conditions, projectPath, skill }
         });
       }
       form.classList.remove("visible");
@@ -237,12 +228,6 @@ export function renderTasksTile(tileObj, body) {
     let items;
     try { items = await invoke("get_tasks"); } catch { items = []; }
     allTasks = items;
-    // Agent names on cards resolve through ui.cachedAgents — make sure it's
-    // populated when any task targets a custom agent.
-    if ((!Array.isArray(ui.cachedAgents) || !ui.cachedAgents.length)
-        && items.some(t => field(t, "agentId", "agent_id"))) {
-      try { ui.cachedAgents = await invoke("get_agents"); } catch {}
-    }
     const nameById = new Map(items.map(t => [field(t, "id", "id"), field(t, "name", "name")]));
     const filtered = currentFilter === "all" ? items : items.filter(i => field(i, "status", "status") === currentFilter);
 
@@ -265,7 +250,7 @@ export function renderTasksTile(tileObj, body) {
       const conditions = field(item, "conditions", "conditions") || "";
       const conditionStatus = field(item, "conditionStatus", "condition_status") || "";
       const projectPath = field(item, "projectPath", "project_path") || "";
-      const agentId = field(item, "agentId", "agent_id") || "";
+      const skill = field(item, "skill") || "";
       const result = field(item, "result", "result") || "";
 
       // Build schedule summary for display
@@ -322,7 +307,7 @@ export function renderTasksTile(tileObj, body) {
         ${chainNames.length ? `<div class="task-chain-badge">→ then: ${escapeHtml(chainNames.join(", "))}</div>` : ""}
         ${conditions ? `<div class="task-condition">only if: ${escapeHtml(conditions)}${conditionStatus ? ` <span class="task-condition-status">(${escapeHtml(conditionStatus)})</span>` : ""}</div>` : ""}
         ${projectPath ? `<div class="task-workspace-badge" title="${escapeHtml(projectPath)}">in: ${escapeHtml(pathBasename(projectPath))}</div>` : ""}
-        ${agentId ? `<div class="task-agent-badge">as: ${escapeHtml(agentDisplayName(agentId))}</div>` : ""}
+        ${skill ? `<div class="task-agent-badge">skill: /${escapeHtml(skill)}</div>` : ""}
         <div class="task-actions">
           <button class="task-action-btn" data-action="run" ${status === "running" ? "disabled" : ""}>▶ Run</button>
           ${toggleBtn}
@@ -351,7 +336,7 @@ export function renderTasksTile(tileObj, body) {
         populateChainOptions(id, chainIds);
         condInput.value = conditions;
         workspaceInput.value = projectPath;
-        populateAgentOptions(agentId);
+        populateSkillOptions(skill);
         saveBtn.textContent = "Update Task";
         form.classList.add("visible");
       });

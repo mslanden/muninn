@@ -29,7 +29,7 @@ pub fn get_tasks(state: State<AppState>) -> Result<Vec<TaskRecord>, String> {
                 SELECT id, name, description, schedule, schedule_config, next_run, status,
                        completed_at, result, run_count, triggered_by,
                        chain_next, conditions, condition_status,
-                       project_path, agent_id,
+                       project_path, skill,
                        created_at, updated_at
                 FROM tasks
                 ORDER BY id DESC
@@ -54,7 +54,7 @@ pub fn get_tasks(state: State<AppState>) -> Result<Vec<TaskRecord>, String> {
                     conditions: row.get(12)?,
                     condition_status: row.get(13)?,
                     project_path: row.get(14)?,
-                    agent_id: row.get(15)?,
+                    skill: row.get(15)?,
                     created_at: row.get(16)?,
                     updated_at: row.get(17)?,
                 })
@@ -94,12 +94,12 @@ pub fn add_task(state: State<AppState>, req: TaskCreateRequest) -> Result<bool, 
     }
 
     let project_path = req.project_path.unwrap_or_default().trim().to_string();
-    let agent_id = req.agent_id.unwrap_or_default().trim().to_string();
+    let skill = req.skill.unwrap_or_default().trim().to_string();
 
     with_db(&state, |db| {
         db.execute(
             r#"
-            INSERT INTO tasks (name, description, schedule, schedule_config, next_run, chain_next, conditions, project_path, agent_id, status, updated_at)
+            INSERT INTO tasks (name, description, schedule, schedule_config, next_run, chain_next, conditions, project_path, skill, status, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'scheduled', CURRENT_TIMESTAMP)
             "#,
             params![
@@ -111,7 +111,7 @@ pub fn add_task(state: State<AppState>, req: TaskCreateRequest) -> Result<bool, 
                 req.chain_next.unwrap_or_default(),
                 req.conditions.unwrap_or_default(),
                 project_path,
-                agent_id
+                skill
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -145,7 +145,7 @@ pub fn update_task(state: State<AppState>, req: TaskUpdateRequest) -> Result<boo
     }
 
     let project_path = req.project_path.unwrap_or_default().trim().to_string();
-    let agent_id = req.agent_id.unwrap_or_default().trim().to_string();
+    let skill = req.skill.unwrap_or_default().trim().to_string();
 
     with_db(&state, |db| {
         let changed = db
@@ -160,7 +160,7 @@ pub fn update_task(state: State<AppState>, req: TaskUpdateRequest) -> Result<boo
                     chain_next = ?7,
                     conditions = ?8,
                     project_path = ?9,
-                    agent_id = ?10,
+                    skill = ?10,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?1
                 "#,
@@ -174,7 +174,7 @@ pub fn update_task(state: State<AppState>, req: TaskUpdateRequest) -> Result<boo
                     req.chain_next.unwrap_or_default(),
                     req.conditions.unwrap_or_default(),
                     project_path,
-                    agent_id
+                    skill
                 ],
             )
             .map_err(|e| e.to_string())?;

@@ -1,4 +1,4 @@
-// Sidebar: chats-only panel (session browser + agents shortcuts) with an app
+// Sidebar: chats-only panel (session browser + skill shortcuts) with an app
 // launcher icon rail in the footer. Workspace/model switching lives in the
 // chat composer (chat.js) — the model popover here is opened from there.
 //
@@ -12,7 +12,7 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import {
   sessionList,
   sessionSearchInput,
-  sidebarAgentsList,
+  sidebarSkillsList,
   sidebarAppsRail,
   navSettingsBtn,
   sidebarCollapseBtn,
@@ -86,7 +86,7 @@ function isSecCollapsed(id) {
 function toggleSection(id) {
   localStorage.setItem(SEC_KEY(id), isSecCollapsed(id) ? "0" : "1");
   refreshSessionList();
-  refreshAgentsList();
+  refreshSkillsList();
 }
 
 // ==================== APP RAIL (footer icons) ====================
@@ -117,69 +117,60 @@ function renderAppsRail() {
   }
 }
 
-// ==================== AGENTS (under Chat) ====================
-export async function refreshAgentsList() {
-  if (!sidebarAgentsList) return;
-  let agents = ui.cachedAgents;
-  if (!Array.isArray(agents) || !agents.length) {
+// ==================== SKILLS (under Chat) ====================
+export async function refreshSkillsList() {
+  if (!sidebarSkillsList) return;
+  let skills = ui.cachedSkills;
+  if (!Array.isArray(skills) || !skills.length) {
     try {
-      agents = await invoke("get_agents");
-      ui.cachedAgents = agents;
+      skills = await invoke("list_skills");
+      ui.cachedSkills = skills;
     } catch {
-      agents = [];
+      skills = [];
     }
   }
-  if (!Array.isArray(agents)) agents = [];
+  if (!Array.isArray(skills)) skills = [];
 
-  const enabled = agents.filter((a) => field(a, "enabled", "enabled"));
-  sidebarAgentsList.innerHTML = "";
-
-  const header = sectionHeader("agents", "Agents", enabled.length, {
+  sidebarSkillsList.innerHTML = "";
+  const header = sectionHeader("skills", "Skills", skills.length, {
     icon: "settings",
-    title: "Manage agents",
-    onClick: () => openTileForType("agents"),
+    title: "Manage skills",
+    onClick: () => openTileForType("skills"),
   });
-  makeDragSource(header.querySelector(".section-action"), { type: "agents" });
-  sidebarAgentsList.appendChild(header);
-  if (isSecCollapsed("agents")) return;
+  makeDragSource(header.querySelector(".section-action"), { type: "skills" });
+  sidebarSkillsList.appendChild(header);
+  if (isSecCollapsed("skills")) return;
 
-  if (!enabled.length) {
+  if (!skills.length) {
     const empty = document.createElement("button");
     empty.className = "agent-shortcut agent-shortcut-empty";
-    empty.innerHTML = `${icon("plus", 13)}<span class="agent-shortcut-name">Create an agent</span>`;
-    empty.addEventListener("click", () => openTileForType("agents"));
-    sidebarAgentsList.appendChild(empty);
+    empty.innerHTML = `${icon("plus", 13)}<span class="agent-shortcut-name">Create a skill</span>`;
+    empty.addEventListener("click", () => openTileForType("skills"));
+    sidebarSkillsList.appendChild(empty);
   }
 
-  for (const a of enabled.slice(0, 8)) {
-    const name = field(a, "name", "name") || "Agent";
-    const slash = field(a, "slashCommand", "slash_command") || "";
+  for (const sk of skills.slice(0, 10)) {
+    const name = field(sk, "name");
     const btn = document.createElement("button");
     btn.className = "agent-shortcut";
-    btn.title = slash ? `Run /${slash}` : `Open ${name}`;
+    btn.title = field(sk, "description") || `Run /${name}`;
     btn.innerHTML = `
-      ${icon("bot", 13)}
+      ${icon("sparkles", 13)}
       <span class="agent-shortcut-name">${escapeHtml(name)}</span>
-      ${slash ? `<span class="agent-shortcut-slash">/${escapeHtml(slash)}</span>` : ""}
+      <span class="agent-shortcut-slash">/${escapeHtml(name)}</span>
     `;
-    btn.addEventListener("click", () => {
-      if (slash) {
-        insertAgentSlash(slash);
-      } else {
-        openTileForType("agents");
-      }
-    });
-    sidebarAgentsList.appendChild(btn);
+    btn.addEventListener("click", () => insertSkillSlash(name));
+    sidebarSkillsList.appendChild(btn);
   }
 }
 
-/** Prefill the focused (or newest) chat composer with `/slash ` and focus it. */
-function insertAgentSlash(slash) {
+/** Prefill the focused (or newest) chat composer with `/skill ` and focus it. */
+function insertSkillSlash(slash) {
   const chatTiles = getTilesByType("chat");
   let tile = chatTiles.find((t) => t.id === ui.focusedTileId);
   if (!tile) tile = chatTiles[chatTiles.length - 1];
   if (!tile) {
-    openTileForType("agents");
+    openTileForType("skills");
     return;
   }
   focusTile(tile.id);
@@ -555,7 +546,7 @@ function wirePopoverDismiss() {
 // ==================== PUBLIC ENTRY ====================
 export function updateSidebar() {
   refreshSessionList();
-  refreshAgentsList();
+  refreshSkillsList();
   renderAppsRail();
 }
 

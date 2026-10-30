@@ -716,8 +716,8 @@ export function renderChatTile(tileObj, body) {
       return void doSend();
     }
 
-    // Parse slash commands
-    let agentId = null;
+    // Parse slash commands: `/skill-name request` pins this turn to that skill.
+    let skill = null;
     let message = text;
     let agentName = null;
     if (text.startsWith("/")) {
@@ -727,8 +727,8 @@ export function renderChatTile(tileObj, body) {
           addTurn(chatLog, "muninn", parsed.error);
           return;
         }
-        agentId = field(parsed.agent, "agentId", "agent_id");
-        agentName = field(parsed.agent, "name") || "Agent";
+        skill = parsed.skill;
+        agentName = parsed.skill;
         message = parsed.query;
       }
     }
@@ -748,7 +748,7 @@ export function renderChatTile(tileObj, body) {
       // Provider + model are deliberately omitted: the backend reads the saved
       // llm/provider + llm/model, so the request can never disagree with Settings.
       const req = { sessionId: stream.sessionId, message };
-      if (agentId) req.agentId = agentId;
+      if (skill) req.skill = skill;
       if (attachments.length) req.attachments = attachments.map(a => ({ mediaType: a.mediaType, data: a.data }));
       await invoke("chat", { req });
 
@@ -796,10 +796,9 @@ export function renderChatTile(tileObj, body) {
       { slash: "stop", name: "Stop", desc: "Cancel in-flight generation" },
       { slash: "init", name: "Init Project", desc: "Explore and index current project" }
     ];
-    const agentItems = ui.cachedAgents
-      .filter(a => field(a, "enabled") !== false && field(a, "slashCommand", "slash_command"))
-      .map(a => ({ slash: field(a, "slashCommand", "slash_command"), name: field(a, "name"), desc: field(a, "description") || "" }));
-    const all = [...builtins, ...agentItems].filter(c => c.slash.toLowerCase().startsWith(partial));
+    const skillItems = (Array.isArray(ui.cachedSkills) ? ui.cachedSkills : [])
+      .map(sk => ({ slash: field(sk, "name"), name: "Skill", desc: field(sk, "description") || "" }));
+    const all = [...builtins, ...skillItems].filter(c => c.slash.toLowerCase().startsWith(partial));
     if (!all.length) { slashPicker.classList.add("hidden"); slashPickerIdx = -1; return; }
     slashPickerIdx = Math.max(0, Math.min(slashPickerIdx, all.length - 1));
     slashPicker.innerHTML = all.map((c, i) =>
@@ -1155,7 +1154,7 @@ export function showChatWelcome(chatLog) {
   el.innerHTML = `
     ${ravenLogo(64)}
     <div class="chat-welcome-brand">MUNINN</div>
-    <p class="chat-welcome-lead">Ask anything — Muninn can use tools, see screenshots, and run agents with <kbd>/</kbd></p>
+    <p class="chat-welcome-lead">Ask anything — Muninn can use tools, see screenshots, and run skills with <kbd>/</kbd></p>
   `;
   chatLog.appendChild(el);
 }
@@ -1284,11 +1283,10 @@ export function parseSlashCommand(text) {
   if (!match) return null;
   const command = match[1].toLowerCase();
   const query = match[2].trim();
-  const agent = ui.cachedAgents.find(
-    a => (field(a, "slashCommand", "slash_command") || "").toLowerCase() === command && field(a, "enabled") !== false
-  );
-  if (!agent) return { error: `Unknown command /${command}` };
-  return { agent, query: query || text };
+  const skills = Array.isArray(ui.cachedSkills) ? ui.cachedSkills : [];
+  const skill = skills.find(sk => String(field(sk, "name")).toLowerCase() === command);
+  if (!skill) return { error: `Unknown command /${command} — no skill by that name` };
+  return { skill: field(skill, "name"), query: query || text };
 }
 
 export const CONTEXT_WINDOW = 1000000;

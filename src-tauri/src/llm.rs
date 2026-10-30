@@ -1687,11 +1687,6 @@ pub(crate) async fn generate_compilation_specs(
 }
 
 /// Build the general (non-project) system prompt, including the memory index.
-/// Used by the custom-agent path, which is always user-invoked → interactive = true.
-pub(crate) fn build_system_prompt(state: &AppState) -> String {
-    build_system_prompt_with_context(state, true)
-}
-
 pub(crate) fn build_system_prompt_with_context(
     state: &AppState,
     interactive: bool,
@@ -1913,6 +1908,7 @@ buttons; otherwise it's free-text.",
     // Long-term memory: the user's own profile settings, the pinned about-me note,
     // and a capped index of the model-managed notes (see memory.rs).
     prompt.push_str(&crate::memory::prompt_section(state, enabled.contains("memory")));
+    prompt.push_str(&crate::skills::prompt_section(state, enabled.contains("skill")));
 
     // Registered projects summaries
     let projects: Vec<(String, String, String)> = with_db(state, |db| {
@@ -2087,6 +2083,7 @@ question per session; call blocks until answered, 10-minute timeout.",
     }
 
     prompt.push_str(&crate::memory::prompt_section(state, enabled.contains("memory")));
+    prompt.push_str(&crate::skills::prompt_section(state, enabled.contains("skill")));
 
     if !agents_md.is_empty() {
         prompt.push_str(&format!("\n\n## Project Description (AGENTS.md)\n{}", agents_md));
@@ -2528,7 +2525,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "chain_next": {"type": "array", "items": {"type": "integer"}, "description": "Optional task ids to run after this one finishes successfully. Each downstream task fires on the next scheduler tick with this task's full output prepended to its prompt. Build workflows by creating the downstream tasks first (no schedule), then referencing their ids here."},
                     "conditions": {"type": "string", "description": "Optional natural-language gate. When this task is fired by an upstream task in a chain, it runs only if this condition holds for the upstream output — e.g. 'only if there are unread emails'. Ignored for the task's own scheduled runs."},
                     "project_path": {"type": "string", "description": "Optional absolute folder path; the task run's file/shell tools are scoped to this folder (its workspace). Must be an existing directory. Omit to run in the default workspace root."},
-                    "agent_id": {"type": "string", "description": "Optional custom agent (id or unique name, from list_agents) to run this task through — the run uses that agent's system prompt and tool allowlist instead of the default Muninn persona. Must exist and be enabled."}
+                    "skill": {"type": "string", "description": "Optional skill name to run this task with — the run follows that skill's instructions (and its allowed-tools, if any). Must exist."}
                 },
                 "required": ["name", "description"]
             }),
@@ -2561,7 +2558,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "chain_next": {"type": "array", "items": {"type": "integer"}, "description": "Task ids to run after this one succeeds (replaces the existing chain). Pass an empty array to clear."},
                     "conditions": {"type": "string", "description": "Natural-language gate for chain-triggered runs (replaces existing). Pass an empty string to clear."},
                     "project_path": {"type": "string", "description": "Absolute folder path to scope the task run's file/shell tools to (must be an existing directory). Pass an empty string to clear (run in the default workspace root)."},
-                    "agent_id": {"type": "string", "description": "Custom agent (id or unique name) to run this task through. Pass an empty string to clear (run as default Muninn)."},
+                    "skill": {"type": "string", "description": "Skill name to run this task with. Pass an empty string to clear (run as default Muninn)."},
                     "status": {"type": "string", "description": "scheduled, completed, or paused (running/failed are engine-managed and can't be set)"}
                 },
                 "required": ["id"]
@@ -2594,78 +2591,36 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
             }),
         ));
     }
-    if enabled.contains("list_agents") {
+    if enabled.contains("skill") {
         defs.push((
-            "list_agents",
-            "List the custom agents: id, name, description, enabled, tool allowlist, and a system-prompt preview. Use before call_agent, update_agent, delete_agent, or targeting an agent from a task.",
-            json!({
-                "type": "object",
-                "properties": {}
-            }),
-        ));
-    }
-    if enabled.contains("create_agent") {
-        defs.push((
-            "create_agent",
-            "Create a reusable custom agent: a named persona with its own system prompt. Use for specialist roles you (or scheduled tasks) will invoke repeatedly — e.g. a code reviewer, a news summarizer. By default the agent gets the full toolset. After creating, invoke it with call_agent or attach it to a task via agent_id.",
+            "skill",
+            "Skills are reusable instruction packs for specific kinds of work (listed in the system prompt). Actions: `list`; `load` (name) — read a skill's full instructions before doing work it covers; `read_file` (name, path) — read a reference file inside the skill folder; `create` (name, description, content, optional allowed_tools) / `update` (name + fields to change) / `delete` (name) — these change future behaviour, so the user is asked to approve each one (refused in background runs). The description is how a skill gets picked: say concretely what it's for and when to use it.",
             json!({
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Unique agent name, e.g. 'Code Reviewer'."},
-                    "system_prompt": {"type": "string", "description": "The agent's role and working instructions. Written as a system prompt: who it is, how it should approach tasks, what its output should look like."},
-                    "description": {"type": "string", "description": "One-line summary shown in the Agents panel."},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "OMIT this (the default) so the agent can use all enabled tools — a missing tool breaks the agent, and the system prompt already shapes its behavior. Only pass a list when the user explicitly asks to restrict the agent; ids are validated against the tools registry."},
-                    "max_iterations": {"type": "integer", "description": "Iteration budget hint (1-100, default 5)."},
-                    "slash_command": {"type": "string", "description": "Optional slash command (without the /) to invoke it from chat."}
+                    "action": {"type": "string", "enum": ["list", "load", "read_file", "create", "update", "delete"]},
+                    "name": {"type": "string", "description": "Skill name, e.g. 'email-triage' (lowercase letters, digits, '-', '_')."},
+                    "path": {"type": "string", "description": "File path relative to the skill folder (read_file)."},
+                    "description": {"type": "string", "description": "One or two sentences: what the skill does and when to use it (create/update)."},
+                    "content": {"type": "string", "description": "The skill's markdown instructions (create/update)."},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional. Restrict runs pinned to this skill to these tool ids. Omit unless the user asks — the default is all enabled tools."}
                 },
-                "required": ["name", "system_prompt"]
+                "required": ["action"]
             }),
         ));
     }
-    if enabled.contains("update_agent") {
+    if enabled.contains("subagent") {
         defs.push((
-            "update_agent",
-            "Edit an existing custom agent. Supply the agent (id or name) and any fields to change; omitted fields are left as-is. Set enabled: false to disable without deleting.",
+            "subagent",
+            "Delegate a self-contained task to a subagent and get its final report back as this tool's result. Subagents run autonomously in their own context (they can't see this chat or ask the user anything; dangerous commands are blocked; they can't start subagents themselves; max 50 tool steps). Call this several times in the SAME turn to run independent tasks in parallel — e.g. research three topics at once, or review several files. Use it for focused work that would otherwise flood this conversation with tool output; do simple things yourself.",
             json!({
                 "type": "object",
                 "properties": {
-                    "agent": {"type": "string", "description": "Agent id or unique name (from list_agents)."},
-                    "name": {"type": "string"},
-                    "system_prompt": {"type": "string"},
-                    "description": {"type": "string"},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Replaces the allowlist. Pass [] to allow all enabled tools."},
-                    "max_iterations": {"type": "integer"},
-                    "slash_command": {"type": "string"},
-                    "enabled": {"type": "boolean"}
+                    "description": {"type": "string", "description": "Short label for the task (3-6 words), shown in the UI."},
+                    "prompt": {"type": "string", "description": "The full brief. Self-contained: goal, relevant context, constraints, and what the report should contain — the subagent sees nothing else."},
+                    "skill": {"type": "string", "description": "Optional skill name to pin the subagent to."}
                 },
-                "required": ["agent"]
-            }),
-        ));
-    }
-    if enabled.contains("delete_agent") {
-        defs.push((
-            "delete_agent",
-            "Delete a custom agent by id or name. Tasks still targeting it will fail until reassigned — the result warns you if any exist.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "agent": {"type": "string", "description": "Agent id or unique name (from list_agents)."}
-                },
-                "required": ["agent"]
-            }),
-        ));
-    }
-    if enabled.contains("call_agent") {
-        defs.push((
-            "call_agent",
-            "Delegate a sub-task to a custom agent and get its final answer back as this tool's result. The agent runs autonomously with its own system prompt and tool allowlist in the current workspace: it cannot ask the user questions, dangerous shell commands are blocked, and it cannot delegate further. The call waits for the agent to finish — use it for focused sub-tasks ('review this diff', 'research X and summarize'), not open-ended work. The prompt must be self-contained: the agent sees none of this conversation.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "agent": {"type": "string", "description": "Agent id or unique name (from list_agents)."},
-                    "prompt": {"type": "string", "description": "The task for the agent. Self-contained and specific — include any context it needs, since it cannot see this chat."}
-                },
-                "required": ["agent", "prompt"]
+                "required": ["description", "prompt"]
             }),
         ));
     }
@@ -3333,11 +3288,57 @@ fn resolve_chat_system_prompt(
     }
 }
 
-/// The shared streaming chat/agent loop: request a turn, stream tokens to the UI,
-/// execute any tool calls, persist hidden tool-round turns, and repeat until the model
-/// produces a plain text reply. Used by both providers, for both regular chat and
-/// custom agents (agents pass `agent_name` to drive the agent-iteration UI event).
+/// Split a round's tool calls into execution groups: each run of consecutive
+/// `subagent` calls becomes one parallel group; every other call is its own group.
+fn group_parallel_calls<'a>(names: impl Iterator<Item = &'a str>) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut prev_parallel = false;
+    for (i, name) in names.enumerate() {
+        let parallel = name == "subagent";
+        match groups.last_mut() {
+            Some(g) if parallel && prev_parallel => g.push(i),
+            _ => groups.push(vec![i]),
+        }
+        prev_parallel = parallel;
+    }
+    groups
+}
+
+/// Run one model tool call, turning unparseable argument JSON into an actionable error.
 #[allow(clippy::too_many_arguments)]
+async fn execute_tool_call_checked(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    exec_tools: &HashSet<String>,
+    call: &ToolCall,
+    scope: Option<&WorkspaceScope>,
+    interactive: bool,
+    max_tokens: u64,
+) -> String {
+    match serde_json::from_str::<Value>(&call.args) {
+        Ok(args_json) => {
+            execute_and_log_tool_call(
+                app, state, session_id, exec_tools, &call.name, &args_json, &call.args, scope, interactive,
+            )
+            .await
+        }
+        // Unparseable argument JSON almost always means the response hit the
+        // output-token ceiling mid tool_use, leaving the accumulated JSON
+        // unterminated. Feed back an honest, actionable error instead of
+        // silently calling the tool with `{}` (which surfaces as a misleading
+        // "missing path"/"missing command" and sends the model chasing a
+        // phantom parameter bug).
+        Err(e) => format!(
+            "ERROR: tool '{}' arguments were not valid JSON ({}). They were most \
+             likely truncated because the response reached the {}-token output \
+             limit. Retry with shorter content — e.g. write the file in smaller \
+             chunks, or raise the limit via the llm/max_tokens setting.",
+            call.name, e, max_tokens
+        ),
+    }
+}
+
 /// Emit the lifecycle events for a single tool call, execute it, log the result, and
 /// return the string to feed back to the model. On error the returned string is
 /// prefixed with `Tool error:`. Shared by the native-tool-call and the
@@ -3496,6 +3497,12 @@ fn provider_or_fallback(
     }
 }
 
+/// The shared streaming tool loop: request a turn, stream tokens to the UI, execute any
+/// tool calls, persist hidden tool-round turns, and repeat until the model produces a
+/// plain text reply. Used by both providers for regular chat, skill turns (which pass
+/// `agent_name` to drive the agent-iteration UI event) and subagents (which pass
+/// `max_rounds` to cap their tool rounds).
+#[allow(clippy::too_many_arguments)]
 async fn run_tool_loop(
     app: &AppHandle,
     state: &AppState,
@@ -3508,6 +3515,7 @@ async fn run_tool_loop(
     scope: Option<&WorkspaceScope>,
     interactive: bool,
     agent_name: Option<&str>,
+    max_rounds: Option<u32>,
 ) -> Result<(String, Vec<Value>), String> {
     // Failover can swap these mid-turn, so the loop works on owned copies.
     let mut provider = provider.clone();
@@ -3521,11 +3529,23 @@ async fn run_tool_loop(
     let mut tool_round: u32 = 0;
     let mut iteration: i64 = 0;
     let mut fallback_tried = false;
+    // Text the model wrote alongside its latest tool calls — reported if a step
+    // limit (subagents) ends the run before a final answer.
+    let mut last_text = String::new();
 
     loop {
         if check_stop_requested(state, session_id) {
             let _ = app.emit("chat-done", ChatDoneEvent { session_id: session_id.to_string() });
             let msg = STOPPED_BY_USER_SENTINEL.to_string();
+            return Ok((msg.clone(), vec![json!({"type": "text", "text": msg})]));
+        }
+
+        if let Some(max) = max_rounds.filter(|m| tool_round >= *m) {
+            let msg = format!(
+                "[Stopped after reaching the {}-step limit before finishing.]{}",
+                max,
+                if last_text.trim().is_empty() { String::new() } else { format!("\nLatest notes: {}", last_text.trim()) }
+            );
             return Ok((msg.clone(), vec![json!({"type": "text", "text": msg})]));
         }
 
@@ -3625,34 +3645,36 @@ async fn run_tool_loop(
             }
             let _ = insert_message(state, session_id, "assistant", &outcome.text, &assistant_blocks, true);
 
-            let mut tool_result_blocks: Vec<Value> = Vec::new();
-            for call in &outcome.tool_calls {
-                let output = match serde_json::from_str::<Value>(&call.args) {
-                    Ok(args_json) => {
-                        execute_and_log_tool_call(
-                            app, state, session_id, exec_tools, &call.name, &args_json, &call.args, scope, interactive,
+            last_text = outcome.text.clone();
+            // Execute. Consecutive `subagent` calls run concurrently (each in its own
+            // isolated sub-session); every other tool runs in order, one at a time.
+            let calls = &outcome.tool_calls;
+            let mut results: Vec<(String, Vec<(String, String)>)> = Vec::with_capacity(calls.len());
+            for group in group_parallel_calls(calls.iter().map(|c| c.name.as_str())) {
+                if group.len() > 1 {
+                    let outs = futures::future::join_all(group.iter().map(|&k| {
+                        execute_tool_call_checked(
+                            app, state, session_id, exec_tools, &calls[k], scope, interactive, max_tokens,
                         )
-                        .await
-                    }
-                    // Unparseable argument JSON almost always means the response hit the
-                    // output-token ceiling mid tool_use, leaving the accumulated JSON
-                    // unterminated. Feed back an honest, actionable error instead of
-                    // silently calling the tool with `{}` (which surfaces as a misleading
-                    // "missing path"/"missing command" and sends the model chasing a
-                    // phantom parameter bug).
-                    Err(e) => format!(
-                        "ERROR: tool '{}' arguments were not valid JSON ({}). They were most \
-                         likely truncated because the response reached the {}-token output \
-                         limit. Retry with shorter content — e.g. write the file in smaller \
-                         chunks, or raise the limit via the llm/max_tokens setting.",
-                        call.name, e, max_tokens
-                    ),
-                };
-                // A tool (capture_screen) may have produced images to show the model. Attach
-                // them as sibling image blocks in the tool_result turn so the vision model
-                // sees them this turn; persist only a text placeholder so reloaded history
-                // doesn't carry the (large) base64 forever.
-                let images = drain_captured_images(state, session_id);
+                    }))
+                    .await;
+                    results.extend(outs.into_iter().map(|o| (o, Vec::new())));
+                } else {
+                    let out = execute_tool_call_checked(
+                        app, state, session_id, exec_tools, &calls[group[0]], scope, interactive, max_tokens,
+                    )
+                    .await;
+                    // A tool (capture_screen) may have produced images for the model; they
+                    // belong to the call that just ran, so drain right after it.
+                    results.push((out, drain_captured_images(state, session_id)));
+                }
+            }
+
+            let mut tool_result_blocks: Vec<Value> = Vec::new();
+            for (call, (output, images)) in calls.iter().zip(results) {
+                // Attach captured images as sibling image blocks in the tool_result turn so
+                // the vision model sees them this turn; persist only a text placeholder so
+                // reloaded history doesn't carry the (large) base64 forever.
                 if images.is_empty() {
                     provider.push_tool_result(&mut messages, &call.id, &output);
                     tool_result_blocks.push(json!({
@@ -3743,7 +3765,7 @@ pub(crate) async fn chat_with_openai(
     let system_prompt = resolve_chat_system_prompt(state, scope, interactive);
     run_tool_loop(
         app, state, session_id, &provider, &model, &system_prompt,
-        history, &enabled_tools, scope, interactive, None,
+        history, &enabled_tools, scope, interactive, None, None,
     )
     .await
 }
@@ -3763,7 +3785,7 @@ pub(crate) async fn chat_with_minimax_anthropic(
     let system_prompt = resolve_chat_system_prompt(state, scope, interactive);
     run_tool_loop(
         app, state, session_id, &provider, &model, &system_prompt,
-        history, &enabled_tools, scope, interactive, None,
+        history, &enabled_tools, scope, interactive, None, None,
     )
     .await
 }
@@ -3788,77 +3810,14 @@ pub(crate) async fn chat_dynamic(
     let system_prompt = resolve_chat_system_prompt(state, scope, interactive);
     run_tool_loop(
         app, state, session_id, &provider, &model, &system_prompt,
-        history, &enabled_tools, scope, interactive, None,
+        history, &enabled_tools, scope, interactive, None, None,
     )
     .await
 }
 
-pub(crate) fn load_agent_by_id(state: &AppState, agent_id: &str) -> Result<crate::models::AgentRecord, String> {
-    use rusqlite::params;
-    with_db(state, |db| {
-        db.query_row(
-            "SELECT agent_id, name, description, slash_command, system_prompt, max_iterations, enabled, allowed_tools_json, created_at, updated_at FROM agents WHERE agent_id = ?1",
-            params![agent_id],
-            |row| {
-                Ok(crate::models::AgentRecord {
-                    agent_id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    slash_command: row.get(3)?,
-                    system_prompt: row.get(4)?,
-                    max_iterations: row.get(5)?,
-                    enabled: row.get::<_, i64>(6)? == 1,
-                    allowed_tools_json: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                })
-            },
-        )
-        .map_err(|e| format!("agent not found: {}", e))
-    })
-}
-
-pub(crate) async fn run_agent(
-    app: &AppHandle,
-    state: &AppState,
-    session_id: &str,
-    agent_id: &str,
-    history: &[HistoryMessage],
-    scope: Option<&WorkspaceScope>,
-    interactive: bool,
-) -> Result<(String, Vec<Value>), String> {
-    let agent = load_agent_by_id(state, agent_id)?;
-    if !agent.enabled {
-        return Err(format!("Agent '{}' is disabled", agent.name));
-    }
-
-    // Build agent-specific system prompt: agent's own prompt + memory context
-    let memory_ctx = build_system_prompt(state);
-    let agent_system = if agent.system_prompt.is_empty() {
-        memory_ctx
-    } else {
-        format!("{}\n\n{}", agent.system_prompt, memory_ctx)
-    };
-
-    // Parse allowed tools from agent config
-    let allowed_tools: HashSet<String> = {
-        let parsed: Vec<String> = serde_json::from_str(&agent.allowed_tools_json).unwrap_or_default();
-        if parsed.is_empty() {
-            // If no tools specified, use all enabled tools
-            enabled_tool_ids(state)?
-        } else {
-            let enabled = enabled_tool_ids(state)?;
-            let mut allowed: HashSet<String> = parsed.into_iter().filter(|t| enabled.contains(t)).collect();
-            // Memory is shared context about the user, not a capability: every agent
-            // gets it (when enabled) so it matches the memory section of its prompt.
-            if enabled.contains("memory") {
-                allowed.insert("memory".to_string());
-            }
-            allowed
-        }
-    };
-
-    // Determine provider/model
+/// The configured chat provider + model (with `llm/fallback_provider` failover), as
+/// used by skill turns and subagents.
+fn resolve_configured_provider(state: &AppState) -> Result<(Provider, String), String> {
     let provider_name =
         get_app_setting_value(state, "llm/provider")?.unwrap_or_else(|| "minimax".to_string());
     let model = get_app_setting_value(state, "llm/model")?
@@ -3870,22 +3829,81 @@ pub(crate) async fn run_agent(
                 "gpt-4.1-mini".to_string()
             }
         });
-
     let primary = if provider_name == "minimax" || model.starts_with("MiniMax-") {
         Provider::minimax_anthropic(state)
     } else {
         Provider::from_provider_name(state, &provider_name)
     };
-    let (provider, model) = provider_or_fallback(state, primary, &model)?;
+    provider_or_fallback(state, primary, &model)
+}
 
-    // Chat-invoked agents pass scope: None, interactive: true (the previous hardcoded
-    // behavior). Scheduled task runs pass the task's workspace scope and
-    // interactive: false so dangerous commands are hard-blocked with no user to ask.
+/// One turn pinned to a skill — the user's `/name` in chat, or a task with a skill.
+/// The normal (project-aware) system prompt plus the skill's instructions; the
+/// skill's `allowed-tools`, if any, narrow the toolset.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_skill_turn(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    skill_name: &str,
+    history: &[HistoryMessage],
+    scope: Option<&WorkspaceScope>,
+    interactive: bool,
+) -> Result<(String, Vec<Value>), String> {
+    let skill = crate::skills::load_skill(&state.skills_dir, skill_name)?;
+    let system_prompt = format!(
+        "{}{}",
+        resolve_chat_system_prompt(state, scope, interactive),
+        crate::skills::active_skill_section(&skill)
+    );
+    let tools = crate::skills::restrict_tools(&enabled_tool_ids(state)?, Some(&skill));
+    let (provider, model) = resolve_configured_provider(state)?;
     run_tool_loop(
-        app, state, session_id, &provider, &model, &agent_system,
-        history, &allowed_tools, scope, interactive, Some(&agent.name),
+        app, state, session_id, &provider, &model, &system_prompt,
+        history, &tools, scope, interactive, Some(&skill.meta.name), None,
     )
     .await
+}
+
+/// Tool rounds a subagent may take before it must stop and report.
+pub(crate) const SUBAGENT_MAX_ROUNDS: u32 = 50;
+
+const SUBAGENT_PREAMBLE: &str = "\n\n## You are a subagent\nAnother Muninn session delegated \
+a self-contained task to you. Nobody can answer questions mid-task, so make reasonable \
+assumptions and note them. Work autonomously with your tools, then finish with a concise \
+report: what you found or did, key details (paths, numbers, sources), and anything left \
+unresolved. Your final message is the only thing the delegating session sees.";
+
+/// Run a delegated task to completion in its own sub-session and return the final
+/// report. Autonomous (no ask_user, dangerous commands blocked), cannot spawn further
+/// subagents, and is capped at SUBAGENT_MAX_ROUNDS tool rounds.
+pub(crate) async fn run_subagent(
+    app: &AppHandle,
+    state: &AppState,
+    sub_session_id: &str,
+    brief: &str,
+    skill_name: Option<&str>,
+    scope: &WorkspaceScope,
+) -> Result<String, String> {
+    let skill = match skill_name {
+        Some(n) => Some(crate::skills::load_skill(&state.skills_dir, n)?),
+        None => None,
+    };
+    let mut system_prompt = build_system_prompt_with_context(state, false);
+    system_prompt.push_str(SUBAGENT_PREAMBLE);
+    if let Some(s) = &skill {
+        system_prompt.push_str(&crate::skills::active_skill_section(s));
+    }
+    let mut tools = crate::skills::restrict_tools(&enabled_tool_ids(state)?, skill.as_ref());
+    tools.remove("subagent");
+    let (provider, model) = resolve_configured_provider(state)?;
+    let history = vec![HistoryMessage::text("user", brief)];
+    let (text, _blocks) = run_tool_loop(
+        app, state, sub_session_id, &provider, &model, &system_prompt,
+        &history, &tools, Some(scope), false, None, Some(SUBAGENT_MAX_ROUNDS),
+    )
+    .await?;
+    Ok(text)
 }
 
 /// The `/init` project analyzer: explores a project with read-only tools and returns the
@@ -3950,7 +3968,7 @@ pub(crate) async fn run_project_init(
 
     let (text, _blocks) = run_tool_loop(
         app, state, session_id, &provider, &model, &system_prompt,
-        &history, &init_tools, Some(scope), false, None,
+        &history, &init_tools, Some(scope), false, None, None,
     )
     .await?;
 
@@ -3960,6 +3978,20 @@ pub(crate) async fn run_project_init(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consecutive_subagent_calls_group_for_parallel_execution() {
+        let g = |names: &[&str]| group_parallel_calls(names.iter().copied());
+        assert_eq!(g(&[]), Vec::<Vec<usize>>::new());
+        assert_eq!(g(&["subagent", "subagent", "subagent"]), vec![vec![0, 1, 2]]);
+        assert_eq!(g(&["read_file", "write_file"]), vec![vec![0], vec![1]]);
+        // A non-subagent call splits runs; order is preserved.
+        assert_eq!(
+            g(&["subagent", "subagent", "read_file", "subagent", "subagent"]),
+            vec![vec![0, 1], vec![2], vec![3, 4]]
+        );
+        assert_eq!(g(&["read_file", "subagent"]), vec![vec![0], vec![1]]);
+    }
 
     #[test]
     fn condition_verdict_is_affirmative_only_and_fails_closed() {

@@ -8,7 +8,7 @@ import { renderTasksTile } from "./tasks.js";
 import { renderContentTile } from "./content.js";
 import { isDarkTheme, applyTheme } from "./theme.js";
 import { renderSettingsTile, refreshSettingsModalIfOpen } from "./settings.js";
-import { renderAgentsTile } from "./agents.js";
+import { onSkillsChanged } from "./skills.js";
 
 // ==================== TAURI EVENT LISTENERS ====================
 export async function setupEventListeners() {
@@ -313,15 +313,10 @@ export async function setupEventListeners() {
     }
   });
 
-  await listen("agents-changed", async () => {
-    // The agent created/edited/deleted a custom agent via tools — refresh the cache
-    // (slash commands, task agent pickers) and any open Agents tiles.
-    try { ui.cachedAgents = await invoke("get_agents"); } catch { /* keep old cache */ }
-    const agentTiles = getTilesByType("agents");
-    for (const t of agentTiles) {
-      const body = t.el.querySelector(".tile-body");
-      if (body) renderAgentsTile(t, body);
-    }
+  await listen("skills-changed", () => {
+    // A skill was created/edited/deleted (Muninn's skill tool or the Skills tile) —
+    // refresh the cache behind slash commands + task pickers, the sidebar, and tiles.
+    onSkillsChanged();
   });
 
   await listen("settings-updated", async () => {

@@ -15,7 +15,7 @@ export const TILE_TYPES = [
   { type: "feeds",      label: "Feeds",      dot: "amber" },
   { type: "web",        label: "Web",        dot: "blue"  },
   { type: "tasks",      label: "Tasks",      dot: "blue"  },
-  { type: "agents",     label: "Agents",     dot: "blue"  },
+  { type: "skills",     label: "Skills",     dot: "blue"  },
   { type: "memory",     label: "Memory",     dot: "purple" },
   { type: "content",    label: "Content",    dot: "off"   },
   { type: "studio",     label: "Studio",     dot: "green" },

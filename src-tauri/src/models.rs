@@ -220,8 +220,8 @@ pub struct TaskRecord {
     pub condition_status: String,
     /// Absolute folder the task's file/shell tools are scoped to ('' = default workspace).
     pub project_path: String,
-    /// Custom agent to run the task with ('' = plain provider chat).
-    pub agent_id: String,
+    /// Skill to run the task with ('' = plain provider chat).
+    pub skill: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -238,20 +238,6 @@ pub struct TaskRun {
     pub note: String,
     pub started_at: String,
     pub finished_at: String,
-}
-
-#[derive(Serialize)]
-pub struct AgentRecord {
-    pub agent_id: String,
-    pub name: String,
-    pub description: String,
-    pub slash_command: String,
-    pub system_prompt: String,
-    pub max_iterations: i64,
-    pub enabled: bool,
-    pub allowed_tools_json: String,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 #[derive(Serialize)]
@@ -332,7 +318,8 @@ pub struct ChatRequest {
     pub message: String,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub agent_id: Option<String>,
+    /// Skill to pin this turn to (the user's `/name` slash command).
+    pub skill: Option<String>,
     /// Optional images shared with the turn (screenshots, etc.), sent to vision-capable
     /// models as Anthropic image content blocks.
     pub attachments: Option<Vec<ChatAttachment>>,
@@ -395,8 +382,8 @@ pub struct TaskCreateRequest {
     pub conditions: Option<String>,
     /// Absolute folder to scope the run's file/shell tools to (empty = default workspace).
     pub project_path: Option<String>,
-    /// Custom agent (agents.agent_id) to run the task with (empty = plain provider chat).
-    pub agent_id: Option<String>,
+    /// Skill name to run the task with (empty = plain provider chat).
+    pub skill: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -414,8 +401,8 @@ pub struct TaskUpdateRequest {
     pub conditions: Option<String>,
     /// Absolute folder to scope the run's file/shell tools to (empty = default workspace).
     pub project_path: Option<String>,
-    /// Custom agent (agents.agent_id) to run the task with (empty = plain provider chat).
-    pub agent_id: Option<String>,
+    /// Skill name to run the task with (empty = plain provider chat).
+    pub skill: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -429,44 +416,6 @@ pub struct TaskStatusRequest {
 #[serde(rename_all = "camelCase")]
 pub struct TaskIdRequest {
     pub id: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentCreateRequest {
-    pub name: String,
-    pub description: Option<String>,
-    pub slash_command: Option<String>,
-    pub system_prompt: Option<String>,
-    pub max_iterations: Option<i64>,
-    pub enabled: Option<bool>,
-    pub allowed_tools: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentUpdateRequest {
-    pub agent_id: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub slash_command: Option<String>,
-    pub system_prompt: Option<String>,
-    pub max_iterations: Option<i64>,
-    pub enabled: Option<bool>,
-    pub allowed_tools: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentToggleRequest {
-    pub agent_id: String,
-    pub enabled: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentIdRequest {
-    pub agent_id: String,
 }
 
 #[derive(Deserialize)]

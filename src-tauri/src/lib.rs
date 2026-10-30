@@ -14,6 +14,7 @@ mod models;
 mod notify_user;
 mod scheduler;
 mod screen;
+mod skills;
 mod search;
 mod todos;
 mod tools;
@@ -53,6 +54,8 @@ pub struct AppState {
     pub captured_images: Mutex<HashMap<String, Vec<(String, String)>>>,
     /// Folder of model-managed memory notes (`app_data_dir()/memory`). See memory.rs.
     pub memory_dir: PathBuf,
+    /// Folder of skills (`app_data_dir()/skills/<name>/SKILL.md`). See skills.rs.
+    pub skills_dir: PathBuf,
 }
 
 /// Show/hide the frameless quick-ask overlay (created on first use). Lives at
@@ -157,6 +160,7 @@ pub fn run() {
                 mcp: mcp::McpManager::default(),
                 captured_images: Mutex::new(HashMap::new()),
                 memory_dir: data_dir.join("memory"),
+                skills_dir: data_dir.join("skills"),
             });
 
             // Plugins
@@ -320,11 +324,11 @@ pub fn run() {
             commands::run_task_now,
             commands::get_task_runs,
             commands::remove_task,
-            commands::get_agents,
-            commands::add_agent,
-            commands::update_agent,
-            commands::set_agent_enabled,
-            commands::remove_agent,
+            commands::list_skills,
+            commands::read_skill,
+            commands::save_skill,
+            commands::delete_skill,
+            commands::open_skills_folder,
             commands::get_app_settings,
             commands::set_app_settings,
             commands::fetch_models,

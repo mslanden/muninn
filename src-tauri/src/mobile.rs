@@ -528,7 +528,7 @@ async fn api_chat(
         message,
         provider: None,
         model: None,
-        agent_id: None,
+        skill: None,
         attachments,
     };
     // Long-running; the phone streams tokens over WS. HTTP returns the final reply.

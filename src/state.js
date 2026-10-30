@@ -3,7 +3,7 @@
 export const workspace = document.getElementById("workspace");
 export const sessionList = document.getElementById("session-list");
 export const sessionSearchInput = document.getElementById("session-search-input");
-export const sidebarAgentsList = document.getElementById("sidebar-agents-list");
+export const sidebarSkillsList = document.getElementById("sidebar-skills-list");
 export const sidebarAppsRail = document.getElementById("sidebar-apps-rail");
 export const newChatBtn = document.getElementById("new-chat-btn");
 export const navSettingsBtn = document.getElementById("nav-settings");
@@ -24,6 +24,6 @@ export const ui = {
   nextTileId: 1,
   focusedTileId: null,
   loadedSettings: {},
-  cachedAgents: [],
+  cachedSkills: [],
   mapboxToken: null, // loaded from settings on init
 };

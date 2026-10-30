@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -211,9 +211,37 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 9)?;
     }
 
+    if version < 10 {
+        // Agents → skills: tasks target a skill by name instead of an agent id, and the
+        // five agent tools are replaced by `skill` + `subagent` (seeded in init_db).
+        // The agents table and tasks.agent_id stay in place, unused. Both tables are
+        // optional here: the legacy-DB migration tests run on minimal schemas.
+        let has_table = |name: &str| -> Result<bool, String> {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|r| r.is_some())
+            .map_err(|e| e.to_string())
+        };
+        if has_table("tasks")? {
+            exec_migration(conn, "ALTER TABLE tasks ADD COLUMN skill TEXT NOT NULL DEFAULT ''")?;
+        }
+        if has_table("tools")? {
+            conn.execute(
+                "DELETE FROM tools WHERE tool_id IN ('list_agents','create_agent','update_agent','delete_agent','call_agent')",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        set_schema_version(conn, 10)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 9, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 10, "add a migration block for the new version");
 
     Ok(())
 }
@@ -646,33 +674,15 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             "clock",
         ),
         (
-            "list_agents",
-            "List Agents",
-            "List custom agents with their tool allowlists and prompts.",
-            "bot",
+            "skill",
+            "Skills",
+            "Load reusable instruction packs on demand; create/edit them with your approval.",
+            "sparkles",
         ),
         (
-            "create_agent",
-            "Create Agent",
-            "Create a reusable custom agent (persona + tool allowlist).",
-            "bot",
-        ),
-        (
-            "update_agent",
-            "Update Agent",
-            "Edit a custom agent's prompt, tools, or enabled state.",
-            "bot",
-        ),
-        (
-            "delete_agent",
-            "Delete Agent",
-            "Delete a custom agent (warns if tasks still target it).",
-            "bot",
-        ),
-        (
-            "call_agent",
-            "Call Agent",
-            "Delegate a sub-task to a custom agent and wait for its answer.",
+            "subagent",
+            "Subagents",
+            "Delegate self-contained tasks to autonomous subagents (several run in parallel).",
             "bot",
         ),
         (
@@ -737,26 +747,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
 
-    // Seed default Research agent
-    conn.execute(
-        r#"
-        INSERT INTO agents (agent_id, name, description, slash_command, system_prompt, max_iterations, enabled, allowed_tools_json, updated_at)
-        VALUES (
-            'default-research-agent',
-            'Research Agent',
-            'Autonomous research agent that investigates topics using available tools.',
-            'research',
-            'You are a focused research agent. When given a query, systematically investigate it by reading files, running commands, and searching the codebase and the web. Summarize your findings clearly and concisely. Break complex questions into steps and use tools to gather evidence before answering.',
-            5,
-            1,
-            '[]',
-            CURRENT_TIMESTAMP
-        )
-        ON CONFLICT(agent_id) DO NOTHING
-        "#,
-        [],
-    )
-    .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -1379,6 +1369,35 @@ mod tests {
             .unwrap();
         assert_eq!(pp, "/tmp/proj");
         assert_eq!(aid, "default-research-agent");
+    }
+
+    #[test]
+    fn v10_migration_adds_task_skill_and_retires_agent_tools() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+               agent_id TEXT NOT NULL DEFAULT '');
+             CREATE TABLE tools (tool_id TEXT PRIMARY KEY, name TEXT, description TEXT,
+               icon_name TEXT, enabled INTEGER NOT NULL DEFAULT 1);
+             INSERT INTO tools (tool_id) VALUES ('call_agent'), ('list_agents'), ('read_file');
+             INSERT INTO tasks (name, agent_id) VALUES ('old', 'some-agent');
+             PRAGMA user_version = 9;",
+        )
+        .unwrap();
+        run_migrations(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let skill: String = conn
+            .query_row("SELECT skill FROM tasks WHERE name = 'old'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(skill, "", "existing tasks start with no skill (fresh start)");
+        let tools: Vec<String> = conn
+            .prepare("SELECT tool_id FROM tools ORDER BY tool_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(tools, vec!["read_file".to_string()]);
     }
 
     #[test]

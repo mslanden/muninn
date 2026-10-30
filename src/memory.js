@@ -26,7 +26,7 @@ export function renderMemoryTile(tileObj, body) {
         </div>
         <div class="memory-note-list" data-mem-list="${tileObj.id}"></div>
       </div>
-      <div class="memory-editor" data-mem-editor="${tileObj.id}">
+      <div class="memory-editor" data-mem-editor="${tileObj.id}" data-placeholder="Select a note, or create one with +">
         <input type="text" class="memory-editor-name" placeholder="note-name" data-mem-name="${tileObj.id}" spellcheck="false" />
         <input type="text" class="memory-editor-desc" placeholder="One-line description — what this note holds" data-mem-desc="${tileObj.id}" />
         <textarea class="memory-editor-body" placeholder="Markdown…" data-mem-body="${tileObj.id}"></textarea>

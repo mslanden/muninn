@@ -7,7 +7,7 @@ import "./feeds.js";
 import "./logs.js";
 import "./tasks.js";
 import "./toolspanel.js";
-import "./agents.js";
+import "./skills.js";
 import "./memory.js";
 import "./content.js";
 import "./studio.js";
@@ -67,7 +67,7 @@ async function bootPopout() {
   try { ui.loadedSettings = await invoke("get_app_settings"); } catch { ui.loadedSettings = {}; }
   ui.mapboxToken = ui.loadedSettings["maps/mapbox_api_key"] || null;
 
-  try { ui.cachedAgents = await invoke("get_agents"); } catch {}
+  try { ui.cachedSkills = await invoke("list_skills"); } catch {}
 
   if (type === "chat") {
     await addChatTile(chatId);
@@ -104,7 +104,7 @@ async function bootMain() {
   ui.mapboxToken = ui.loadedSettings["maps/mapbox_api_key"] || null;
   updateModelChips();
 
-  try { ui.cachedAgents = await invoke("get_agents"); } catch {}
+  try { ui.cachedSkills = await invoke("list_skills"); } catch {}
 
   const saved = restoreLayout();
   if (saved && saved.length > 0) {
@@ -114,7 +114,8 @@ async function bootMain() {
       } else if (item.type === "settings") {
         continue; // settings is a modal now — don't restore old settings tiles
       } else {
-        addTile(item.type, { webUrl: item.webUrl || "" });
+        // Layouts saved before agents became skills still name the old tile type.
+        addTile(item.type === "agents" ? "skills" : item.type, { webUrl: item.webUrl || "" });
       }
     }
   } else {

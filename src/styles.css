@@ -3193,118 +3193,6 @@ body.tile-dragging * { cursor: grabbing !important; }
 .tool-name { font-size: var(--fs-sm); font-weight: 500; }
 .tool-desc { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-/* ========== AGENTS TILE ========== */
-.agents-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-}
-
-.agents-count { font-size: var(--fs-xs); color: var(--dim); }
-.agents-spacer { flex: 1; }
-
-.agents-new {
-  font-family: var(--font-ui);
-  font-size: var(--fs-xs);
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-  transition: all 200ms ease;
-}
-
-.agents-new:hover { border-color: var(--muted); color: var(--text); }
-
-.agents-list { padding: 6px; }
-
-.agent-card {
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--card);
-  margin-bottom: 6px;
-  transition: border-color 200ms ease;
-}
-
-.agent-card:hover { border-color: var(--border-hover); }
-.agent-card.disabled { opacity: 0.5; }
-
-.agent-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 4px;
-}
-
-.agent-name {
-  font-size: var(--fs-md);
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.agent-slash {
-  font-size: var(--fs-xs);
-  color: var(--blue);
-  background: rgba(96, 165, 250, 0.08);
-  padding: 1px 6px;
-  border-radius: var(--r-sm);
-}
-
-.agent-desc {
-  font-size: var(--fs-sm);
-  color: var(--muted);
-  line-height: 1.5;
-  margin-bottom: 8px;
-}
-
-.agent-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.agent-tag {
-  font-size: var(--fs-xs);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  padding: 2px 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  color: var(--dim);
-}
-
-.agent-tag.tool { border-color: rgba(96, 165, 250, 0.2); color: var(--blue); }
-
-.agent-iters {
-  margin-left: auto;
-  font-size: var(--fs-xs);
-  color: var(--dim);
-}
-
-.agent-actions {
-  display: flex;
-  gap: 4px;
-  margin-top: 8px;
-}
-
-/* Agent form */
-.agent-form {
-  padding: 12px;
-  border-bottom: 1px solid var(--border);
-  display: none;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.agent-form.visible { display: flex; }
-
 /* ========== TOGGLE SWITCH ========== */
 .toggle-switch {
   position: relative;
@@ -3468,7 +3356,7 @@ body.tile-dragging * { cursor: grabbing !important; }
   color: var(--dim);
   font-size: var(--fs-md);
 }
-.memory-editor.is-empty::before { content: "Select a note, or create one with +"; }
+.memory-editor.is-empty::before { content: attr(data-placeholder); }
 
 @container (max-width: 520px) {
   .memory-notes { grid-template-columns: 1fr; grid-template-rows: minmax(0, 40%) 1fr; }

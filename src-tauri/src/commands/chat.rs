@@ -121,7 +121,7 @@ pub(crate) async fn chat_core(app: &AppHandle, state: &AppState, req: ChatReques
     };
 
     let (reply, reply_blocks) = dispatch_chat_turn(
-        &app, &state, &req.session_id, req.agent_id.as_deref(), &provider, &model, &history, scope.as_ref(),
+        &app, &state, &req.session_id, req.skill.as_deref(), &provider, &model, &history, scope.as_ref(),
     )
     .await?;
 
@@ -256,7 +256,7 @@ pub(crate) async fn chat_core(app: &AppHandle, state: &AppState, req: ChatReques
             sanitize_tool_pairs(&mut history);
 
             let (iter_reply, iter_blocks) = dispatch_chat_turn(
-                &app, &state, &req.session_id, req.agent_id.as_deref(), &provider, &model, &history, scope.as_ref(),
+                &app, &state, &req.session_id, req.skill.as_deref(), &provider, &model, &history, scope.as_ref(),
             )
             .await?;
 
@@ -334,15 +334,15 @@ async fn dispatch_chat_turn(
     app: &AppHandle,
     state: &AppState,
     session_id: &str,
-    agent_id: Option<&str>,
+    skill: Option<&str>,
     provider: &str,
     model: &str,
     history: &[HistoryMessage],
     scope: Option<&WorkspaceScope>,
 ) -> Result<(String, Vec<serde_json::Value>), String> {
-    if let Some(agent_id) = agent_id {
-        // Chat-invoked agents keep the pre-existing behavior: unscoped, interactive.
-        run_agent(app, state, session_id, agent_id, history, None, true).await
+    if let Some(skill) = skill.filter(|s| !s.trim().is_empty()) {
+        // `/skill` turns keep the chat's workspace scope and stay interactive.
+        run_skill_turn(app, state, session_id, skill, history, scope, true).await
     } else if provider == "minimax" || model.starts_with("MiniMax-") {
         // MiniMax fast path — unchanged.
         chat_with_minimax_anthropic(app, state, session_id, model, history, scope, true).await

@@ -4,7 +4,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::AppState;
 use crate::db::{add_feed_item, get_app_setting_value, insert_message, with_db};
-use crate::llm::{chat_dynamic, chat_with_minimax_anthropic, chat_with_openai, load_agent_by_id, run_agent};
+use crate::llm::{chat_dynamic, chat_with_minimax_anthropic, chat_with_openai, run_skill_turn};
 use crate::models::{DayConfig, HistoryMessage, ScheduleConfig};
 use crate::tools::{truncate_chars, WorkspaceScope};
 
@@ -421,8 +421,8 @@ fn human_duration(d: TimeDelta) -> String {
     }
 }
 
-/// Fail a claimed run before the LLM is ever called (invalid workspace path, missing or
-/// disabled agent). Applies the same status rules as an errored LLM run — recurring tasks
+/// Fail a claimed run before the LLM is ever called (invalid workspace path or missing
+/// skill). Applies the same status rules as an errored LLM run — recurring tasks
 /// rejoin their schedule, schedule-less tasks go 'failed', a manually-run paused task is
 /// restored to 'paused' — records a task_run with the error, and notifies the feed.
 /// Deliberately does NOT run the task unscoped: a task pinned to a workspace that no
@@ -507,7 +507,7 @@ pub async fn execute_task(app: AppHandle, task_id: i64, manual: bool) -> Result<
     let row: Option<(String, String, String, String, String, String, String, String, String, String)> =
         with_db(&state, |db| {
             db.query_row(
-                "SELECT name, description, schedule, schedule_config, next_run, chain_next, pending_input, status, project_path, agent_id \
+                "SELECT name, description, schedule, schedule_config, next_run, chain_next, pending_input, status, project_path, skill \
                  FROM tasks WHERE id = ?1",
                 params![task_id],
                 |row| {
@@ -528,10 +528,10 @@ pub async fn execute_task(app: AppHandle, task_id: i64, manual: bool) -> Result<
             .optional()
             .map_err(|e| e.to_string())
         })?;
-    let (task_name, description, schedule, schedule_config, due_at, chain_next, pending_input, prior_status, project_path, agent_id) =
+    let (task_name, description, schedule, schedule_config, due_at, chain_next, pending_input, prior_status, project_path, skill) =
         row.ok_or_else(|| format!("no task with id {}", task_id))?;
     let project_path = project_path.trim().to_string();
-    let agent_id = agent_id.trim().to_string();
+    let skill = skill.trim().to_string();
 
     // Atomic claim — the double-run guard. Also clears consumed chain input so it
     // can't replay on a later tick.
@@ -578,7 +578,7 @@ pub async fn execute_task(app: AppHandle, task_id: i64, manual: bool) -> Result<
         "",
     );
 
-    // ---- Per-task workspace scope + custom agent (validated before any LLM spend) ----
+    // ---- Per-task workspace scope + skill (validated before any LLM spend) ----
     // A non-empty project_path scopes the run's file/shell tools to that folder. If it
     // no longer resolves (folder deleted/renamed), the run fails — never runs unscoped.
     let scope: Option<WorkspaceScope> = if project_path.is_empty() {
@@ -599,15 +599,11 @@ pub async fn execute_task(app: AppHandle, task_id: i64, manual: bool) -> Result<
             }
         }
     };
-    // A non-empty agent_id runs the task through that custom agent (its system prompt +
-    // tool allowlist). A deleted or disabled agent fails the run the same way.
-    if !agent_id.is_empty() {
-        let agent_err = match load_agent_by_id(&state, &agent_id) {
-            Ok(agent) if agent.enabled => None,
-            Ok(agent) => Some(format!("agent '{}' ({}) is disabled", agent.name, agent_id)),
-            Err(e) => Some(format!("agent '{}' is unavailable: {}", agent_id, e)),
-        };
-        if let Some(msg) = agent_err {
+    // A non-empty skill runs the task with that skill's instructions (and allowed-tools).
+    // A deleted skill fails the run the same way as a bad workspace path.
+    if !skill.is_empty() {
+        if let Err(e) = crate::skills::load_skill(&state.skills_dir, &skill) {
+            let msg = format!("skill '{}' is unavailable: {}", skill, e);
             let next = next_run_after_run(
                 &schedule, &schedule_config, &due_at, Local::now().naive_local(), manual,
             );
@@ -668,8 +664,8 @@ pub async fn execute_task(app: AppHandle, task_id: i64, manual: bool) -> Result<
 
     // Run LLM. All task runs are non-interactive (no user to ask — dangerous commands
     // hard-block) and carry the task's workspace scope (None = default workspace root).
-    let result = if !agent_id.is_empty() {
-        run_agent(&app, &state, &session_id, &agent_id, &history, scope.as_ref(), false).await
+    let result = if !skill.is_empty() {
+        run_skill_turn(&app, &state, &session_id, &skill, &history, scope.as_ref(), false).await
     } else if provider == "minimax" || model.starts_with("MiniMax-") {
         chat_with_minimax_anthropic(&app, &state, &session_id, &model, &history, scope.as_ref(), false).await
     } else if provider == "openai" {
