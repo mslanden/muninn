@@ -34,6 +34,9 @@ pub(crate) struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Switched off in the Connections window: kept in the config, not started.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[derive(Clone)]
@@ -140,7 +143,7 @@ fn parse_configs(state: &AppState) -> Vec<McpServerConfig> {
     };
     configs
         .into_iter()
-        .filter(|c| !c.name.trim().is_empty() && !c.command.trim().is_empty())
+        .filter(|c| !c.disabled && !c.name.trim().is_empty() && !c.command.trim().is_empty())
         .collect()
 }
 

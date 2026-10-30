@@ -257,11 +257,6 @@ code, pre, kbd, samp, .mono,
 .footer-popover-path,
 .ws-path,
 .slash-picker-cmd,
-.agent-shortcut-slash,
-.web-source-url {
-  font-family: var(--font-mono);
-}
-
 /* Times and counters line up without needing a mono face. */
 .turn-time, .logs-time, .task-run-time, .feeds-card-time,
 .vp-time, .studio-tr-time, .todo-progress, .schedule-time-input {
@@ -412,34 +407,6 @@ body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
 .head-btn.open { color: var(--text); background: var(--overlay-medium); }
 
 /* New chat + shared scroll area */
-.sidebar-topline {
-  padding: 2px 8px 0;
-  flex-shrink: 0;
-}
-
-.new-chat-btn {
-  width: 100%;
-  padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface);
-  color: var(--text);
-  font: inherit;
-  font-size: var(--fs-md);
-  font-weight: 500;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  text-align: left;
-  transition: all 160ms ease;
-}
-
-.new-chat-btn:hover {
-  border-color: var(--border-hover);
-  background: var(--overlay-medium);
-}
-.new-chat-btn .icon { color: var(--muted); }
 
 .sidebar-scroll {
   flex: 1;
@@ -534,40 +501,40 @@ body.sidebar-collapsed .workspace[data-tile-count="1"] .tile-header {
 .sidebar-panel[hidden] { display: none; }
 
 /* Agents under Chat (shares the session scroll area — no pinned dead space) */
-.sidebar-agents-list {
+
+
+/* ----- Session search ----- */
+/* Primary nav (New chat, Library, Connections, Settings): no outlines — a soft
+   wash on hover, a slightly stronger one when selected/open. */
+.sidebar-main-nav {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  margin: var(--sp-2) 8px 0;
-  padding: 0 0 10px;
-  border-top: 1px solid var(--border);
+  padding: 2px 8px 6px;
   flex-shrink: 0;
 }
-.sidebar-agents-list:empty { display: none; }
-
-.agent-shortcut {
+.nav-main-item {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
-  padding: 6px var(--sp-2);
+  gap: var(--sp-3);
+  width: 100%;
+  padding: 7px var(--sp-2);
   border: none;
   border-radius: var(--r-md);
   background: transparent;
   color: var(--muted);
   font: inherit;
   font-size: var(--fs-md);
-  cursor: pointer;
   text-align: left;
-  transition: all 160ms ease;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
 }
+.nav-main-item .icon { color: var(--dim); transition: color 120ms ease; }
+.nav-main-item:hover { background: var(--overlay-medium); color: var(--text); }
+.nav-main-item.open { background: var(--overlay-toggle); color: var(--text); }
+.nav-main-item:hover .icon,
+.nav-main-item.open .icon { color: var(--text); }
 
-.agent-shortcut:hover { color: var(--text); background: var(--overlay-light); }
-.agent-shortcut .icon { color: var(--dim); }
-.agent-shortcut-empty { color: var(--dim); }
-.agent-shortcut-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.agent-shortcut-slash { font-size: var(--fs-xs); color: var(--dim); flex-shrink: 0; }
-
-/* ----- Session search ----- */
 .session-search {
   position: relative;
   padding: 6px 8px 4px;
@@ -1086,23 +1053,27 @@ body.tile-dragging * { cursor: grabbing !important; }
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* Empty chat: the greeting and the composer sit together in the middle of the tile
+   (a fresh start page); once the first turn lands the welcome is removed and the
+   normal stream-above-composer layout takes over. */
+.tile:has(.chat-welcome) .tile-body.chat-scroll { flex: 0 1 auto; margin-top: auto; }
+.tile:has(.chat-welcome) .chat-stream { overflow: visible; padding-bottom: var(--sp-4); }
+.tile:has(.chat-welcome) .chat-welcome { flex: none; min-height: 0; padding: 0 var(--sp-5); }
+.tile:has(.chat-welcome) .composer { margin-bottom: auto; padding-bottom: 12vh; }
+
+.chat-welcome-title {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-display);
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
 /* Raven brand mark: currentColor so it follows the theme. */
 .chat-welcome .raven-logo {
   height: auto;
   color: var(--text);
   opacity: 0.92;
-}
-
-.chat-welcome-brand {
-  font-family: inherit;
-  font-size: var(--fs-md);
-  font-weight: 600;
-  letter-spacing: 9px;
-  /* Optically recenters tracked-out text (trailing letter-space). */
-  padding-left: 9px;
-  text-transform: uppercase;
-  color: var(--text);
-  margin-top: 2px;
 }
 
 .chat-welcome-lead {
@@ -4896,3 +4867,185 @@ textarea:focus-visible {
     scroll-behavior: auto !important;
   }
 }
+
+
+/* ==================== CONNECTIONS ==================== */
+.conn-modal .settings-modal-head { gap: var(--sp-3); }
+.conn-summary { flex: 1; font-size: var(--fs-xs); color: var(--dim); }
+.conn-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-4) var(--sp-5) var(--sp-6);
+}
+.conn-loading { padding: var(--sp-6); text-align: center; color: var(--dim); font-size: var(--fs-md); }
+.conn-intro, .conn-hint { margin: 0 0 var(--sp-2); font-size: var(--fs-sm); color: var(--muted); }
+.conn-section { margin-top: var(--sp-5); }
+.conn-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--muted);
+}
+.conn-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: var(--sp-2);
+}
+.conn-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  transition: border-color 120ms ease;
+}
+.conn-card:hover { border-color: var(--border-hover); }
+.conn-card.expanded { grid-column: 1 / -1; border-color: var(--border-hover); }
+.conn-card-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 10px var(--sp-3);
+  cursor: pointer;
+  border-radius: var(--r-lg);
+}
+.conn-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: var(--r-md);
+  background: var(--overlay-medium);
+  color: var(--muted);
+}
+.conn-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.conn-name { font-size: var(--fs-md); font-weight: 500; color: var(--text); }
+.conn-detail {
+  font-size: var(--fs-xs);
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conn-pill {
+  flex-shrink: 0;
+  padding: 2px var(--sp-2);
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+.conn-pill.accent { background: color-mix(in srgb, var(--blue) 16%, transparent); color: var(--blue); }
+.conn-pill.ok { background: color-mix(in srgb, var(--live) 16%, transparent); color: var(--live); }
+.conn-pill.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.conn-pill.muted { background: var(--overlay-medium); color: var(--dim); }
+.conn-switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 30px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: var(--border-hover);
+  cursor: pointer;
+  transition: background 150ms ease;
+}
+.conn-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--bg);
+  transition: transform 150ms ease;
+}
+.conn-switch.on { background: var(--blue); }
+.conn-switch.on::after { transform: translateX(12px); }
+.conn-details {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-3) var(--sp-3) calc(32px + var(--sp-3) * 2);
+}
+.conn-desc { margin: 0; font-size: var(--fs-sm); color: var(--muted); }
+.conn-status-line { font-size: var(--fs-xs); color: var(--dim); min-height: 0; }
+.conn-status-line:empty { display: none; }
+.conn-status-line.ok { color: var(--live); }
+.conn-status-line.warn { color: var(--warn); }
+.conn-key-row input { flex: 1; min-width: 0; }
+.conn-primary { background: var(--text) !important; color: var(--bg) !important; border-color: var(--text) !important; }
+.conn-small-btn { align-self: flex-start; padding: 4px var(--sp-3); }
+.conn-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--blue);
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  cursor: pointer;
+}
+.conn-tools {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  margin-top: var(--sp-1);
+}
+.conn-tool {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.conn-tool:last-child { border-bottom: none; }
+.conn-tool-name { flex: 0 0 170px; font-size: var(--fs-sm); color: var(--text); }
+.conn-tool-desc { flex: 1; min-width: 0; font-size: var(--fs-xs); color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conn-tool input { width: auto; flex-shrink: 0; }
+.conn-add-server {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+}
+.settings-inline-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--blue);
+  font: inherit;
+  cursor: pointer;
+}
+
+/* ==================== LIBRARY ==================== */
+.library { max-width: var(--chat-col); margin: 0 auto; padding: var(--sp-5) var(--sp-4); }
+.library-intro { margin: 0 0 var(--sp-3); font-size: var(--fs-sm); color: var(--muted); }
+.library-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--sp-2);
+}
+.library-card {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.library-card:hover { border-color: var(--border-hover); background: var(--overlay-light); }

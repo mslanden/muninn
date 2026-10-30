@@ -16,6 +16,7 @@ export const TILE_TYPES = [
   { type: "web",        label: "Web",        dot: "blue"  },
   { type: "tasks",      label: "Tasks",      dot: "blue"  },
   { type: "skills",     label: "Skills",     dot: "blue"  },
+  { type: "library",    label: "Library",    dot: "purple" },
   { type: "memory",     label: "Memory",     dot: "purple" },
   { type: "content",    label: "Content",    dot: "off"   },
   { type: "studio",     label: "Studio",     dot: "green" },

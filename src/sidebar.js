@@ -1,4 +1,4 @@
-// Sidebar: chats-only panel (session browser + skill shortcuts) with an app
+// Sidebar: primary nav (new chat, Library, Connections, Settings) + chat history with an app
 // launcher icon rail in the footer. Workspace/model switching lives in the
 // chat composer (chat.js) — the model popover here is opened from there.
 //
@@ -12,7 +12,6 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import {
   sessionList,
   sessionSearchInput,
-  sidebarSkillsList,
   sidebarAppsRail,
   navSettingsBtn,
   sidebarCollapseBtn,
@@ -37,7 +36,8 @@ import { openSettingsModal } from "./settings.js";
 // ==================== APP RAIL ====================
 // App tile types shown as icons in the footer rail (Logs & Tools live under
 // Settings now).
-const APPS_TYPES = ["studio", "content", "web", "feeds", "tasks", "memory"];
+// Content and Memory live in Library now (see library.js).
+const APPS_TYPES = ["studio", "web", "feeds", "tasks"];
 const APPS_ICONS = {
   studio: "video",
   content: "image",
@@ -86,7 +86,6 @@ function isSecCollapsed(id) {
 function toggleSection(id) {
   localStorage.setItem(SEC_KEY(id), isSecCollapsed(id) ? "0" : "1");
   refreshSessionList();
-  refreshSkillsList();
 }
 
 // ==================== APP RAIL (footer icons) ====================
@@ -115,74 +114,6 @@ function renderAppsRail() {
     makeDragSource(btn, { type });
     sidebarAppsRail.appendChild(btn);
   }
-}
-
-// ==================== SKILLS (under Chat) ====================
-export async function refreshSkillsList() {
-  if (!sidebarSkillsList) return;
-  let skills = ui.cachedSkills;
-  if (!Array.isArray(skills) || !skills.length) {
-    try {
-      skills = await invoke("list_skills");
-      ui.cachedSkills = skills;
-    } catch {
-      skills = [];
-    }
-  }
-  if (!Array.isArray(skills)) skills = [];
-
-  sidebarSkillsList.innerHTML = "";
-  const header = sectionHeader("skills", "Skills", skills.length, {
-    icon: "settings",
-    title: "Manage skills",
-    onClick: () => openTileForType("skills"),
-  });
-  makeDragSource(header.querySelector(".section-action"), { type: "skills" });
-  sidebarSkillsList.appendChild(header);
-  if (isSecCollapsed("skills")) return;
-
-  if (!skills.length) {
-    const empty = document.createElement("button");
-    empty.className = "agent-shortcut agent-shortcut-empty";
-    empty.innerHTML = `${icon("plus", 13)}<span class="agent-shortcut-name">Create a skill</span>`;
-    empty.addEventListener("click", () => openTileForType("skills"));
-    sidebarSkillsList.appendChild(empty);
-  }
-
-  for (const sk of skills.slice(0, 10)) {
-    const name = field(sk, "name");
-    const btn = document.createElement("button");
-    btn.className = "agent-shortcut";
-    btn.title = field(sk, "description") || `Run /${name}`;
-    btn.innerHTML = `
-      ${icon("sparkles", 13)}
-      <span class="agent-shortcut-name">${escapeHtml(name)}</span>
-      <span class="agent-shortcut-slash">/${escapeHtml(name)}</span>
-    `;
-    btn.addEventListener("click", () => insertSkillSlash(name));
-    sidebarSkillsList.appendChild(btn);
-  }
-}
-
-/** Prefill the focused (or newest) chat composer with `/skill ` and focus it. */
-function insertSkillSlash(slash) {
-  const chatTiles = getTilesByType("chat");
-  let tile = chatTiles.find((t) => t.id === ui.focusedTileId);
-  if (!tile) tile = chatTiles[chatTiles.length - 1];
-  if (!tile) {
-    openTileForType("skills");
-    return;
-  }
-  focusTile(tile.id);
-  const input = tile.el.querySelector(`[data-chat-input="${tile.id}"]`);
-  if (!input) return;
-  const prefix = `/${slash} `;
-  if (!input.value.startsWith(prefix)) {
-    input.value = prefix + input.value.replace(/^\/\S*\s*/, "");
-  }
-  input.focus();
-  input.setSelectionRange(input.value.length, input.value.length);
-  input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 // ==================== CHAT HISTORY BROWSER ====================
@@ -545,15 +476,22 @@ function wirePopoverDismiss() {
 
 // ==================== PUBLIC ENTRY ====================
 export function updateSidebar() {
+  document.getElementById("nav-library")?.classList.toggle("open", getTilesByType("library").length > 0);
   refreshSessionList();
-  refreshSkillsList();
   renderAppsRail();
 }
 
 export function initSidebar() {
-  if (navSettingsBtn) navSettingsBtn.innerHTML = icon("settings", 15);
-  const newChatBtn = document.getElementById("new-chat-btn");
-  if (newChatBtn) newChatBtn.innerHTML = `${icon("plus", 14)}<span>New chat</span>`;
+  const navItems = [
+    ["new-chat-btn", "message-circle", "New chat"],
+    ["nav-library", "book-open", "Library"],
+    ["nav-connections", "plug", "Connections"],
+    ["nav-settings", "settings", "Settings"],
+  ];
+  for (const [id, ico, label] of navItems) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = `${icon(ico, 16)}<span>${label}</span>`;
+  }
   wireSearch();
   wireCollapse();
   wirePopoverDismiss();

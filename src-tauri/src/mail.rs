@@ -80,7 +80,7 @@ end isoDate
 const OSASCRIPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Prefix of the error `run_applescript_with_deadline` returns when it kills a run.
-const TIMEOUT_MARKER: &str = "__MUNINN_DEADLINE__:";
+pub(crate) const TIMEOUT_MARKER: &str = "__MUNINN_DEADLINE__:";
 
 /// Deadline for opening one message — a healthy read takes well under 8s.
 const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
@@ -144,7 +144,7 @@ pub(crate) fn run_applescript(script: &str) -> Result<String, String> {
 }
 
 /// `run_applescript` with an explicit wall-clock deadline.
-fn run_applescript_with_deadline(script: &str, deadline: std::time::Duration) -> Result<String, String> {
+pub(crate) fn run_applescript_with_deadline(script: &str, deadline: std::time::Duration) -> Result<String, String> {
     use std::io::Read;
     use std::process::Stdio;
 

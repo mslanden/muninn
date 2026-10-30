@@ -16,14 +16,11 @@ export function renderSettingsTile(tileObj, body) {
     <div class="settings-layout">
       <nav class="settings-nav" data-s-tabs="${tileObj.id}">
         <button type="button" class="settings-tab active" data-s-tab="main">Main</button>
-        <button type="button" class="settings-tab" data-s-tab="keys">API Keys</button>
         <button type="button" class="settings-tab" data-s-tab="voice">Voice &amp; Media</button>
         <button type="button" class="settings-tab" data-s-tab="ui">UI</button>
         <button type="button" class="settings-tab" data-s-tab="system">System</button>
         <button type="button" class="settings-tab" data-s-tab="remote">Remote</button>
-        <button type="button" class="settings-tab" data-s-tab="mcp">MCP</button>
         <button type="button" class="settings-tab" data-s-tab="activity">Activity</button>
-        <button type="button" class="settings-tab" data-s-tab="tools">Tools</button>
       </nav>
       <div class="settings-main">
         <div class="settings-pages">
@@ -37,6 +34,7 @@ export function renderSettingsTile(tileObj, body) {
             </div>
             <div class="settings-group">
               <h3>Model</h3>
+              <p class="settings-hint">API keys for every provider, plus services, MCP servers and tool access, live in <button type="button" class="settings-inline-link" data-open-connections>Connections</button>.</p>
               <div class="form-row mb-2">
                 <select class="grow min-w-0" data-s-provider="${tileObj.id}">
                   <option value="minimax">MiniMax (Anthropic-compatible)</option>

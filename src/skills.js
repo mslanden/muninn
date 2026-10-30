@@ -5,7 +5,6 @@ import { ui } from "./state.js";
 import { escapeHtml, field, formatModifiedAt, parseAllowedTools } from "./utils.js";
 import { emptyState } from "./uikit.js";
 import { icon } from "./icons.js";
-import { refreshSkillsList } from "./sidebar.js";
 import { getTilesByType } from "./tilesys.js";
 
 // ========== SKILLS TILE ==========
@@ -175,7 +174,6 @@ export function renderSkillsTile(tileObj, body) {
 /** `skills-changed`: refresh the shared cache, the sidebar list, and open tiles. */
 export async function onSkillsChanged() {
   try { ui.cachedSkills = await invoke("list_skills"); } catch { /* keep old cache */ }
-  try { refreshSkillsList(); } catch { /* sidebar absent in pop-out */ }
   for (const t of getTilesByType("skills")) {
     if (typeof t.refreshSkills === "function") t.refreshSkills();
   }

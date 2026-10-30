@@ -11,12 +11,14 @@ import "./skills.js";
 import "./memory.js";
 import "./content.js";
 import "./studio.js";
+import "./library.js";
 import { openSettingsModal, closeSettingsModal, isSettingsModalOpen } from "./settings.js";
+import { openConnections, closeConnections, isConnectionsOpen } from "./connections.js";
 
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { workspace, newChatBtn, navSettingsBtn, ui } from "./state.js";
-import { addTile, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav, replaceSingleTileIfAlone, makeDragSource } from "./tilesys.js";
+import { addTile, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav, replaceSingleTileIfAlone, makeDragSource, openTileForType } from "./tilesys.js";
 import { addChatTile, updateModelChips } from "./chat.js";
 import { initSidebar, refreshSessionList } from "./sidebar.js";
 import { setupEventListeners } from "./events.js";
@@ -46,9 +48,29 @@ document.addEventListener("click", async (e) => {
 });
 
 navSettingsBtn.addEventListener("click", () => {
+  if (isConnectionsOpen()) closeConnections();
   if (isSettingsModalOpen()) closeSettingsModal();
   else openSettingsModal();
 });
+
+document.getElementById("nav-connections")?.addEventListener("click", () => {
+  if (isSettingsModalOpen()) closeSettingsModal();
+  if (isConnectionsOpen()) closeConnections();
+  else openConnections();
+});
+
+// "Connections" links inside other windows (e.g. the Settings model section).
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("[data-open-connections]")) return;
+  if (isSettingsModalOpen()) closeSettingsModal();
+  openConnections();
+});
+
+const navLibrary = document.getElementById("nav-library");
+if (navLibrary) {
+  navLibrary.addEventListener("click", () => openTileForType("library"));
+  makeDragSource(navLibrary, { type: "library" });
+}
 
 // ==================== BOOT ====================
 async function bootPopout() {

@@ -9,6 +9,7 @@ import { renderContentTile } from "./content.js";
 import { isDarkTheme, applyTheme } from "./theme.js";
 import { renderSettingsTile, refreshSettingsModalIfOpen } from "./settings.js";
 import { onSkillsChanged } from "./skills.js";
+import { refreshConnections } from "./connections.js";
 
 // ==================== TAURI EVENT LISTENERS ====================
 export async function setupEventListeners() {
@@ -311,6 +312,11 @@ export async function setupEventListeners() {
     for (const t of getTilesByType("memory")) {
       if (typeof t.refreshMemory === "function") t.refreshMemory();
     }
+  });
+
+  await listen("connections-changed", () => {
+    // A connection or tool was switched on/off — keep the Connections window in sync.
+    refreshConnections();
   });
 
   await listen("skills-changed", () => {

@@ -762,6 +762,19 @@ where
     f(&conn)
 }
 
+/// Upsert one `app_config` value (the same write `set_app_settings` does per key).
+pub(crate) fn set_app_setting_value(state: &AppState, key: &str, value: &str) -> Result<(), String> {
+    with_db(state, |db| {
+        db.execute(
+            "INSERT INTO app_config (key, value, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+            params![key, value],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
 pub(crate) fn get_app_setting_value(state: &AppState, key: &str) -> Result<Option<String>, String> {
     with_db(state, |db| {
         db.query_row(

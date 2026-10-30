@@ -1152,9 +1152,9 @@ export function showChatWelcome(chatLog) {
   const el = document.createElement("div");
   el.className = "chat-welcome";
   el.innerHTML = `
-    ${ravenLogo(64)}
-    <div class="chat-welcome-brand">MUNINN</div>
-    <p class="chat-welcome-lead">Ask anything — Muninn can use tools, see screenshots, and run skills with <kbd>/</kbd></p>
+    ${ravenLogo(44)}
+    <h1 class="chat-welcome-title">How can I help you today?</h1>
+    <p class="chat-welcome-lead">Muninn can use your connections, see screenshots, and run skills with <kbd>/</kbd></p>
   `;
   chatLog.appendChild(el);
 }
