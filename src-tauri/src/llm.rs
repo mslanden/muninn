@@ -1733,7 +1733,13 @@ Proactively use your tools — don't describe what you *could* do, just do it."
         caps.push("Append or prepend content to a file (append_file)");
     }
     if enabled.contains("capture_screen") {
-        caps.push("Take a screenshot of the screen or frontmost window to see it (capture_screen)");
+        caps.push("Take a screenshot of the screen, or of one app's window in the background without focusing it (capture_screen)");
+    }
+    if enabled.contains("capture_page") {
+        caps.push("Check a web page or local dev server in a headless browser — screenshot, console errors and page text, nothing shown on screen (capture_page)");
+    }
+    if enabled.contains("process") {
+        caps.push("Start long-running processes like dev servers with run_command background: true, then read their output or stop them (process)");
     }
     if enabled.contains("open_app") {
         caps.push("Launch/focus a macOS app, optionally opening a URL (open_app)");
@@ -1987,7 +1993,9 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     if enabled.contains("write_file") { caps.push("Write/create files (write_file)"); }
     if enabled.contains("edit_file") { caps.push("Edit part of a file by exact-string replacement (edit_file)"); }
     if enabled.contains("append_file") { caps.push("Append or prepend content to a file (append_file)"); }
-    if enabled.contains("capture_screen") { caps.push("Take a screenshot of the screen or frontmost window (capture_screen)"); }
+    if enabled.contains("capture_screen") { caps.push("Take a screenshot of the screen, or of one app's window in the background without focusing it (capture_screen)"); }
+    if enabled.contains("capture_page") { caps.push("Check a web page or local dev server in a headless browser — screenshot, console errors and page text, nothing shown on screen (capture_page)"); }
+    if enabled.contains("process") { caps.push("Start long-running processes like dev servers with run_command background: true, then read their output or stop them (process)"); }
     if enabled.contains("open_app") { caps.push("Launch/focus a macOS app, optionally opening a URL (open_app)"); }
     if enabled.contains("list_files") { caps.push("List directory contents (list_files)"); }
     if enabled.contains("search_files") { caps.push("Search for text in files (search_files)"); }
@@ -2102,12 +2110,14 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("run_command") {
         defs.push((
             "run_command",
-            "Run a shell command in the local workspace and return text output. Commands flagged as potentially dangerous pause and ask the user for approval before running.",
+            "Run a shell command in the local workspace and return its output (stdout and stderr interleaved; a non-zero exit code is reported at the end). Commands flagged as potentially dangerous pause and ask the user for approval before running. A command that runs longer than timeout_secs is killed — so never run a dev server, watcher or anything else that doesn't exit in the foreground: start it with background: true, which returns immediately with a process id you then manage with the process tool.",
             json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "cwd": {"type": "string"}
+                    "cwd": {"type": "string"},
+                    "timeout_secs": {"type": "integer", "description": "Kill the command after this many seconds (default 300, max 1800). Raise it for long builds or installs."},
+                    "background": {"type": "boolean", "description": "Start a long-running process (dev server, watcher) and return right away with its process id. Interactive chat only."}
                 },
                 "required": ["command"]
             }),
@@ -2116,7 +2126,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("read_file") {
         defs.push((
             "read_file",
-            "Read a file within the workspace. Optionally pass start_line and/or end_line (1-based, inclusive) to read only a slice of a large file; when a range is given each line is prefixed with its line number.",
+            "Read a file within the workspace. Image files (png, jpg, gif, webp, heic, bmp, tiff) are returned to you as an image you can see — use this to look at screenshots, photos, and rendered output. Optionally pass start_line and/or end_line (1-based, inclusive) to read only a slice of a large file; when a range is given each line is prefixed with its line number.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2176,11 +2186,12 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("capture_screen") {
         defs.push((
             "capture_screen",
-            "Take a screenshot so you can SEE the user's screen — use this to debug how an app or web page looks. `mode` is \"screen\" (whole display, default) or \"window\" (the frontmost window). To inspect a specific app or URL, call open_app first to bring it to the front, then capture_screen with mode \"window\". The screenshot is returned to you as an image you can read directly.",
+            "Take a screenshot so you can SEE the user's screen or an app — use this to check how a native app looks. To look at a specific app, pass `app` (e.g. \"Safari\", \"Xcode\"): its window is captured in the background, exactly where it is, even if other windows cover it — nothing is brought to the front and the user is not interrupted. Prefer that over focusing the app. Without `app`, `mode` is \"screen\" (whole display, default) or \"window\" (whatever window is frontmost). For web pages and local dev servers use capture_page instead when it is available. The screenshot is returned to you as an image you can read directly.",
             json!({
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "enum": ["screen", "window"], "description": "\"screen\" = whole display (default); \"window\" = the frontmost window."}
+                    "app": {"type": "string", "description": "Name of a running app whose window to capture without focusing it, e.g. \"Safari\". Overrides mode."},
+                    "mode": {"type": "string", "enum": ["screen", "window"], "description": "Used when app is omitted: \"screen\" = whole display (default); \"window\" = the frontmost window."}
                 }
             }),
         ));
@@ -2188,14 +2199,47 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("open_app") {
         defs.push((
             "open_app",
-            "Launch or focus a macOS app and bring it to the front, optionally opening a URL or file in it. Use the app's exact name (e.g. \"Safari\", \"Google Chrome\", \"Preview\"). Pair with capture_screen mode \"window\" to look at what you opened.",
+            "Launch a macOS app, optionally opening a URL or file in it. Use the app's exact name (e.g. \"Safari\", \"Google Chrome\", \"Preview\"). By default the app is brought to the front, which interrupts the user — when you only need to look at it (testing, verification), pass background: true to open it behind their current window, then use capture_screen with `app` to see it. Only bring an app to the front when the user asked to see it.",
             json!({
                 "type": "object",
                 "properties": {
                     "app": {"type": "string", "description": "Exact app name, e.g. \"Safari\" or \"Google Chrome\"."},
-                    "url": {"type": "string", "description": "Optional URL or file path to open in the app."}
+                    "url": {"type": "string", "description": "Optional URL or file path to open in the app."},
+                    "background": {"type": "boolean", "description": "Open without bringing the app to the front or taking focus (default false)."}
                 },
                 "required": ["app"]
+            }),
+        ));
+    }
+    if enabled.contains("capture_page") {
+        defs.push((
+            "capture_page",
+            "Load a web page in a headless browser and get back a screenshot, the page's console output (including uncaught JavaScript errors) and its rendered text — all in the background: no window opens and nothing on the user's screen changes. This is the way to verify web work: after changing a page or app, capture it and check the screenshot AND the console before saying it works. `url` is an http(s) URL — including a local dev server such as http://localhost:5173 — or the path of an HTML file in the workspace. For a dev server, start it first with run_command background: true and wait for it with the process tool. Each call is a fresh page load (no clicking or typing, no login state).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "http(s) URL (localhost allowed) or a workspace-relative path to an HTML file."},
+                    "width": {"type": "integer", "description": "Viewport width in px (default 1280; use ~390 to check a phone layout)."},
+                    "height": {"type": "integer", "description": "Viewport height in px (default 800, max 4000; raise it to see further down a long page)."},
+                    "wait_ms": {"type": "integer", "description": "How long to let the page run (timers, fetches, rendering) before capturing, in ms (default 3000, max 20000)."}
+                },
+                "required": ["url"]
+            }),
+        ));
+    }
+    if enabled.contains("process") {
+        defs.push((
+            "process",
+            "Manage long-running background processes that were started with run_command background: true (dev servers, watchers, builds). action \"list\" shows them; \"output\" returns a process's status and the latest output — pass wait_for to block until a line containing that text appears (e.g. \"ready\", \"listening\", \"Local:\"), which is how you wait for a server to come up before testing it; \"stop\" stops the process and everything it started. Stop processes you started once you no longer need them, unless the user wants them left running.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "output", "stop"]},
+                    "id": {"type": "integer", "description": "Process id returned by run_command (required for output and stop)."},
+                    "wait_for": {"type": "string", "description": "For output: wait until the process output contains this text (case-insensitive) before returning."},
+                    "wait_secs": {"type": "integer", "description": "For output with wait_for: how long to wait, in seconds (default 30, max 120)."}
+                },
+                "required": ["action"]
             }),
         ));
     }
@@ -3243,6 +3287,12 @@ impl Provider {
     ) {
         match self {
             Self::OpenAi { .. } => {
+                // Say so, rather than let the tool's "image attached" note mislead the model.
+                let output = format!(
+                    "{}\n[Note: {} image(s) could not be shown to you — this provider's tool results are text-only.]",
+                    output,
+                    images.len()
+                );
                 messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
             }
             Self::Anthropic { .. } => {
@@ -3716,7 +3766,7 @@ async fn run_tool_loop(
                     tool_result_blocks.push(json!({
                         "type": "tool_result",
                         "tool_use_id": call.id,
-                        "content": format!("{} [{} screenshot(s) shown to the model]", output, images.len()),
+                        "content": format!("{} [{} image(s) shown to the model]", output, images.len()),
                     }));
                 }
             }

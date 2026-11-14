@@ -524,27 +524,98 @@ pub(crate) fn run_command_scoped(scope: &WorkspaceScope, command: &str, cwd: Opt
 /// Run a command without the safety check. Only call this after the user has
 /// explicitly approved the command (or from `run_command_scoped`, which checks).
 pub(crate) fn run_command_scoped_unchecked(scope: &WorkspaceScope, command: &str, cwd: Option<&str>) -> Result<String, String> {
-    let cwd_path = match cwd {
-        Some(value) => resolve_within_workspace(&scope.root, &scope.root_canon, value, false)?,
-        None => scope.root.clone(),
-    };
-    let output = Command::new("/bin/zsh")
-        .arg("-lc")
-        .arg(command)
-        .current_dir(cwd_path)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let cwd_path = resolve_command_cwd(scope, cwd)?;
+    crate::procs::run_blocking(
+        command,
+        &cwd_path,
+        std::time::Duration::from_secs(crate::procs::DEFAULT_TIMEOUT_SECS),
+    )
+}
 
-    let mut merged = String::new();
-    merged.push_str(&String::from_utf8_lossy(&output.stdout));
-    merged.push_str(&String::from_utf8_lossy(&output.stderr));
+/// Read an integer tool argument, tolerating models that send numbers as strings ("30").
+fn arg_u64(arguments: &Value, key: &str) -> Option<u64> {
+    let v = arguments.get(key)?;
+    v.as_u64()
+        .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
 
-    if merged.len() > 12000 {
-        merged.truncate(12000);
-        merged.push_str("\n...[truncated]");
+/// Read a boolean tool argument (default false), tolerating "true"/"false" strings.
+fn arg_bool(arguments: &Value, key: &str) -> bool {
+    match arguments.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Resolve a command's working directory inside the workspace (default: the workspace root).
+fn resolve_command_cwd(scope: &WorkspaceScope, cwd: Option<&str>) -> Result<PathBuf, String> {
+    match cwd {
+        Some(value) => resolve_within_workspace(&scope.root, &scope.root_canon, value, false),
+        None => Ok(scope.root.clone()),
+    }
+}
+
+/// Whether the user has pressed Stop for this session (or, for a subagent, its parent chat).
+/// Peeks without clearing — `run_tool_loop` consumes the flag between rounds.
+fn stop_requested_peek(state: &AppState, session_id: &str) -> bool {
+    let stops = state.stop_requests.lock().unwrap_or_else(|p| p.into_inner());
+    stops.contains(session_id)
+        || session_id
+            .split_once("::sub-")
+            .map(|(parent, _)| stops.contains(parent))
+            .unwrap_or(false)
+}
+
+/// Run an agent `run_command` that has already passed, or been approved past, the
+/// dangerous-command check — never call this before that check. Foreground commands are
+/// killed after `timeout_secs` or when the user presses Stop; `background` starts a
+/// long-running process and returns immediately with its id (see the `process` tool).
+async fn exec_agent_command(
+    state: &AppState,
+    session_id: &str,
+    scope: &WorkspaceScope,
+    command: &str,
+    cwd: Option<&str>,
+    timeout_secs: u64,
+    background: bool,
+) -> Result<String, String> {
+    let cwd_path = resolve_command_cwd(scope, cwd)?;
+    if !background {
+        return crate::procs::run_async(
+            command,
+            &cwd_path,
+            std::time::Duration::from_secs(timeout_secs),
+            || stop_requested_peek(state, session_id),
+        )
+        .await;
     }
 
-    Ok(merged)
+    let id = state.bg_processes.start(session_id, command, &cwd_path)?;
+    // Give it a moment so an immediate failure (typo, port in use) is reported right here.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let view = state.bg_processes.view(id, 3000)?;
+    let output = if view.output.trim().is_empty() {
+        "(no output yet)".to_string()
+    } else {
+        view.output
+    };
+    Ok(if view.running {
+        format!(
+            "Started background process {id} ({status}).\nOutput so far:\n{output}\n\nIt keeps running after this turn. Use the process tool: action \"output\" with id {id} (add wait_for to block until a readiness line appears), and action \"stop\" with id {id} when you are done with it.",
+            id = id,
+            status = view.status,
+            output = output
+        )
+    } else {
+        format!(
+            "Background process {id} already {status} — it did not stay running.\nOutput:\n{output}",
+            id = id,
+            status = view.status,
+            output = output
+        )
+    })
 }
 
 #[allow(dead_code)]
@@ -652,6 +723,19 @@ pub(crate) async fn web_fetch_impl(state: &AppState, url: &str) -> Result<String
 /// rebinding (a public hostname that resolves to a private IP); that would require
 /// resolving and pinning the address before the request.
 pub(crate) fn validate_public_url(url: &str) -> Result<(), String> {
+    let host = http_url_host(url)?;
+    if is_blocked_host(&host) {
+        return Err(format!(
+            "Blocked URL: '{}' resolves to a local or private address",
+            host
+        ));
+    }
+
+    Ok(())
+}
+
+/// Extract the lowercased host of an http(s) URL, rejecting every other scheme.
+fn http_url_host(url: &str) -> Result<String, String> {
     let trimmed = url.trim();
     let lower = trimmed.to_lowercase();
     let rest = if let Some(r) = lower.strip_prefix("http://") {
@@ -684,15 +768,59 @@ pub(crate) fn validate_public_url(url: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("Blocked URL: missing host".to_string());
     }
+    Ok(host)
+}
 
-    if is_blocked_host(&host) {
+/// Whether `host` is this machine's loopback address (where local dev servers listen).
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h == "::1" {
+        return true;
+    }
+    let parts: Vec<&str> = h.split('.').collect();
+    parts.len() == 4 && parts[0] == "127" && parts.iter().all(|p| p.parse::<u8>().is_ok())
+}
+
+/// Turn a `capture_page` target into the URL the headless browser loads.
+///
+/// Allowed: public http(s) URLs (same rule as `web_fetch`), http(s) on this machine's
+/// loopback address (the point of the tool — previewing a local dev server), and a file
+/// inside the workspace (opened as `file://`). Everything else is refused: other schemes,
+/// private-network and link-local/metadata hosts, and paths outside the workspace.
+pub(crate) fn resolve_page_target(scope: &WorkspaceScope, target: &str) -> Result<String, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing url".to_string());
+    }
+    let lower = target.to_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let host = http_url_host(target)?;
+        if !is_loopback_host(&host) {
+            validate_public_url(target)?;
+        }
+        if target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("invalid URL: contains whitespace".to_string());
+        }
+        return Ok(target.to_string());
+    }
+    // `scheme:` of any other kind (file:, chrome:, javascript:, data:, view-source:, ...).
+    let scheme_len = lower.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')).count();
+    if scheme_len > 1 && lower[scheme_len..].starts_with(':') {
         return Err(format!(
-            "Blocked URL: '{}' resolves to a local or private address",
-            host
+            "Blocked URL scheme '{}': capture_page takes an http(s) URL or the path of a file in the workspace.",
+            &lower[..scheme_len]
         ));
     }
-
-    Ok(())
+    let resolved = resolve_within_workspace(&scope.root, &scope.root_canon, target, false)?;
+    if !resolved.is_file() {
+        return Err(format!("no such file in the workspace: {}", target));
+    }
+    let encoded: Vec<String> = resolved
+        .to_string_lossy()
+        .split('/')
+        .map(|seg| urlencoding::encode(seg).into_owned())
+        .collect();
+    Ok(format!("file://{}", encoded.join("/")))
 }
 
 /// Returns true for hosts that should never be reachable via `web_fetch`:
@@ -744,7 +872,7 @@ fn is_blocked_host(host: &str) -> bool {
     false
 }
 
-fn strip_html_tags(html: &str) -> String {
+pub(crate) fn strip_html_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut in_script = false;
@@ -2034,6 +2162,8 @@ pub(crate) async fn execute_agent_tool(
         "edit" | "str_replace" | "replace" => "edit_file",
         "append" | "append_to_file" => "append_file",
         "screenshot" | "screen_capture" | "take_screenshot" => "capture_screen",
+        "screenshot_page" | "capture_url" | "preview_page" | "screenshot_url" => "capture_page",
+        "processes" | "background_process" | "background_processes" => "process",
         "launch_app" | "open_application" | "activate_app" => "open_app",
         "ls" | "dir" => "list_files",
         "grep" | "rg" | "find" => "search_files",
@@ -2091,9 +2221,17 @@ pub(crate) async fn execute_agent_tool(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing command".to_string())?;
             let cwd = arguments.get("cwd").and_then(Value::as_str);
+            let timeout_secs = arg_u64(arguments, "timeout_secs")
+                .unwrap_or(crate::procs::DEFAULT_TIMEOUT_SECS)
+                .clamp(1, crate::procs::MAX_TIMEOUT_SECS);
+            let background = arg_bool(arguments, "background");
+            if background && !interactive {
+                // Nothing would ever stop a server started by a scheduled task or subagent.
+                return Err("background: true is only available in interactive chat. Run the command in the foreground (optionally with timeout_secs) instead.".to_string());
+            }
             let safety = is_dangerous_command(command);
             if !safety.dangerous {
-                run_command_scoped_unchecked(&effective_scope, command, cwd)
+                exec_agent_command(state, session_id, &effective_scope, command, cwd, timeout_secs, background).await
             } else if !interactive {
                 // Scheduled / background runs have no user to ask — hard block.
                 Err(format!(
@@ -2116,7 +2254,7 @@ pub(crate) async fn execute_agent_tool(
                 )
                 .await?;
                 if answer.trim().eq_ignore_ascii_case("run it") {
-                    run_command_scoped_unchecked(&effective_scope, command, cwd)
+                    exec_agent_command(state, session_id, &effective_scope, command, cwd, timeout_secs, background).await
                 } else {
                     Err(format!(
                         "The user declined to run this command (answered: {}). Do not retry it; choose a safer approach or ask the user what to do instead.",
@@ -2144,7 +2282,7 @@ pub(crate) async fn execute_agent_tool(
                             &format!("ALLOW: {}", note),
                             "ok",
                         );
-                        let out = run_command_scoped_unchecked(&effective_scope, command, cwd)?;
+                        let out = exec_agent_command(state, session_id, &effective_scope, command, cwd, timeout_secs, background).await?;
                         Ok(format!("[auto-verified: {}]\n{}", note, out))
                     }
                     crate::llm::CommandVerdict::Deny(note) => {
@@ -2192,7 +2330,7 @@ pub(crate) async fn execute_agent_tool(
                         .await;
                         match answer {
                             Ok(a) if a.trim().eq_ignore_ascii_case("run it") => {
-                                run_command_scoped_unchecked(&effective_scope, command, cwd)
+                                exec_agent_command(state, session_id, &effective_scope, command, cwd, timeout_secs, background).await
                             }
                             Ok(a) => Err(format!(
                                 "The user declined to run this command (answered: {}). Do not retry it; choose a safer approach or ask the user what to do instead.",
@@ -2244,7 +2382,26 @@ pub(crate) async fn execute_agent_tool(
                 .ok_or_else(|| "missing path".to_string())?;
             let start_line = arguments.get("start_line").and_then(Value::as_u64).map(|v| v as usize);
             let end_line = arguments.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
-            read_file_range_scoped(&effective_scope, path, start_line, end_line)
+            // Image files are shown to the model as an image rather than returned as
+            // (garbled) text. Same workspace boundary as a text read; the image rides the
+            // per-session side channel that capture_screen uses.
+            let image_path = if start_line.is_none() && end_line.is_none() {
+                resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)
+                    .ok()
+                    .filter(|p| crate::screen::image_kind(p).is_some() && p.is_file())
+            } else {
+                None
+            };
+            match image_path {
+                Some(resolved) => {
+                    let (media_type, data, note) = crate::screen::load_image_for_model(&resolved)?;
+                    if let Ok(mut map) = state.captured_images.lock() {
+                        map.entry(session_id.to_string()).or_default().push((media_type, data));
+                    }
+                    Ok(note)
+                }
+                None => read_file_range_scoped(&effective_scope, path, start_line, end_line),
+            }
         }
         "write_file" => {
             let path = arguments
@@ -2302,7 +2459,17 @@ pub(crate) async fn execute_agent_tool(
         }
         "capture_screen" => {
             let mode = arguments.get("mode").and_then(Value::as_str).unwrap_or("screen");
-            let (media_type, data, note) = crate::screen::capture_screen(mode)?;
+            let target_app = arguments
+                .get("app")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|a| !a.is_empty());
+            // With `app`, grab that app's window where it sits (even behind other windows)
+            // instead of whatever is frontmost — no focus change, nothing moves on screen.
+            let (media_type, data, note) = match target_app {
+                Some(name) => crate::screen::capture_app_window(name)?,
+                None => crate::screen::capture_screen(mode)?,
+            };
             // Stash the image on the per-session side channel; the chat loop attaches it to
             // this tool_result so the vision model can see it (tool dispatch returns text only).
             if let Ok(mut map) = state.captured_images.lock() {
@@ -2329,7 +2496,94 @@ pub(crate) async fn execute_agent_tool(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing app".to_string())?;
             let url = arguments.get("url").and_then(Value::as_str);
-            crate::screen::open_app(app_name, url)
+            crate::screen::open_app(app_name, url, arg_bool(arguments, "background"))
+        }
+        "capture_page" => {
+            let target = arguments
+                .get("url")
+                .or_else(|| arguments.get("path"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing url".to_string())?;
+            let url = resolve_page_target(&effective_scope, target)?;
+            let width = arg_u64(arguments, "width").unwrap_or(1280).clamp(320, 2560) as u32;
+            let height = arg_u64(arguments, "height").unwrap_or(800).clamp(240, 4000) as u32;
+            let wait_ms = arg_u64(arguments, "wait_ms").unwrap_or(3000).clamp(0, 20_000);
+            let capture = crate::browser::capture_page(&url, width, height, wait_ms).await?;
+            if let Some((media_type, data)) = capture.image {
+                // Nothing appeared on the user's screen, so show them in the chat what the
+                // model was shown (same event the desktop tile and paired phones render
+                // for capture_screen).
+                let _ = app.emit(
+                    "screen-captured",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "media_type": media_type,
+                        "data": data,
+                        "note": format!("Headless capture of {} ({}x{})", target, width, height),
+                    }),
+                );
+                if let Ok(mut map) = state.captured_images.lock() {
+                    map.entry(session_id.to_string()).or_default().push((media_type, data));
+                }
+            }
+            Ok(capture.report)
+        }
+        "process" => {
+            let action = arguments.get("action").and_then(Value::as_str).unwrap_or("list");
+            let need_id = || {
+                arg_u64(arguments, "id")
+                    .map(|v| v as u32)
+                    .ok_or_else(|| "missing id (the number run_command returned when it started the process)".to_string())
+            };
+            match action {
+                "list" => Ok(state.bg_processes.list(session_id)),
+                "output" | "read" | "logs" | "status" => {
+                    let id = need_id()?;
+                    let wait_for = arguments
+                        .get("wait_for")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|w| !w.is_empty());
+                    let mut waited_note = String::new();
+                    if let Some(needle) = wait_for {
+                        let wait_secs = arg_u64(arguments, "wait_secs").unwrap_or(30).clamp(1, 120);
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+                        loop {
+                            let (found, running) = state.bg_processes.log_contains(id, needle)?;
+                            if found {
+                                waited_note = format!("Found \"{}\" in the output.\n", needle);
+                                break;
+                            }
+                            if !running {
+                                waited_note = format!("The process exited before \"{}\" appeared.\n", needle);
+                                break;
+                            }
+                            if stop_requested_peek(state, session_id) {
+                                waited_note = "Stopped waiting (the user pressed Stop).\n".to_string();
+                                break;
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                waited_note = format!(
+                                    "Waited {}s but \"{}\" has not appeared in the output yet.\n",
+                                    wait_secs, needle
+                                );
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                    }
+                    let view = state.bg_processes.view(id, 6000)?;
+                    Ok(format!(
+                        "{}Process {} is {}.\nOutput:\n{}",
+                        waited_note,
+                        id,
+                        view.status,
+                        if view.output.trim().is_empty() { "(no output yet)" } else { view.output.as_str() }
+                    ))
+                }
+                "stop" | "kill" => state.bg_processes.stop(need_id()?, 3000),
+                other => Err(format!("unknown process action '{}' (use list, output or stop)", other)),
+            }
         }
         "list_files" => {
             let path = arguments
@@ -3374,6 +3628,8 @@ pub(crate) fn parse_tool_code_block(text: &str) -> Option<(String, String)> {
         "edit" | "str_replace" | "replace" => "edit_file",
         "append" | "append_to_file" => "append_file",
         "screenshot" | "screen_capture" | "take_screenshot" => "capture_screen",
+        "screenshot_page" | "capture_url" | "preview_page" | "screenshot_url" => "capture_page",
+        "processes" | "background_process" | "background_processes" => "process",
         "launch_app" | "open_application" | "activate_app" => "open_app",
         "ls" | "dir" => "list_files",
         "grep" | "rg" | "find" => "search_files",
@@ -3685,6 +3941,69 @@ mod tests {
         fs::write(root.join("a.txt"), "hi").unwrap();
         let resolved = resolve_within_workspace(&root, &canon, "a.txt", false).unwrap();
         assert!(resolved.starts_with(&canon));
+    }
+
+    #[test]
+    fn page_target_allows_loopback_public_and_workspace_files_only() {
+        let (root, root_canon) = test_workspace("page-target");
+        fs::create_dir_all(root.join("site dir")).unwrap();
+        fs::write(root.join("site dir").join("index.html"), "<h1>hi</h1>").unwrap();
+        let scope = WorkspaceScope { root: root.clone(), root_canon: root_canon.clone() };
+        let ok = |t: &str| resolve_page_target(&scope, t);
+
+        // Local dev servers are the point of the tool.
+        assert_eq!(ok("http://localhost:5173/app?x=1").unwrap(), "http://localhost:5173/app?x=1");
+        assert!(ok("http://127.0.0.1:3000").is_ok());
+        assert!(ok("http://[::1]:8080/").is_ok());
+        assert!(ok("http://app.localhost:1420").is_ok());
+        assert!(ok("https://example.com/docs").is_ok());
+
+        // Private-network, link-local/metadata and odd loopback spellings stay blocked.
+        assert!(ok("http://192.168.1.1/").is_err());
+        assert!(ok("http://10.0.0.5:8080/").is_err());
+        assert!(ok("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(ok("http://0.0.0.0:8000/").is_err());
+        assert!(ok("http://localhost.evil.com@10.0.0.1/").is_err());
+
+        // No other schemes.
+        for bad in ["file:///etc/passwd", "chrome://settings", "javascript:alert(1)", "data:text/html,x", "view-source:http://localhost"] {
+            assert!(ok(bad).is_err(), "{} should be refused", bad);
+        }
+        assert!(ok("").is_err());
+        assert!(ok("http://local host/").is_err());
+
+        // Workspace files become file:// URLs (percent-encoded); nothing outside the root.
+        let url = ok("site dir/index.html").unwrap();
+        assert!(url.starts_with("file:///"), "got {}", url);
+        assert!(url.ends_with("/site%20dir/index.html"), "got {}", url);
+        assert!(ok("../../etc/hosts").is_err());
+        assert!(ok("/etc/hosts").is_err());
+        assert!(ok("missing.html").is_err());
+        assert!(ok("site dir").is_err(), "a directory is not a page");
+    }
+
+    #[test]
+    fn tool_args_tolerate_stringly_typed_values() {
+        let args = serde_json::json!({"a": 30, "b": "45", "c": 2.0, "d": "x", "t": true, "u": "TRUE", "f": "no"});
+        assert_eq!(arg_u64(&args, "a"), Some(30));
+        assert_eq!(arg_u64(&args, "b"), Some(45));
+        assert_eq!(arg_u64(&args, "c"), Some(2));
+        assert_eq!(arg_u64(&args, "d"), None);
+        assert_eq!(arg_u64(&args, "missing"), None);
+        assert!(arg_bool(&args, "t"));
+        assert!(arg_bool(&args, "u"));
+        assert!(!arg_bool(&args, "f"));
+        assert!(!arg_bool(&args, "missing"));
+    }
+
+    #[test]
+    fn run_command_reports_exit_code_and_scopes_cwd() {
+        let (root, root_canon) = test_workspace("run-cmd");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let scope = WorkspaceScope { root: root.clone(), root_canon };
+        let out = run_command_scoped_unchecked(&scope, "basename \"$PWD\"; false", Some("sub")).unwrap();
+        assert_eq!(out, "sub\n[exit code 1]");
+        assert!(run_command_scoped_unchecked(&scope, "pwd", Some("../..")).is_err());
     }
 
     #[test]

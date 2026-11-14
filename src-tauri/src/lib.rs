@@ -1,4 +1,5 @@
 mod audio;
+mod browser;
 mod calendar;
 mod commands;
 mod config_tools;
@@ -12,6 +13,7 @@ mod memory;
 mod mobile;
 mod models;
 mod notify_user;
+mod procs;
 mod scheduler;
 mod screen;
 mod skills;
@@ -52,6 +54,9 @@ pub struct AppState {
     /// (media_type, base64). Drained per tool call by the chat loop. Side-channel because the
     /// tool dispatch returns plain text — see `tools::execute_agent_tool`.
     pub captured_images: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// Long-running shell processes (dev servers, watchers) the agent started with
+    /// `run_command` `background: true`. Stopped on quit and when their chat is deleted.
+    pub bg_processes: procs::ProcessRegistry,
     /// Folder of model-managed memory notes (`app_data_dir()/memory`). See memory.rs.
     pub memory_dir: PathBuf,
     /// Folder of skills (`app_data_dir()/skills/<name>/SKILL.md`). See skills.rs.
@@ -159,6 +164,7 @@ pub fn run() {
                 pending_questions: Mutex::new(HashMap::new()),
                 mcp: mcp::McpManager::default(),
                 captured_images: Mutex::new(HashMap::new()),
+                bg_processes: procs::ProcessRegistry::default(),
                 memory_dir: data_dir.join("memory"),
                 skills_dir: data_dir.join("skills"),
             });
@@ -217,7 +223,11 @@ pub fn run() {
                             let _ = w.set_focus();
                         }
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        // Don't leave agent-started dev servers running after the app is gone.
+                        app.state::<AppState>().bg_processes.kill_all();
+                        app.exit(0)
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {

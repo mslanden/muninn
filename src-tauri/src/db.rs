@@ -479,6 +479,24 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // Tools added to the "Files and shell" connection after it shipped inherit that
+    // connection's current switch, so a user who turned the shell off doesn't get new
+    // shell-adjacent tools switched on by an update. (Fresh DB: no row yet → enabled.)
+    for (tool_id, name, description, icon_name) in [
+        ("capture_page", "Capture Page", "Screenshot a web page or local dev server in a headless browser, with its console output and text.", "image"),
+        ("process", "Background Processes", "Read the output of, or stop, long-running processes started by Run Command.", "terminal"),
+    ] {
+        conn.execute(
+            r#"
+            INSERT INTO tools (tool_id, name, description, icon_name, enabled)
+            VALUES (?1, ?2, ?3, ?4, COALESCE((SELECT enabled FROM tools WHERE tool_id = 'run_command'), 1))
+            ON CONFLICT(tool_id) DO NOTHING
+            "#,
+            params![tool_id, name, description, icon_name],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
     let default_tools = [
         (
             "run_command",
@@ -490,8 +508,10 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
         ("write_file", "Write File", "Write content to a workspace file.", "edit"),
         ("edit_file", "Edit File", "Edit part of a file by exact-string replacement.", "edit"),
         ("append_file", "Append File", "Append or prepend content to a workspace file.", "edit"),
-        ("capture_screen", "Capture Screen", "Take a screenshot of the screen or frontmost window so the model can see it.", "image"),
+        ("capture_screen", "Capture Screen", "Take a screenshot of the screen, the frontmost window, or one app's window in the background.", "image"),
         ("open_app", "Open App", "Launch or focus a macOS app, optionally opening a URL in it.", "terminal"),
+        ("capture_page", "Capture Page", "Screenshot a web page or local dev server in a headless browser, with its console output and text.", "image"),
+        ("process", "Background Processes", "Read the output of, or stop, long-running processes started by Run Command.", "terminal"),
         ("list_files", "List Files", "List files in a workspace directory.", "folder"),
         (
             "search_files",

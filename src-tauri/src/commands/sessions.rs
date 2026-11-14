@@ -336,6 +336,7 @@ pub fn delete_session(state: State<AppState>, session_id: String) -> Result<bool
     // Clear any ephemeral per-session state so a reused id doesn't inherit stale data.
     crate::todos::clear_for_session(&state, &session_id);
     crate::interactive::cancel_question(&state, &session_id);
+    state.bg_processes.kill_session(&session_id);
 
     with_db(&state, |db| {
         db.execute("DELETE FROM tool_logs WHERE session_id = ?1", params![session_id.as_str()])
