@@ -2959,6 +2959,12 @@ struct StreamOutcome {
     usage_cached: u64,
 }
 
+/// Longest a single streamed model reply may take end to end.
+const STREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Longest gap between two chunks of a streamed reply before the connection is treated as
+/// dead. Generous because a reasoning model can think for a while before its first token.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Endpoints that rejected `stream_options` (remembered for the life of the process so the
 /// extra failed request happens once, not every round).
 fn no_stream_options() -> &'static Mutex<HashSet<String>> {
@@ -3133,7 +3139,17 @@ impl Provider {
                 .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01"),
         };
-        let response = request.json(body).send().await.map_err(|e| e.to_string())?;
+        // The shared client's 90s timeout covers the WHOLE request, body included — fine for
+        // one-shot calls, but it cut every streamed reply that took longer than 90s to
+        // generate (a long answer or a big write_file) with "error decoding response
+        // body". Streams get a generous overall cap instead, and `parse_stream` enforces
+        // an idle timeout between chunks, which is what actually detects a dead connection.
+        let response = request
+            .json(body)
+            .timeout(STREAM_TOTAL_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the model: {}", e))?;
         let status = response.status();
         if !status.is_success() {
             // Keep the status even when the error body isn't JSON (proxies, gateways).
@@ -3161,7 +3177,23 @@ impl Provider {
         let mut anthropic_calls: Vec<ToolCall> = Vec::new();
         let mut current_event_type = String::new();
 
-        while let Some(bytes) = response.chunk().await.map_err(|e| e.to_string())? {
+        loop {
+            let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, response.chunk()).await {
+                Ok(Ok(chunk)) => chunk,
+                Ok(Err(e)) => {
+                    return Err(format!(
+                        "The model's reply was cut off mid-stream ({}). Nothing after this point was received — send the message again to retry.",
+                        e
+                    ))
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "The model stopped sending data for {}s, so the reply was abandoned. Send the message again to retry.",
+                        STREAM_IDLE_TIMEOUT.as_secs()
+                    ))
+                }
+            };
+            let Some(bytes) = chunk else { break };
             line_buf.push_str(&String::from_utf8_lossy(&bytes));
 
             while let Some(newline_pos) = line_buf.find('\n') {
@@ -4230,6 +4262,84 @@ mod tests {
     }
     fn anthropic_provider() -> Provider {
         Provider::Anthropic { endpoint: "https://example.test/v1/messages".into(), api_key: "k".into() }
+    }
+
+    /// Serve one HTTP request with an SSE body that trickles out over ~2.4s.
+    async fn slow_sse_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read the request: headers, then Content-Length bytes of body.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            for word in ["slow ", "but ", "complete"] {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                let line = format!("data: {}\n\n", json!({"choices": [{"delta": {"content": word}}]}));
+                sock.write_all(line.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            sock.write_all(b"data: [DONE]\n\n").await.unwrap();
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{}/v1/chat/completions", addr)
+    }
+
+    /// Regression: the shared client's total timeout used to cut any streamed reply that
+    /// took longer than it to generate ("error decoding response body").
+    #[tokio::test]
+    async fn streamed_replies_outlive_the_clients_total_timeout() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        // Baseline: without the per-request override the stream dies at the client timeout.
+        let endpoint = slow_sse_server().await;
+        let mut resp = client.post(&endpoint).json(&json!({})).send().await.unwrap();
+        let mut failed = false;
+        loop {
+            match resp.chunk().await {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "expected the 1s client timeout to cut a 2.4s stream");
+
+        // Through Provider::send the same stream completes.
+        let endpoint = slow_sse_server().await;
+        let provider = Provider::OpenAi { endpoint, api_key: "k".into() };
+        let body = provider.build_request("m", "sys", &[], &[], 100, true);
+        let response = provider.send(&client, &body).await.unwrap();
+        let mut seen = String::new();
+        let outcome = provider.parse_stream(response, |t| seen.push_str(t)).await.unwrap();
+        assert_eq!(outcome.text, "slow but complete");
+        assert_eq!(seen, "slow but complete");
     }
 
     #[test]

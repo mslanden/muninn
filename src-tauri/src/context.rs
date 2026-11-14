@@ -482,14 +482,20 @@ async fn summarize(state: &AppState, previous: &str, transcript: &str) -> Result
         state.http.post(&cfg.endpoint).bearer_auth(&cfg.api_key)
     };
     let send = async {
-        let resp = request.json(&body).send().await.map_err(|e| e.to_string())?;
+        // Longer than the shared client's 90s default: summarizing a long transcript is slow.
+        let resp = request
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(240))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("HTTP {}", status));
         }
         resp.json::<Value>().await.map_err(|e| e.to_string())
     };
-    let parsed = tokio::time::timeout(std::time::Duration::from_secs(120), send)
+    let parsed = tokio::time::timeout(std::time::Duration::from_secs(240), send)
         .await
         .map_err(|_| "timed out".to_string())??;
     let text = if cfg.is_anthropic {
