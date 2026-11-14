@@ -79,6 +79,18 @@ pub(crate) fn setting_schema() -> &'static [SettingDef] {
             gated: false,
         },
         SettingDef {
+            key: "llm/context_budget_tokens",
+            description: "How much conversation (in tokens) is sent to the model before older messages are summarized and old tool output is cleared. Lower it for models with a small context window or to cut cost. Empty resets to the default (300000).",
+            kind: Int { min: 16_000, max: 2_000_000, allow_empty: true },
+            gated: false,
+        },
+        SettingDef {
+            key: "llm/auto_compact",
+            description: "Summarize the older part of a long conversation instead of silently dropping it once the context budget is reached (default on).",
+            kind: Bool01,
+            gated: false,
+        },
+        SettingDef {
             key: "llm/custom_base_url",
             description: "Base URL for the 'custom' OpenAI-compatible provider (e.g. http://localhost:11434/v1). Only used when llm/provider is 'custom'.",
             kind: Text,

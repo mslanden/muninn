@@ -115,14 +115,35 @@ export async function setupEventListeners() {
   });
 
   await listen("chat-usage", (event) => {
-    const { session_id, input_tokens, output_tokens } = event.payload;
+    const { session_id, input_tokens, output_tokens, cached_tokens } = event.payload;
     const tile = getChatTileBySessionId(session_id);
     if (!tile) return;
     const stream = chatStreams[tile.id];
     if (!stream) return;
     const total = input_tokens + output_tokens;
     stream.contextTokens = total;
-    updateContextBar(tile.id, total);
+    // Share of this request the provider served from its prompt cache (0 = none reported).
+    const cachedPct = input_tokens > 0 ? Math.round(((cached_tokens || 0) / input_tokens) * 100) : 0;
+    updateContextBar(tile.id, total, cachedPct);
+  });
+
+  // The older part of a long chat was summarized so the model keeps the thread without the
+  // full history. Messages stay in the chat; only what is sent to the model changed.
+  await listen("context-compacted", (event) => {
+    const { session_id, messages, ok } = event.payload;
+    if (!ok || !messages) return;
+    tiles
+      .filter(t => t.type === "chat" && chatStreams[t.id]?.sessionId === session_id)
+      .forEach(t => {
+        const chatLog = t.el.querySelector(`[data-chat-stream="${t.id}"]`);
+        if (chatLog) {
+          addTurn(
+            chatLog,
+            "muninn",
+            `🗜️ Summarized ${Number(messages)} earlier messages to free up context. Nothing was deleted — the model now works from a summary of them.`
+          );
+        }
+      });
   });
 
   await listen("tool-start", (event) => {

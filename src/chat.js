@@ -1291,7 +1291,7 @@ export function parseSlashCommand(text) {
 
 export const CONTEXT_WINDOW = 1000000;
 
-export function updateContextBar(tileId, tokens) {
+export function updateContextBar(tileId, tokens, cachedPct = 0) {
   const ring = document.querySelector(`[data-context-bar="${tileId}"]`);
   const fill = document.querySelector(`[data-context-fill="${tileId}"]`);
   if (!ring || !fill) return;
@@ -1302,7 +1302,8 @@ export function updateContextBar(tileId, tokens) {
 
   const used = tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : `${tokens}`;
   const max = `${(CONTEXT_WINDOW / 1000).toFixed(0)}k`;
-  ring.title = `Context: ${used} / ${max} tokens (${pct.toFixed(0)}%)`;
+  const cached = cachedPct > 0 ? ` · ${cachedPct}% of the last request served from cache` : "";
+  ring.title = `Context: ${used} / ${max} tokens (${pct.toFixed(0)}%)${cached}`;
   ring.hidden = tokens <= 0;
 }
 

@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -239,9 +239,29 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 10)?;
     }
 
+    if version < 11 {
+        // Conversation compaction: a rolling summary of the session's older messages and the
+        // id of the last message it covers. A turn sends the summary plus every message
+        // after that id (see context.rs). Messages themselves are never deleted.
+        let has_sessions = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .is_some();
+        if has_sessions {
+            exec_migration(conn, "ALTER TABLE sessions ADD COLUMN context_summary TEXT NOT NULL DEFAULT ''")?;
+            exec_migration(conn, "ALTER TABLE sessions ADD COLUMN summary_upto_id INTEGER NOT NULL DEFAULT 0")?;
+        }
+        set_schema_version(conn, 11)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 10, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 11, "add a migration block for the new version");
 
     Ok(())
 }
@@ -1022,47 +1042,98 @@ pub(crate) fn sanitize_tool_pairs(history: &mut Vec<HistoryMessage>) {
 
 /// Load the full structured history for a session, including hidden tool-round turns.
 /// Legacy rows (content_json empty) are wrapped as a single text block so they still replay.
-pub(crate) fn load_history_structured(
+/// Build a `HistoryMessage` from a stored `messages` row.
+fn history_message_from_row(role: String, content: String, content_json: &str) -> HistoryMessage {
+    let blocks: Vec<Value> = if content_json.trim().is_empty() {
+        // Legacy row — treat as a single text block. Skip if the text is empty (shouldn't
+        // happen, but some older rows with tool output placeholders could be blank).
+        if content.is_empty() {
+            Vec::new()
+        } else {
+            vec![serde_json::json!({"type": "text", "text": content})]
+        }
+    } else {
+        serde_json::from_str(content_json)
+            .unwrap_or_else(|_| vec![serde_json::json!({"type": "text", "text": content})])
+    };
+    HistoryMessage { role, blocks }
+}
+
+/// The newest `limit` messages of a session with id greater than `after_id`, oldest first,
+/// each with its row id. `after_id` is the session's compaction point (0 = from the start).
+pub(crate) fn load_history_rows(
     state: &AppState,
     session_id: &str,
+    after_id: i64,
     limit: usize,
-) -> Result<Vec<HistoryMessage>, String> {
-    with_db(state, |db| {
-        let mut stmt = db
-            .prepare(
-                "SELECT role, content, content_json FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![session_id, limit as i64], |row| {
-                let role: String = row.get(0)?;
-                let content: String = row.get(1)?;
-                let content_json: String = row.get(2)?;
-                Ok((role, content, content_json))
-            })
-            .map_err(|e| e.to_string())?;
+) -> Result<Vec<(i64, HistoryMessage)>, String> {
+    with_db(state, |db| load_history_rows_conn(db, session_id, after_id, limit))
+}
 
-        let mut items: Vec<HistoryMessage> = Vec::new();
-        for row in rows {
-            let (role, content, content_json) = row.map_err(|e| e.to_string())?;
-            let blocks: Vec<Value> = if content_json.trim().is_empty() {
-                // Legacy row — treat as a single text block. Skip if the text is empty (shouldn't
-                // happen, but some older rows with tool output placeholders could be blank).
-                if content.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![serde_json::json!({"type": "text", "text": content})]
-                }
-            } else {
-                serde_json::from_str(&content_json).unwrap_or_else(|_| {
-                    vec![serde_json::json!({"type": "text", "text": content})]
-                })
-            };
-            items.push(HistoryMessage { role, blocks });
-        }
-        items.reverse();
-        Ok(items)
-    })
+fn load_history_rows_conn(
+    db: &Connection,
+    session_id: &str,
+    after_id: i64,
+    limit: usize,
+) -> Result<Vec<(i64, HistoryMessage)>, String> {
+    let mut stmt = db
+        .prepare(
+            "SELECT id, role, content, content_json FROM messages \
+             WHERE session_id = ?1 AND id > ?2 ORDER BY id DESC LIMIT ?3",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id, after_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (id, role, content, content_json) = row.map_err(|e| e.to_string())?;
+        items.push((id, history_message_from_row(role, content, &content_json)));
+    }
+    items.reverse();
+    Ok(items)
+}
+
+/// A session's compaction state: (summary of older messages, id of the last message the
+/// summary covers). ("", 0) when the session has never been compacted.
+pub(crate) fn get_context_summary(state: &AppState, session_id: &str) -> Result<(String, i64), String> {
+    with_db(state, |db| get_context_summary_conn(db, session_id))
+}
+
+fn get_context_summary_conn(db: &Connection, session_id: &str) -> Result<(String, i64), String> {
+    db.query_row(
+        "SELECT context_summary, summary_upto_id FROM sessions WHERE id = ?1",
+        params![session_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )
+    .optional()
+    .map(|r| r.unwrap_or_default())
+    .map_err(|e| e.to_string())
+}
+
+pub(crate) fn set_context_summary(
+    state: &AppState,
+    session_id: &str,
+    summary: &str,
+    upto_id: i64,
+) -> Result<(), String> {
+    with_db(state, |db| set_context_summary_conn(db, session_id, summary, upto_id))
+}
+
+fn set_context_summary_conn(db: &Connection, session_id: &str, summary: &str, upto_id: i64) -> Result<(), String> {
+    db.execute(
+        "UPDATE sessions SET context_summary = ?1, summary_upto_id = ?2 WHERE id = ?3",
+        params![summary, upto_id, session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1196,6 +1267,45 @@ mod tests {
         init_db(&conn).unwrap();
         let version = get_schema_version(&conn).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn compaction_state_round_trips_and_history_loads_after_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO sessions (id) VALUES ('s1')", []).unwrap();
+        conn.execute("INSERT INTO sessions (id) VALUES ('other')", []).unwrap();
+        for i in 1..=6 {
+            let blocks = serde_json::to_string(&vec![json!({"type": "text", "text": format!("m{}", i)})]).unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, content_json) VALUES ('s1', ?1, ?2, ?3)",
+                params![if i % 2 == 1 { "user" } else { "assistant" }, format!("m{}", i), blocks],
+            )
+            .unwrap();
+        }
+        conn.execute("INSERT INTO messages (session_id, role, content) VALUES ('other', 'user', 'x')", []).unwrap();
+
+        // Never compacted: empty summary, everything loads, oldest first, with row ids.
+        assert_eq!(get_context_summary_conn(&conn, "s1").unwrap(), (String::new(), 0));
+        let all = load_history_rows_conn(&conn, "s1", 0, 100).unwrap();
+        assert_eq!(all.len(), 6);
+        assert_eq!(all[0].1.plain_text(), "m1");
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
+
+        // The limit keeps the newest rows.
+        let newest = load_history_rows_conn(&conn, "s1", 0, 2).unwrap();
+        assert_eq!(newest.iter().map(|(_, m)| m.plain_text()).collect::<Vec<_>>(), vec!["m5", "m6"]);
+
+        // After compacting through the 4th message only later ones load.
+        let upto = all[3].0;
+        set_context_summary_conn(&conn, "s1", "they talked", upto).unwrap();
+        assert_eq!(get_context_summary_conn(&conn, "s1").unwrap(), ("they talked".to_string(), upto));
+        let rest = load_history_rows_conn(&conn, "s1", upto, 100).unwrap();
+        assert_eq!(rest.iter().map(|(_, m)| m.plain_text()).collect::<Vec<_>>(), vec!["m5", "m6"]);
+
+        // Other sessions are unaffected; unknown sessions read as never compacted.
+        assert_eq!(get_context_summary_conn(&conn, "other").unwrap(), (String::new(), 0));
+        assert_eq!(get_context_summary_conn(&conn, "nope").unwrap(), (String::new(), 0));
     }
 
     #[test]

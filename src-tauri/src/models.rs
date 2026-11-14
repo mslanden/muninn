@@ -295,6 +295,9 @@ pub struct ChatUsageEvent {
     pub session_id: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// How many of `input_tokens` the provider served from its prompt cache this round
+    /// (0 when the provider reports no cache usage).
+    pub cached_tokens: u64,
 }
 
 #[derive(Clone, Serialize)]

@@ -3,6 +3,7 @@ mod browser;
 mod calendar;
 mod commands;
 mod config_tools;
+mod context;
 mod db;
 mod feeds;
 mod interactive;

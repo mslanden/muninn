@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
 
 use crate::AppState;
@@ -59,6 +60,9 @@ fn history_to_openai(history: &[HistoryMessage]) -> Vec<Value> {
             }
             "user" => {
                 let mut text_acc = String::new();
+                // Attached images become `image_url` parts (data URLs), the OpenAI
+                // chat-completions shape that vision models on this wire format accept.
+                let mut image_parts: Vec<Value> = Vec::new();
                 for b in &h.blocks {
                     match b.get("type").and_then(Value::as_str) {
                         Some("text") => {
@@ -67,6 +71,17 @@ fn history_to_openai(history: &[HistoryMessage]) -> Vec<Value> {
                                     text_acc.push('\n');
                                 }
                                 text_acc.push_str(t);
+                            }
+                        }
+                        Some("image") => {
+                            let source = b.get("source");
+                            let media = source.and_then(|s| s.get("media_type")).and_then(Value::as_str);
+                            let data = source.and_then(|s| s.get("data")).and_then(Value::as_str);
+                            if let (Some(media), Some(data)) = (media, data) {
+                                image_parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {"url": format!("data:{};base64,{}", media, data)}
+                                }));
                             }
                         }
                         Some("tool_result") => {
@@ -98,7 +113,14 @@ fn history_to_openai(history: &[HistoryMessage]) -> Vec<Value> {
                         _ => {}
                     }
                 }
-                if !text_acc.is_empty() {
+                if !image_parts.is_empty() {
+                    let mut parts = Vec::with_capacity(image_parts.len() + 1);
+                    if !text_acc.is_empty() {
+                        parts.push(json!({"type": "text", "text": text_acc}));
+                    }
+                    parts.extend(image_parts);
+                    out.push(json!({"role": "user", "content": parts}));
+                } else if !text_acc.is_empty() {
                     out.push(json!({"role": "user", "content": text_acc}));
                 }
             }
@@ -2933,6 +2955,34 @@ struct StreamOutcome {
     tool_calls: Vec<ToolCall>,
     usage_input: u64,
     usage_output: u64,
+    /// Input tokens served from the provider's prompt cache (0 if not reported).
+    usage_cached: u64,
+}
+
+/// Endpoints that rejected `stream_options` (remembered for the life of the process so the
+/// extra failed request happens once, not every round).
+fn no_stream_options() -> &'static Mutex<HashSet<String>> {
+    static SET: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// `endpoint|model` pairs that rejected image input, so later requests send text only.
+fn no_vision() -> &'static Mutex<HashSet<String>> {
+    static SET: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn set_contains(set: &Mutex<HashSet<String>>, key: &str) -> bool {
+    set.lock().unwrap_or_else(|p| p.into_inner()).contains(key)
+}
+
+fn set_insert(set: &Mutex<HashSet<String>>, key: &str) {
+    set.lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string());
+}
+
+/// Whether a `Provider::send` error is an HTTP 4xx (the request itself was refused).
+fn is_client_error(err: &str) -> bool {
+    err.contains(" API error 4")
 }
 
 /// Provider-specific wire format. Everything the OpenAI chat/completions and the
@@ -3040,16 +3090,30 @@ impl Provider {
         }
     }
 
-    fn build_request(&self, model: &str, system_prompt: &str, messages: &[Value], tools: &[Value], max_tokens: u64) -> Value {
+    fn endpoint(&self) -> &str {
         match self {
-            Self::OpenAi { .. } => json!({
-                "model": model,
-                "messages": messages,
-                "tools": tools,
-                "tool_choice": "auto",
-                "max_tokens": max_tokens,
-                "stream": true
-            }),
+            Self::OpenAi { endpoint, .. } | Self::Anthropic { endpoint, .. } => endpoint,
+        }
+    }
+
+    /// `include_usage` asks OpenAI-format streams for a final usage chunk (token counts and
+    /// prompt-cache hits); without it they report none. Anthropic streams always report usage.
+    fn build_request(&self, model: &str, system_prompt: &str, messages: &[Value], tools: &[Value], max_tokens: u64, include_usage: bool) -> Value {
+        match self {
+            Self::OpenAi { .. } => {
+                let mut body = json!({
+                    "model": model,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "max_tokens": max_tokens,
+                    "stream": true
+                });
+                if include_usage {
+                    body["stream_options"] = json!({"include_usage": true});
+                }
+                body
+            }
             Self::Anthropic { .. } => json!({
                 "model": model,
                 "max_tokens": max_tokens,
@@ -3072,7 +3136,9 @@ impl Provider {
         let response = request.json(body).send().await.map_err(|e| e.to_string())?;
         let status = response.status();
         if !status.is_success() {
-            let body: Value = response.json().await.map_err(|e| e.to_string())?;
+            // Keep the status even when the error body isn't JSON (proxies, gateways).
+            let text = response.text().await.unwrap_or_default();
+            let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
             return Err(format!("{} API error {}: {}", self.label(), status, body));
         }
         Ok(response)
@@ -3087,6 +3153,7 @@ impl Provider {
         let mut text = String::new();
         let mut usage_input: u64 = 0;
         let mut usage_output: u64 = 0;
+        let mut usage_cached: u64 = 0;
         let mut line_buf = String::new();
 
         // OpenAI keys partial tool calls by stream index; Anthropic appends in order.
@@ -3121,6 +3188,14 @@ impl Provider {
                             }
                             if let Some(v) = usage.get("completion_tokens").and_then(Value::as_u64) {
                                 usage_output = v;
+                            }
+                            // Prompt-cache hits (already included in prompt_tokens).
+                            if let Some(v) = usage
+                                .get("prompt_tokens_details")
+                                .and_then(|d| d.get("cached_tokens"))
+                                .and_then(Value::as_u64)
+                            {
+                                usage_cached = v;
                             }
                         }
                         let delta = match data
@@ -3164,7 +3239,11 @@ impl Provider {
                     Self::Anthropic { .. } => match current_event_type.as_str() {
                         "message_start" => {
                             if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
-                                usage_input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                                // Anthropic reports cached tokens separately from
+                                // input_tokens; the request's real size is the sum.
+                                let field = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+                                usage_cached = field("cache_read_input_tokens");
+                                usage_input = field("input_tokens") + usage_cached + field("cache_creation_input_tokens");
                             }
                         }
                         "message_delta" => {
@@ -3227,6 +3306,7 @@ impl Provider {
             tool_calls,
             usage_input,
             usage_output,
+            usage_cached,
         })
     }
 
@@ -3276,8 +3356,9 @@ impl Provider {
 
     /// Like `push_tool_result`, but also attaches captured images so a vision model can see
     /// them. For Anthropic the images ride as sibling blocks in the same user turn as the
-    /// tool_result (a well-supported shape); OpenAI tool messages are text-only, so the
-    /// images are dropped there with the text result kept.
+    /// tool_result (a well-supported shape). OpenAI tool messages are text-only and all of a
+    /// round's tool messages must be consecutive, so there the images are sent after the
+    /// round in one user message — see `push_round_images`.
     fn push_tool_result_with_images(
         &self,
         messages: &mut Vec<Value>,
@@ -3287,9 +3368,8 @@ impl Provider {
     ) {
         match self {
             Self::OpenAi { .. } => {
-                // Say so, rather than let the tool's "image attached" note mislead the model.
                 let output = format!(
-                    "{}\n[Note: {} image(s) could not be shown to you — this provider's tool results are text-only.]",
+                    "{}\n[The {} image(s) for this result are in the user message that follows the tool results.]",
                     output,
                     images.len()
                 );
@@ -3305,6 +3385,18 @@ impl Provider {
                 }
                 messages.push(json!({"role": "user", "content": content}));
             }
+        }
+    }
+
+    /// OpenAI wire format only: after every tool message of a round has been pushed, send
+    /// the images those tools produced as one user message. No-op for Anthropic (images are
+    /// already attached to their tool_result) and when the round produced none.
+    fn push_round_images(&self, messages: &mut Vec<Value>, images: &[(String, String)]) {
+        if images.is_empty() {
+            return;
+        }
+        if let Self::OpenAi { .. } = self {
+            messages.push(crate::context::tool_image_message_openai(images));
         }
     }
 
@@ -3499,8 +3591,72 @@ fn resolve_max_output_tokens(state: &AppState) -> u64 {
 /// report `usage` (MiniMax's Anthropic-compatible endpoint often omits it) — far closer
 /// to the truth than the frontend's fallback, which counts only visible chat bubbles.
 fn estimate_request_tokens(system_prompt: &str, messages: &[Value]) -> u64 {
-    let messages_chars: usize = messages.iter().map(|m| m.to_string().len()).sum();
-    ((system_prompt.len() + messages_chars) / 4) as u64
+    // Image blocks count as a fixed size: their base64 length would overstate them ~100x.
+    ((system_prompt.len() + crate::context::messages_chars(messages)) / 4) as u64
+}
+
+/// Send one round's request, recovering from two things an OpenAI-compatible endpoint may
+/// refuse outright: the `stream_options` field, and image input on a text-only model. Each
+/// is retried once without the offending part and remembered, so a custom provider that
+/// lacks either keeps working instead of failing every turn. `messages` is updated in place
+/// when images had to be stripped.
+#[allow(clippy::too_many_arguments)]
+async fn send_round(
+    state: &AppState,
+    session_id: &str,
+    provider: &Provider,
+    model: &str,
+    system_prompt: &str,
+    messages: &mut Vec<Value>,
+    tools: &[Value],
+    max_tokens: u64,
+) -> Result<reqwest::Response, String> {
+    let endpoint = provider.endpoint().to_string();
+    let vision_key = format!("{}|{}", endpoint, model);
+    if set_contains(no_vision(), &vision_key) {
+        crate::context::strip_all_images(messages);
+    }
+
+    let mut include_usage = !set_contains(no_stream_options(), &endpoint);
+    let mut body = provider.build_request(model, system_prompt, messages, tools, max_tokens, include_usage);
+    let mut result = provider.send(&state.http, &body).await;
+
+    if let Err(err) = &result {
+        if include_usage && is_client_error(err) && err.contains("stream_options") {
+            set_insert(no_stream_options(), &endpoint);
+            include_usage = false;
+            body = provider.build_request(model, system_prompt, messages, tools, max_tokens, false);
+            result = provider.send(&state.http, &body).await;
+        }
+    }
+
+    if let Err(err) = &result {
+        if is_client_error(err) && crate::context::contains_images(messages) {
+            let mut text_only = messages.clone();
+            crate::context::strip_all_images(&mut text_only);
+            let retry = provider.build_request(model, system_prompt, &text_only, tools, max_tokens, include_usage);
+            // Only conclude "no vision" if the same request without images is accepted —
+            // otherwise the refusal was about something else and the original error stands.
+            if let Ok(response) = provider.send(&state.http, &retry).await {
+                set_insert(no_vision(), &vision_key);
+                *messages = text_only;
+                crate::db::add_feed_item(
+                    state,
+                    "system",
+                    "Images not supported by this model",
+                    &format!(
+                        "'{}' rejected image input ({}). Images are being left out for this model until the app restarts.",
+                        model,
+                        crate::tools::truncate_chars(err, 200)
+                    ),
+                    "error",
+                    session_id,
+                );
+                return Ok(response);
+            }
+        }
+    }
+    result
 }
 
 /// Take and clear any images `capture_screen` stashed for this session during the current
@@ -3602,6 +3758,7 @@ async fn run_tool_loop(
     tools.extend(provider.mcp_tools_json(&state.mcp.connected_tools(state).await));
     let mut messages = provider.initial_messages(system_prompt, history);
     let max_tokens = resolve_max_output_tokens(state);
+    let context_budget = crate::context::budget_chars(state);
     let mut tool_round: u32 = 0;
     let mut iteration: i64 = 0;
     let mut fallback_tried = false;
@@ -3637,8 +3794,14 @@ async fn run_tool_loop(
             });
         }
 
-        let request_body = provider.build_request(&model, system_prompt, &messages, &tools, max_tokens);
-        let response = match provider.send(&state.http, &request_body).await {
+        // Keep the outgoing conversation inside the budget: drop stale tool images, and once
+        // it nears the limit clear old tool output (see context.rs).
+        crate::context::maintain(&mut messages, context_budget);
+        let response = match send_round(
+            state, session_id, &provider, &model, system_prompt, &mut messages, &tools, max_tokens,
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(err) => {
                 // Provider failover (llm/fallback_provider): only on the turn's FIRST
@@ -3705,6 +3868,7 @@ async fn run_tool_loop(
                 session_id: session_id.to_string(),
                 input_tokens,
                 output_tokens,
+                cached_tokens: outcome.usage_cached.min(input_tokens),
             });
         }
 
@@ -3749,6 +3913,7 @@ async fn run_tool_loop(
             }
 
             let mut tool_result_blocks: Vec<Value> = Vec::new();
+            let mut round_images: Vec<(String, String)> = Vec::new();
             for (call, (output, images)) in calls.iter().zip(results) {
                 let output = note_repeated_failure(&mut failed_calls, &call.name, &call.args, output);
                 // Attach captured images as sibling image blocks in the tool_result turn so
@@ -3768,8 +3933,10 @@ async fn run_tool_loop(
                         "tool_use_id": call.id,
                         "content": format!("{} [{} image(s) shown to the model]", output, images.len()),
                     }));
+                    round_images.extend(images);
                 }
             }
+            provider.push_round_images(&mut messages, &round_images);
             let _ = insert_message(
                 state,
                 session_id,
@@ -4057,6 +4224,104 @@ pub(crate) async fn run_project_init(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn openai_provider() -> Provider {
+        Provider::OpenAi { endpoint: "https://example.test/v1/chat/completions".into(), api_key: "k".into() }
+    }
+    fn anthropic_provider() -> Provider {
+        Provider::Anthropic { endpoint: "https://example.test/v1/messages".into(), api_key: "k".into() }
+    }
+
+    #[test]
+    fn openai_history_carries_user_images_as_image_url_parts() {
+        let history = vec![
+            HistoryMessage {
+                role: "user".into(),
+                blocks: vec![
+                    json!({"type": "text", "text": "what is this?"}),
+                    json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}),
+                ],
+            },
+            HistoryMessage::text("assistant", "a cat"),
+            HistoryMessage::text("user", "thanks"),
+        ];
+        let out = history_to_openai(&history);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["content"][0], json!({"type": "text", "text": "what is this?"}));
+        assert_eq!(out[0]["content"][1]["type"], "image_url");
+        assert_eq!(out[0]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        // Text-only turns keep the plain-string shape.
+        assert_eq!(out[2]["content"], "thanks");
+
+        // An image-only turn has no empty text part.
+        let image_only = vec![HistoryMessage {
+            role: "user".into(),
+            blocks: vec![json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "Zm9v"}})],
+        }];
+        let out = history_to_openai(&image_only);
+        assert_eq!(out[0]["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn openai_tool_images_follow_the_tool_messages_in_one_user_message() {
+        let p = openai_provider();
+        let img = ("image/png".to_string(), "QUJD".to_string());
+        let mut messages = vec![json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1"}, {"id": "c2"}]})];
+        p.push_tool_result_with_images(&mut messages, "c1", "Captured.", &[img.clone()]);
+        p.push_tool_result(&mut messages, "c2", "ok");
+        p.push_round_images(&mut messages, &[img.clone()]);
+        // Tool messages stay consecutive; the image comes after them.
+        assert_eq!(messages[1]["role"], "tool");
+        assert!(messages[1]["content"].as_str().unwrap().contains("user message that follows"));
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"][0]["text"], crate::context::TOOL_IMAGE_NOTE);
+        assert_eq!(messages[3]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        // No images → nothing pushed.
+        let before = messages.len();
+        p.push_round_images(&mut messages, &[]);
+        assert_eq!(messages.len(), before);
+
+        // Anthropic attaches the image to the tool_result turn and adds no extra message.
+        let a = anthropic_provider();
+        let mut messages = Vec::new();
+        a.push_tool_result_with_images(&mut messages, "t1", "Captured.", &[img.clone()]);
+        a.push_round_images(&mut messages, &[img]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[0]["content"][1]["type"], "image");
+    }
+
+    #[test]
+    fn openai_requests_ask_for_usage_unless_told_not_to() {
+        let p = openai_provider();
+        let with = p.build_request("m", "sys", &[], &[], 100, true);
+        assert_eq!(with["stream_options"], json!({"include_usage": true}));
+        let without = p.build_request("m", "sys", &[], &[], 100, false);
+        assert!(without.get("stream_options").is_none());
+        // Anthropic never gets the OpenAI-only field.
+        let a = anthropic_provider().build_request("m", "sys", &[], &[], 100, true);
+        assert!(a.get("stream_options").is_none());
+        assert_eq!(a["system"], "sys");
+    }
+
+    #[test]
+    fn client_errors_are_recognised_from_send_errors() {
+        assert!(is_client_error("OpenAI API error 400 Bad Request: {\"error\":\"x\"}"));
+        assert!(is_client_error("OpenAI API error 422 Unprocessable Entity: nope"));
+        assert!(!is_client_error("OpenAI API error 500 Internal Server Error: boom"));
+        assert!(!is_client_error("error sending request for url"));
+    }
+
+    #[test]
+    fn request_estimate_counts_images_at_a_fixed_size() {
+        let messages = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(2_000_000)}}
+        ]})];
+        let tokens = estimate_request_tokens("system", &messages);
+        assert!(tokens < 3_000, "a 2 MB screenshot must not read as {} tokens", tokens);
+    }
 
     #[test]
     fn repeated_identical_failures_get_a_stop_note() {
