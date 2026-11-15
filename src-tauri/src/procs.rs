@@ -297,9 +297,101 @@ pub async fn run_async(
 // Background processes
 // ---------------------------------------------------------------------------------------
 
+/// One running background process as recorded on disk, so a later launch of the app can
+/// find and stop it if this run ends without cleaning up (crash, SIGKILL, power loss).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+struct LedgerEntry {
+    /// Pid of the group leader, which is also the process-group id.
+    pid: u32,
+    /// The leader's start time as `ps` reports it — tells our process apart from an
+    /// unrelated one that was later given the same pid.
+    started: String,
+    command: String,
+}
+
+/// Start time of `pid` as printed by `ps -o lstart=`, or None if there is no such process.
+fn process_start_time(pid: u32) -> Option<String> {
+    let out = Command::new("/bin/ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !text.is_empty()).then_some(text)
+}
+
+/// Whether any process still belongs to process group `pgid`.
+fn group_alive(pgid: u32) -> bool {
+    Command::new("/bin/kill")
+        .arg("-0")
+        .arg("--")
+        .arg(format!("-{}", pgid))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn read_ledger(path: &Path) -> Vec<LedgerEntry> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn write_ledger(path: &Path, entries: &[LedgerEntry]) {
+    // Write-then-rename so a crash mid-write can't leave a half-written ledger.
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(bytes) = serde_json::to_vec(entries) {
+        if fs::write(&tmp, bytes).is_ok() {
+            let _ = fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// Stop background processes a previous run of the app left behind, as recorded in the
+/// ledger at `path`, and clear it. Returns the commands that were stopped.
+///
+/// Killing by a stored pid is only safe if it is still *our* process. A pid is never handed
+/// to a new process while a process group with that id exists, so:
+/// - leader alive with the recorded start time → ours, stop the group;
+/// - leader alive with a different start time → the pid was reused, which means our group
+///   is completely gone → leave it alone;
+/// - leader gone but the group still has members → they are ours (the wrapper exited, its
+///   children did not) → stop the group.
+pub fn reap_orphans(path: &Path) -> Vec<String> {
+    let entries = read_ledger(path);
+    let mut stopped = Vec::new();
+    for entry in &entries {
+        let ours = match process_start_time(entry.pid) {
+            Some(started) => started == entry.started,
+            None => group_alive(entry.pid),
+        };
+        if !ours {
+            continue;
+        }
+        signal_group(entry.pid, "TERM");
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while group_alive(entry.pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if group_alive(entry.pid) {
+            signal_group(entry.pid, "KILL");
+        }
+        stopped.push(entry.command.clone());
+    }
+    if !entries.is_empty() || path.exists() {
+        write_ledger(path, &[]);
+    }
+    stopped
+}
+
 struct BgProcess {
     session_id: String,
     command: String,
+    /// Start time of the group leader (see `LedgerEntry::started`).
+    started_at: String,
     cwd: String,
     log: PathBuf,
     started: Instant,
@@ -352,10 +444,13 @@ struct Inner {
 }
 
 /// The app-wide set of background processes started by the agent. Lives in `AppState`;
-/// dropping it (or calling `kill_all`) stops everything.
+/// dropping it (or calling `kill_all`) stops everything. With a ledger, the running set is
+/// also mirrored to disk so the next launch can stop whatever an unclean exit left behind
+/// (`reap_orphans`).
 #[derive(Default)]
 pub struct ProcessRegistry {
     inner: Mutex<Inner>,
+    ledger: Option<PathBuf>,
 }
 
 /// Snapshot of one process's state after a read.
@@ -366,8 +461,26 @@ pub struct ProcessView {
 }
 
 impl ProcessRegistry {
+    /// A registry that mirrors its running processes to the ledger file at `path`.
+    pub fn with_ledger(path: PathBuf) -> Self {
+        Self { inner: Mutex::new(Inner::default()), ledger: Some(path) }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Rewrite the ledger from the processes still running. Call after every change.
+    fn sync_ledger(&self, inner: &Inner) {
+        let Some(path) = &self.ledger else { return };
+        let mut entries: Vec<LedgerEntry> = inner
+            .procs
+            .values()
+            .filter(|p| p.exited.is_none())
+            .map(|p| LedgerEntry { pid: p.child.id(), started: p.started_at.clone(), command: p.command.clone() })
+            .collect();
+        entries.sort_by_key(|e| e.pid);
+        write_ledger(path, &entries);
     }
 
     /// Start `command` in the background. Returns its id.
@@ -403,6 +516,7 @@ impl ProcessRegistry {
             let _ = fs::remove_file(&log);
             e
         })?;
+        let started_at = process_start_time(child.id()).unwrap_or_default();
         inner.next_id += 1;
         let id = inner.next_id;
         inner.procs.insert(
@@ -410,6 +524,7 @@ impl ProcessRegistry {
             BgProcess {
                 session_id: session_id.to_string(),
                 command: command.to_string(),
+                started_at,
                 cwd: cwd.display().to_string(),
                 log,
                 started: Instant::now(),
@@ -417,6 +532,7 @@ impl ProcessRegistry {
                 exited: None,
             },
         );
+        self.sync_ledger(&inner);
         Ok(id)
     }
 
@@ -457,6 +573,8 @@ impl ProcessRegistry {
         if was_running {
             terminate(&mut p.child, Duration::from_millis(2000));
         }
+        // Only after it is really gone: a crash between the two must leave it in the ledger.
+        self.sync_ledger(&self.lock());
         let output = read_log_tail(&p.log, tail_chars);
         let head = if was_running {
             format!("Stopped process {} ({}).", id, p.command)
@@ -504,12 +622,14 @@ impl ProcessRegistry {
             ids.into_iter().filter_map(|id| inner.procs.remove(&id)).collect()
         };
         drop(removed); // BgProcess::drop terminates each one, outside the lock.
+        self.sync_ledger(&self.lock());
     }
 
     /// Stop everything (app quit).
     pub fn kill_all(&self) {
         let removed: Vec<BgProcess> = self.lock().procs.drain().map(|(_, p)| p).collect();
         drop(removed);
+        self.sync_ledger(&self.lock());
     }
 }
 
@@ -650,6 +770,118 @@ mod tests {
         }
         assert!(reg.start("s", "sleep 600", &tmp()).is_err());
         reg.kill_all();
+    }
+
+    fn ledger_path(label: &str) -> PathBuf {
+        let p = tmp().join(format!("muninn-ledger-test-{}-{}.json", label, std::process::id()));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
+    /// Spawn `command` the way the registry does, without a registry owning it.
+    fn spawn_detached(command: &str) -> Child {
+        let log = new_log_path();
+        let child = spawn_shell(command, &tmp(), &log).unwrap();
+        let _ = fs::remove_file(&log);
+        child
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        cond()
+    }
+
+    #[test]
+    fn ledger_tracks_running_processes() {
+        let path = ledger_path("tracks");
+        let reg = ProcessRegistry::with_ledger(path.clone());
+        let a = reg.start("s", "sleep 600", &tmp()).unwrap();
+        let b = reg.start("s", "sleep 601", &tmp()).unwrap();
+        let entries = read_ledger(&path);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| !e.started.is_empty() && e.pid > 0));
+        assert!(entries.iter().any(|e| e.command == "sleep 601"));
+
+        reg.stop(a, 100).unwrap();
+        assert_eq!(read_ledger(&path).iter().map(|e| e.command.as_str()).collect::<Vec<_>>(), vec!["sleep 601"]);
+        reg.kill_session("s");
+        assert!(read_ledger(&path).is_empty());
+        assert!(reg.view(b, 10).is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn leftovers_from_an_unclean_exit_are_stopped_at_next_launch() {
+        let path = ledger_path("crash");
+        let reg = ProcessRegistry::with_ledger(path.clone());
+        reg.start("s", "sleep 600", &tmp()).unwrap();
+        let pid = read_ledger(&path)[0].pid;
+        // Simulate the app dying without cleanup: nothing runs Drop, the process lives on.
+        std::mem::forget(reg);
+        assert!(group_alive(pid));
+
+        let stopped = reap_orphans(&path);
+        assert_eq!(stopped, vec!["sleep 600".to_string()]);
+        assert!(wait_until(|| !group_alive(pid)), "leftover process {} survived", pid);
+        assert!(read_ledger(&path).is_empty());
+        // Nothing left to do the second time.
+        assert!(reap_orphans(&path).is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn leftover_children_are_stopped_even_when_their_wrapper_already_exited() {
+        let path = ledger_path("orphan-children");
+        let pid_file = tmp().join(format!("muninn-ledger-child-{}.pid", std::process::id()));
+        let _ = fs::remove_file(&pid_file);
+        // The wrapper backgrounds a sleep and exits; the sleep stays in the wrapper's group.
+        let mut wrapper = spawn_detached(&format!("sleep 600 & echo $! > '{}'", pid_file.display()));
+        let pgid = wrapper.id();
+        let started = process_start_time(pgid).unwrap_or_default();
+        wrapper.wait().unwrap();
+        assert!(wait_until(|| pid_file.exists() && !fs::read_to_string(&pid_file).unwrap_or_default().trim().is_empty()));
+        let child_pid: u32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        assert!(process_start_time(pgid).is_none(), "wrapper should be gone");
+        assert!(process_start_time(child_pid).is_some(), "child should still be running");
+
+        write_ledger(&path, &[LedgerEntry { pid: pgid, started, command: "wrapper".into() }]);
+        assert_eq!(reap_orphans(&path), vec!["wrapper".to_string()]);
+        assert!(wait_until(|| process_start_time(child_pid).is_none()), "child {} survived", child_pid);
+        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reused_pid_is_never_killed() {
+        let path = ledger_path("reuse");
+        // A live process whose pid is in the ledger with a DIFFERENT start time stands in
+        // for an unrelated process that was later given our old pid.
+        let mut bystander = spawn_detached("sleep 600");
+        let pid = bystander.id();
+        assert!(process_start_time(pid).is_some());
+        write_ledger(&path, &[LedgerEntry { pid, started: "Thu Jan  1 00:00:00 1970".into(), command: "old".into() }]);
+
+        assert!(reap_orphans(&path).is_empty());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(process_start_time(pid).is_some(), "an unrelated process was killed");
+        assert!(read_ledger(&path).is_empty(), "stale entry should be dropped");
+
+        // Entries for processes that are simply gone are dropped quietly too.
+        terminate(&mut bystander, Duration::from_millis(500));
+        write_ledger(&path, &[LedgerEntry { pid, started: "x".into(), command: "gone".into() }]);
+        assert!(reap_orphans(&path).is_empty());
+        // A missing or corrupt ledger is not an error.
+        let _ = fs::remove_file(&path);
+        assert!(reap_orphans(&path).is_empty());
+        fs::write(&path, b"not json").unwrap();
+        assert!(reap_orphans(&path).is_empty());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

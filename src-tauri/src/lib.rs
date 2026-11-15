@@ -153,6 +153,12 @@ pub fn run() {
                 .build()
                 .map_err(|e| e.to_string())?;
 
+            // Background processes the agent started are mirrored to this ledger. If the
+            // previous run ended without stopping them (crash, SIGKILL, power loss), stop
+            // them now rather than leave dev servers holding ports forever.
+            let bg_ledger = data_dir.join("bg-processes.json");
+            let leftover_processes = procs::reap_orphans(&bg_ledger);
+
             app.manage(AppState {
                 workspace_root: Mutex::new(workspace_root),
                 workspace_root_canon: Mutex::new(workspace_root_canon),
@@ -165,10 +171,55 @@ pub fn run() {
                 pending_questions: Mutex::new(HashMap::new()),
                 mcp: mcp::McpManager::default(),
                 captured_images: Mutex::new(HashMap::new()),
-                bg_processes: procs::ProcessRegistry::default(),
+                bg_processes: procs::ProcessRegistry::with_ledger(bg_ledger),
                 memory_dir: data_dir.join("memory"),
                 skills_dir: data_dir.join("skills"),
             });
+
+            if !leftover_processes.is_empty() {
+                let state: tauri::State<'_, AppState> = app.state();
+                db::add_feed_item(
+                    &state,
+                    "system",
+                    "Stopped leftover background processes",
+                    &format!(
+                        "Muninn did not shut down cleanly last time. Stopped {} process(es) it had left running: {}",
+                        leftover_processes.len(),
+                        leftover_processes.join("; ")
+                    ),
+                    "robot",
+                    "",
+                );
+            }
+
+            // A termination signal (`kill`, logout, shutdown, an installer replacing the app)
+            // ends the process without running the tray's Quit handler, so stop the
+            // agent's background processes here too.
+            #[cfg(unix)]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+                        signal(SignalKind::terminate()),
+                        signal(SignalKind::interrupt()),
+                        signal(SignalKind::hangup()),
+                    ) else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = int.recv() => {}
+                        _ = hup.recv() => {}
+                    }
+                    handle.state::<AppState>().bg_processes.kill_all();
+                    handle.exit(0);
+                    // A termination signal must always end the process, even if the
+                    // event loop is slow to wind down.
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    std::process::exit(0);
+                });
+            }
 
             // Plugins
             app.handle().plugin(tauri_plugin_autostart::init(
@@ -437,6 +488,12 @@ pub fn run() {
                 // the process alive for the tray/background agent.
                 tauri::RunEvent::ExitRequested { api, .. } => {
                     api.prevent_exit();
+                }
+                // The app really is exiting (tray Quit, a signal): last chance to stop
+                // the agent's background processes. Harmless if already done.
+                tauri::RunEvent::Exit => {
+                    use tauri::Manager;
+                    app.state::<AppState>().bg_processes.kill_all();
                 }
                 // macOS: clicking the Dock icon while no window is visible fires
                 // Reopen — bring the main window back instead of doing nothing.
