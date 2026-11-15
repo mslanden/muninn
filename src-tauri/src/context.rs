@@ -453,76 +453,11 @@ fn summarizer_prompt(previous: &str, transcript: &str) -> String {
     prompt
 }
 
-/// One non-streaming completion with the configured chat model.
+/// Summarize with the configured chat model (one non-streaming call).
 async fn summarize(state: &AppState, previous: &str, transcript: &str) -> Result<String, String> {
     let cfg = crate::llm::resolve_llm_config(state)?;
     let prompt = summarizer_prompt(previous, transcript);
-    let body = if cfg.is_anthropic {
-        json!({
-            "model": cfg.model, "max_tokens": 3000, "stream": false,
-            "system": SUMMARIZER_SYSTEM,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": cfg.model, "max_tokens": 3000, "stream": false,
-            "messages": [
-                {"role": "system", "content": SUMMARIZER_SYSTEM},
-                {"role": "user", "content": prompt}
-            ]
-        })
-    };
-    let request = if cfg.is_anthropic {
-        state
-            .http
-            .post(&cfg.endpoint)
-            .header("x-api-key", &cfg.api_key)
-            .header("anthropic-version", "2023-06-01")
-    } else {
-        state.http.post(&cfg.endpoint).bearer_auth(&cfg.api_key)
-    };
-    let send = async {
-        // Longer than the shared client's 90s default: summarizing a long transcript is slow.
-        let resp = request
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(240))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("HTTP {}", status));
-        }
-        resp.json::<Value>().await.map_err(|e| e.to_string())
-    };
-    let parsed = tokio::time::timeout(std::time::Duration::from_secs(240), send)
-        .await
-        .map_err(|_| "timed out".to_string())??;
-    let text = if cfg.is_anthropic {
-        parsed
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default()
-    } else {
-        parsed
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|c| c.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    let text = crate::feeds::strip_think_tags(&text).trim().to_string();
+    let text = crate::llm::complete_once(state, &cfg, SUMMARIZER_SYSTEM, &prompt, 3000, crate::llm::ONE_SHOT_LONG_SECS).await?;
     if text.chars().count() < 40 {
         return Err("the model returned no usable summary".to_string());
     }

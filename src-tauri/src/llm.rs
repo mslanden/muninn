@@ -181,6 +181,192 @@ pub(crate) struct LlmCallConfig {
     pub endpoint: String,
 }
 
+/// Time limits for one-shot helper calls: verdicts and titles vs. long-form generation.
+const ONE_SHOT_QUICK_SECS: u64 = 120;
+pub(crate) const ONE_SHOT_LONG_SECS: u64 = 300;
+/// Every helper call gets at least this much output room, whatever the caller asked for.
+/// A reasoning model spends output tokens thinking before it writes a visible answer, so
+/// the tight caps these calls used to send (40-150 tokens) were consumed by the thinking
+/// and the reply came back empty. A model that doesn't think simply stops early, so the
+/// headroom costs nothing.
+const ONE_SHOT_MIN_TOKENS: u64 = 4096;
+/// Budget for the single retry when a reply was still cut off before any visible text.
+const ONE_SHOT_RETRY_TOKENS: u64 = 16_384;
+
+/// What a non-streaming completion contained.
+#[derive(Debug, Default, PartialEq)]
+struct OneShotReply {
+    /// The visible answer, with any inline `<think>` blocks removed.
+    text: String,
+    /// The model hit its output limit (`finish_reason: length` / `stop_reason: max_tokens`).
+    truncated: bool,
+    /// The reply carried reasoning (a separate field, a thinking block, or inline tags).
+    had_reasoning: bool,
+    /// The provider's raw finish/stop reason, for diagnostics.
+    finish: String,
+}
+
+/// Pull the visible text out of a non-streaming response in either wire format.
+fn parse_one_shot(is_anthropic: bool, body: &Value) -> OneShotReply {
+    let mut raw = String::new();
+    let mut had_reasoning = false;
+    let finish;
+    if is_anthropic {
+        for block in body.get("content").and_then(Value::as_array).into_iter().flatten() {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(Value::as_str) {
+                        if !raw.is_empty() {
+                            raw.push('\n');
+                        }
+                        raw.push_str(t);
+                    }
+                }
+                Some("thinking") | Some("redacted_thinking") => had_reasoning = true,
+                _ => {}
+            }
+        }
+        finish = body.get("stop_reason").and_then(Value::as_str).unwrap_or("").to_string();
+    } else {
+        let choice = body.get("choices").and_then(Value::as_array).and_then(|c| c.first());
+        let message = choice.and_then(|c| c.get("message"));
+        match message.and_then(|m| m.get("content")) {
+            Some(Value::String(t)) => raw.push_str(t),
+            // Some providers return content as a list of typed parts.
+            Some(Value::Array(parts)) => {
+                for part in parts {
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        raw.push_str(t);
+                    }
+                }
+            }
+            _ => {}
+        }
+        had_reasoning = ["reasoning_content", "reasoning"].iter().any(|key| {
+            message
+                .and_then(|m| m.get(*key))
+                .and_then(Value::as_str)
+                .map_or(false, |r| !r.trim().is_empty())
+        });
+        finish = choice
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+    }
+    if raw.contains("<think") {
+        had_reasoning = true;
+    }
+    OneShotReply {
+        text: crate::feeds::strip_think_tags(&raw),
+        truncated: finish == "length" || finish == "max_tokens",
+        had_reasoning,
+        finish,
+    }
+}
+
+fn one_shot_request(cfg: &LlmCallConfig, system: &str, prompt: &str, max_tokens: u64) -> Value {
+    if cfg.is_anthropic {
+        json!({
+            "model": cfg.model, "max_tokens": max_tokens, "stream": false,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    } else {
+        json!({
+            "model": cfg.model, "max_tokens": max_tokens, "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ]
+        })
+    }
+}
+
+/// Why an empty reply was empty, for the error message and the logs.
+fn empty_reply_reason(reply: &OneShotReply, budget: u64) -> String {
+    let finish = if reply.finish.is_empty() { "unknown" } else { reply.finish.as_str() };
+    match (reply.truncated, reply.had_reasoning) {
+        (true, true) => format!("it used all {budget} output tokens on reasoning before writing an answer"),
+        (true, false) => format!("it hit the {budget}-token output limit without writing anything"),
+        (false, true) => format!("it returned reasoning but no answer (finish reason: {finish})"),
+        (false, false) => format!("the response had no text (finish reason: {finish})"),
+    }
+}
+
+/// Output budget for a helper call's first attempt and for its one retry.
+fn one_shot_budgets(requested: u64, ceiling: u64) -> (u64, u64) {
+    // `ceiling` is the user's llm/max_tokens; never go above it unless the caller itself
+    // asked for more.
+    let ceiling = ceiling.max(requested);
+    let first = requested.max(ONE_SHOT_MIN_TOKENS).min(ceiling);
+    let retry = ONE_SHOT_RETRY_TOKENS.max(first).min(ceiling);
+    (first, retry)
+}
+
+/// The single entry point for one-shot, non-streaming helper calls (verdicts, titles,
+/// summaries, planning, copy). Returns the model's visible text — never empty — or an error
+/// that says what went wrong. `max_tokens` is the caller's expectation for the answer;
+/// the request is given at least `ONE_SHOT_MIN_TOKENS` (bounded by `llm/max_tokens`) and is
+/// retried once with a larger budget if the reply was cut off before any visible text.
+pub(crate) async fn complete_once(
+    state: &AppState,
+    cfg: &LlmCallConfig,
+    system: &str,
+    prompt: &str,
+    max_tokens: u64,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    complete_once_with(&state.http, resolve_max_output_tokens(state), cfg, system, prompt, max_tokens, timeout_secs).await
+}
+
+/// `complete_once` without the app state: `ceiling` is the configured `llm/max_tokens`.
+async fn complete_once_with(
+    http: &reqwest::Client,
+    ceiling: u64,
+    cfg: &LlmCallConfig,
+    system: &str,
+    prompt: &str,
+    max_tokens: u64,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let (mut budget, retry_budget) = one_shot_budgets(max_tokens, ceiling);
+    for attempt in 0..2 {
+        let body = one_shot_request(cfg, system, prompt, budget);
+        let request = if cfg.is_anthropic {
+            http.post(&cfg.endpoint)
+                .header("x-api-key", &cfg.api_key)
+                .header("anthropic-version", "2023-06-01")
+        } else {
+            http.post(&cfg.endpoint).bearer_auth(&cfg.api_key)
+        };
+        let response = request
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .send()
+            .await
+            .map_err(|e| format!("request error: {e}"))?;
+        let status = response.status();
+        let raw = response.text().await.map_err(|e| format!("could not read the response: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("HTTP {}: {}", status, crate::tools::truncate_chars(raw.trim(), 400)));
+        }
+        let parsed: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("unreadable response ({e}): {}", crate::tools::truncate_chars(raw.trim(), 200)))?;
+        let reply = parse_one_shot(cfg.is_anthropic, &parsed);
+        if !reply.text.is_empty() {
+            return Ok(reply.text);
+        }
+        if attempt == 0 && reply.truncated && retry_budget > budget {
+            budget = retry_budget;
+            continue;
+        }
+        return Err(format!("the model gave no answer: {}", empty_reply_reason(&reply, budget)));
+    }
+    Err("the model gave no answer".to_string())
+}
+
+
 /// Resolve provider / model / API key / endpoint for the one-shot helper LLM calls
 /// (entity-summary compaction, feed-article generation, memory extraction). These three
 /// call sites previously duplicated this block verbatim. The interactive chat + agent
@@ -380,7 +566,6 @@ pub(crate) async fn evaluate_chain_condition(
         Ok(c) => c,
         Err(e) => return (false, format!("no LLM configured: {e}")),
     };
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
 
     // Cap the data we send — gate decisions don't need the full payload.
     let data = crate::tools::truncate_chars(upstream_output, 6000);
@@ -394,49 +579,11 @@ pub(crate) async fn evaluate_chain_condition(
         Answer YES only when the condition is clearly satisfied; answer NO if it is not satisfied or you are unsure. \
         First line must be exactly YES or NO.";
 
-    let request_body = if is_anthropic {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
+    let text = match complete_once(state, &cfg, system, &prompt, 150, ONE_SHOT_QUICK_SECS).await {
+        Ok(t) => t,
+        Err(e) => return (false, format!("eval call failed: {e}")),
     };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body).send().await
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
-    };
-    let resp = match resp {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => return (false, format!("eval call failed: HTTP {}", r.status())),
-        Err(e) => return (false, format!("eval call error: {e}")),
-    };
-    let body: Value = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => return (false, format!("eval parse error: {e}")),
-    };
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
-            .and_then(Value::as_str).unwrap_or("")
-    };
-    parse_condition_verdict(&crate::feeds::strip_think_tags(text))
+    parse_condition_verdict(&crate::feeds::strip_think_tags(&text))
 }
 
 /// Evaluate whether a session's goal has been FULLY achieved, judging by the assistant's
@@ -451,7 +598,6 @@ pub(crate) async fn evaluate_goal_met(
     last_reply: &str,
 ) -> Result<(bool, String), String> {
     let cfg = resolve_llm_config(state).map_err(|e| format!("no LLM configured: {e}"))?;
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
 
     let data = crate::tools::truncate_chars(last_reply, 6000);
     let prompt = format!(
@@ -467,46 +613,9 @@ pub(crate) async fn evaluate_goal_met(
         partially done, still in progress, uncertain, or the assistant is blocked, answer NO. \
         Then add one short sentence explaining why.";
 
-    let request_body = if is_anthropic {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body).send().await
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
-    };
-    let resp = match resp {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => return Err(format!("eval call failed: HTTP {}", r.status())),
-        Err(e) => return Err(format!("eval call error: {e}")),
-    };
-    let body: Value = resp.json().await.map_err(|e| format!("eval parse error: {e}"))?;
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
-            .and_then(Value::as_str).unwrap_or("")
-    };
-    Ok(parse_condition_verdict(&crate::feeds::strip_think_tags(text)))
+    let text = complete_once(state, &cfg, system, &prompt, 150, ONE_SHOT_QUICK_SECS).await
+        .map_err(|e| format!("eval call failed: {e}"))?;
+    Ok(parse_condition_verdict(&crate::feeds::strip_think_tags(&text)))
 }
 
 /// Generate a short human title for a chat session from its first exchange. One-shot,
@@ -518,7 +627,6 @@ pub(crate) async fn generate_session_title(
     assistant_reply: &str,
 ) -> Result<String, String> {
     let cfg = resolve_llm_config(state).map_err(|e| format!("no LLM configured: {e}"))?;
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
 
     let user_part = crate::tools::truncate_chars(user_msg, 1500);
     let reply_part = crate::tools::truncate_chars(assistant_reply, 1500);
@@ -530,46 +638,9 @@ pub(crate) async fn generate_session_title(
     let system = "You name chat conversations. Reply with only a concise 2-6 word title \
         describing the topic — no quotes, no punctuation at the end, no explanations.";
 
-    let request_body = if is_anthropic {
-        json!({
-            "model": model, "max_tokens": 40, "stream": false,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model, "max_tokens": 40, "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body).send().await
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
-    };
-    let resp = match resp {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => return Err(format!("title call failed: HTTP {}", r.status())),
-        Err(e) => return Err(format!("title call error: {e}")),
-    };
-    let body: Value = resp.json().await.map_err(|e| format!("title parse error: {e}"))?;
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
-            .and_then(Value::as_str).unwrap_or("")
-    };
-    let title = sanitize_session_title(&crate::feeds::strip_think_tags(text));
+    let text = complete_once(state, &cfg, system, &prompt, 40, ONE_SHOT_QUICK_SECS).await
+        .map_err(|e| format!("title call failed: {e}"))?;
+    let title = sanitize_session_title(&crate::feeds::strip_think_tags(&text));
     if title.is_empty() {
         return Err("title model returned nothing usable".to_string());
     }
@@ -629,7 +700,6 @@ pub(crate) async fn verify_dangerous_command(
         Ok(c) => c,
         Err(e) => return CommandVerdict::Escalate(format!("no LLM configured: {e}")),
     };
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
 
     let cwd_str = cwd.unwrap_or("(workspace root)");
     let reasons_str = if reasons.is_empty() {
@@ -660,49 +730,11 @@ pub(crate) async fn verify_dangerous_command(
         First line exactly ALLOW, DENY, or ESCALATE. Then one short sentence explaining why."
     );
 
-    let request_body = if is_anthropic {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
+    let text = match complete_once(state, &cfg, system, &prompt, 150, ONE_SHOT_QUICK_SECS).await {
+        Ok(t) => t,
+        Err(e) => return CommandVerdict::Escalate(format!("verifier call failed: {e}")),
     };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body).send().await
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
-    };
-    let resp = match resp {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => return CommandVerdict::Escalate(format!("verifier call failed: HTTP {}", r.status())),
-        Err(e) => return CommandVerdict::Escalate(format!("verifier call error: {e}")),
-    };
-    let body: Value = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => return CommandVerdict::Escalate(format!("verifier parse error: {e}")),
-    };
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
-            .and_then(Value::as_str).unwrap_or("")
-    };
-    parse_command_verdict(&crate::feeds::strip_think_tags(text))
+    parse_command_verdict(&crate::feeds::strip_think_tags(&text))
 }
 
 /// Interpret the verifier model's reply. The first non-empty line must start with ALLOW,
@@ -753,7 +785,7 @@ pub(crate) async fn generate_feed_article_text(
     source_name: &str,
     source_text: &str,
 ) -> Result<String, String> {
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+    let cfg = resolve_llm_config(state)?;
 
     // Cap fetched source so we stay within a sane token budget.
     let source_excerpt: String = source_text.chars().take(8000).collect();
@@ -781,63 +813,8 @@ pub(crate) async fn generate_feed_article_text(
 
     let system = "You are a sharp, concise editorial writer who turns source material into a faithful, readable overview. Never invent facts.";
 
-    let request_body = if is_anthropic {
-        json!({
-            "model": model,
-            "max_tokens": 1600,
-            "stream": false,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model,
-            "max_tokens": 1600,
-            "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint)
-            .bearer_auth(&api_key)
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("LLM request failed ({status}): {body}"));
-    }
-
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = if is_anthropic {
-        body.get("content")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-    } else {
-        body.get("choices")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-    }
-    .ok_or_else(|| "LLM returned no article text".to_string())?;
+    let text = complete_once(state, &cfg, system, &prompt, 1600, ONE_SHOT_LONG_SECS).await
+        .map_err(|e| format!("LLM request failed: {e}"))?;
 
     let article = text.trim().to_string();
     if article.is_empty() {
@@ -897,7 +874,7 @@ pub(crate) async fn generate_social_copy(
     if platforms.is_empty() {
         return Err("Select at least one platform.".to_string());
     }
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+    let cfg = resolve_llm_config(state)?;
 
     // Shared brand voice (persisted in Settings via the Studio header) + the per-request tone.
     let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
@@ -923,58 +900,8 @@ pub(crate) async fn generate_social_copy(
     );
     let system = "You are an expert social media copywriter. You tailor copy precisely to each platform's format and audience, write scroll-stopping hooks, and never use generic filler. You output strict JSON only.";
 
-    let request_body = if is_anthropic {
-        json!({
-            "model": model, "max_tokens": 4000, "stream": false, "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model, "max_tokens": 4000, "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint)
-            .bearer_auth(&api_key)
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Copy generation failed ({status}): {body}"));
-    }
-
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = if is_anthropic {
-        body.get("content")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-    } else {
-        body.get("choices")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-    }
-    .ok_or_else(|| "Copy generation returned no text".to_string())?;
+    let text = complete_once(state, &cfg, system, &prompt, 4000, ONE_SHOT_LONG_SECS).await
+        .map_err(|e| format!("Copy generation failed: {e}"))?;
 
     let parsed = extract_json_array(&text)
         .ok_or_else(|| format!("Could not parse copy as JSON. Model said:\n{}", text.trim()))?;
@@ -1007,7 +934,7 @@ pub(crate) async fn writing_assist(
     if instruction.trim().is_empty() {
         return Err("Tell me what to do (e.g. improve, shorten, continue, or write…).".to_string());
     }
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+    let cfg = resolve_llm_config(state)?;
 
     let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
     let voice_line = if brand_voice.trim().is_empty() {
@@ -1029,38 +956,8 @@ pub(crate) async fn writing_assist(
     let system = "You are a sharp, versatile writing assistant and editor. You improve clarity, flow, and impact while preserving the author's intent. You return only the requested text.";
 
     let max_tokens = resolve_max_output_tokens(state);
-    let request_body = if is_anthropic {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false, "system": system,
-               "messages": [{"role": "user", "content": prompt}]})
-    } else {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false,
-               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Writing request failed ({status}): {body}"));
-    }
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let out = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-    }
-    .ok_or_else(|| "Writing assistant returned no text".to_string())?;
+    let out = complete_once(state, &cfg, system, &prompt, max_tokens, ONE_SHOT_LONG_SECS).await
+        .map_err(|e| format!("Writing request failed: {e}"))?;
     let out = out.trim().to_string();
     if out.is_empty() {
         return Err("Writing assistant returned empty text".to_string());
@@ -1082,7 +979,7 @@ pub(crate) async fn generate_carousel(
         return Err("Describe what the graphic should say.".to_string());
     }
     let n = slides.clamp(1, 10);
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+    let cfg = resolve_llm_config(state)?;
     let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
     let voice_line = if brand_voice.trim().is_empty() {
         String::new()
@@ -1105,38 +1002,8 @@ pub(crate) async fn generate_carousel(
     let system = "You are a world-class social media graphic designer who builds striking, self-contained, inline-styled HTML cards. You never use <style> blocks, classes, scripts, or external resources. You return only a JSON array of HTML strings.";
 
     let max_tokens = resolve_max_output_tokens(state);
-    let request_body = if is_anthropic {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false, "system": system,
-               "messages": [{"role": "user", "content": prompt}]})
-    } else {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false,
-               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Carousel generation failed ({status}): {body}"));
-    }
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-    }
-    .ok_or_else(|| "Carousel generation returned no text".to_string())?;
+    let text = complete_once(state, &cfg, system, &prompt, max_tokens, ONE_SHOT_LONG_SECS).await
+        .map_err(|e| format!("Carousel generation failed: {e}"))?;
 
     let arr = extract_json_array(&text)
         .ok_or_else(|| format!("Could not parse slides as JSON. Model said:\n{}", text.trim()))?;
@@ -1173,7 +1040,7 @@ pub(crate) async fn generate_doc_html(
     if topic.trim().is_empty() {
         return Err("Describe what the document should cover.".to_string());
     }
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+    let cfg = resolve_llm_config(state)?;
     let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
     let voice_line = if brand_voice.trim().is_empty() {
         String::new()
@@ -1205,38 +1072,8 @@ pub(crate) async fn generate_doc_html(
     let system = "You are an expert document and presentation designer who writes clean, self-contained, print-ready HTML/CSS. You never use external resources or scripts. You return only the HTML.";
 
     let max_tokens = resolve_max_output_tokens(state);
-    let request_body = if is_anthropic {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false, "system": system,
-               "messages": [{"role": "user", "content": prompt}]})
-    } else {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false,
-               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Doc generation failed ({status}): {body}"));
-    }
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-    }
-    .ok_or_else(|| "Doc generation returned no text".to_string())?;
+    let text = complete_once(state, &cfg, system, &prompt, max_tokens, ONE_SHOT_LONG_SECS).await
+        .map_err(|e| format!("Doc generation failed: {e}"))?;
 
     let html = strip_code_fences(&text);
     if !html.to_lowercase().contains("<html") && !html.to_lowercase().contains("<!doctype") {
@@ -1265,7 +1102,7 @@ pub(crate) async fn generate_video_edit_plan(
     if instruction.trim().is_empty() {
         return Err("Describe the edit you want.".to_string());
     }
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+    let cfg = resolve_llm_config(state)?;
 
     let presets = crate::video::FILTER_PRESETS
         .iter()
@@ -1348,38 +1185,8 @@ pub(crate) async fn generate_video_edit_plan(
     );
     let system = "You are a precise video editor. You reason about timestamps carefully and output strict JSON only.";
 
-    let request_body = if is_anthropic {
-        json!({"model": model, "max_tokens": 4000, "stream": false, "system": system,
-               "messages": [{"role": "user", "content": prompt}]})
-    } else {
-        json!({"model": model, "max_tokens": 4000, "stream": false,
-               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Edit planning failed ({status}): {body}"));
-    }
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-    }
-    .ok_or_else(|| "Edit planning returned no text".to_string())?;
+    let text = complete_once(state, &cfg, system, &prompt, 4000, ONE_SHOT_LONG_SECS).await
+        .map_err(|e| format!("Edit planning failed: {e}"))?;
 
     let obj = extract_json_object(&text)
         .ok_or_else(|| format!("Could not parse the edit plan as JSON. Model said:\n{}", text.trim()))?;
@@ -1436,7 +1243,7 @@ pub(crate) async fn generate_shorts_specs(
     if transcript.segments.is_empty() {
         return Err("no transcript segments to pick shorts from".to_string());
     }
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+    let cfg = resolve_llm_config(state)?;
 
     // Segment-level transcript with timestamps, budgeted so a long video still fits the context.
     let mut tr = String::new();
@@ -1482,37 +1289,8 @@ pub(crate) async fn generate_shorts_specs(
     let mut attempt_prompt = base_prompt.clone();
     let mut last_err = String::new();
     for attempt in 0..2 {
-        let request_body = if is_anthropic {
-            json!({"model": model, "max_tokens": 4000, "stream": false, "system": system,
-                   "messages": [{"role": "user", "content": attempt_prompt}]})
-        } else {
-            json!({"model": model, "max_tokens": 4000, "stream": false,
-                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": attempt_prompt}]})
-        };
-        let resp = if is_anthropic {
-            state.http.post(&endpoint)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&request_body)
-                .send().await.map_err(|e| e.to_string())?
-        } else {
-            state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-        };
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Shorts planning failed ({status}): {body}"));
-        }
-        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let text = if is_anthropic {
-            body.get("content").and_then(Value::as_array)
-                .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-                .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-        } else {
-            body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-                .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-        }
-        .unwrap_or_default();
+        let text = complete_once(state, &cfg, system, &attempt_prompt, 4000, ONE_SHOT_LONG_SECS).await
+            .map_err(|e| format!("Shorts planning failed: {e}"))?;
 
         match parse_shorts_specs(&text)
             .and_then(|specs| crate::video::sanitize_short_specs(specs, probe, count, target_s))
@@ -1574,7 +1352,7 @@ pub(crate) async fn generate_compilation_specs(
         _ => "auto",
     };
     let target_s = target_duration_s.filter(|t| *t > 0.0);
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
+    let cfg = resolve_llm_config(state)?;
 
     let clip_durations: Vec<(String, f64)> =
         clips.iter().map(|c| (c.path.clone(), c.duration_s)).collect();
@@ -1659,37 +1437,8 @@ pub(crate) async fn generate_compilation_specs(
     let mut attempt_prompt = base_prompt.clone();
     let mut last_err = String::new();
     for attempt in 0..2 {
-        let request_body = if is_anthropic {
-            json!({"model": model, "max_tokens": 4000, "stream": false, "system": system,
-                   "messages": [{"role": "user", "content": attempt_prompt}]})
-        } else {
-            json!({"model": model, "max_tokens": 4000, "stream": false,
-                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": attempt_prompt}]})
-        };
-        let resp = if is_anthropic {
-            state.http.post(&endpoint)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&request_body)
-                .send().await.map_err(|e| e.to_string())?
-        } else {
-            state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-        };
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Compilation planning failed ({status}): {body}"));
-        }
-        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let text = if is_anthropic {
-            body.get("content").and_then(Value::as_array)
-                .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-                .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-        } else {
-            body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-                .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-        }
-        .unwrap_or_default();
+        let text = complete_once(state, &cfg, system, &attempt_prompt, 4000, ONE_SHOT_LONG_SECS).await
+            .map_err(|e| format!("Compilation planning failed: {e}"))?;
 
         match parse_compilation_spec(&text)
             .and_then(|spec| crate::video::sanitize_compilation_spec(spec, &clip_durations, target_s))
@@ -4262,6 +4011,174 @@ mod tests {
     }
     fn anthropic_provider() -> Provider {
         Provider::Anthropic { endpoint: "https://example.test/v1/messages".into(), api_key: "k".into() }
+    }
+
+    /// A mock model endpoint: answers each request in turn with the next canned
+    /// (status, JSON body), recording the JSON it was sent.
+    async fn canned_server(responses: Vec<(u16, Value)>) -> (String, std::sync::Arc<Mutex<Vec<Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let request_body = loop {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break String::new();
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).to_string();
+                        }
+                    }
+                };
+                seen_in.lock().unwrap().push(serde_json::from_str(&request_body).unwrap_or(Value::Null));
+                let payload = body.to_string();
+                let head = format!(
+                    "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    payload.len()
+                );
+                sock.write_all(head.as_bytes()).await.unwrap();
+                sock.write_all(payload.as_bytes()).await.unwrap();
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{}/v1/chat/completions", addr), seen)
+    }
+
+    fn helper_cfg(endpoint: String, is_anthropic: bool) -> LlmCallConfig {
+        LlmCallConfig { provider: "custom".into(), model: "test-model".into(), is_anthropic, api_key: "k".into(), endpoint }
+    }
+
+    fn openai_reply(content: &str, reasoning: &str, finish: &str) -> Value {
+        json!({"choices": [{"message": {"role": "assistant", "content": content, "reasoning_content": reasoning}, "finish_reason": finish}]})
+    }
+
+    /// Regression: a reasoning model given a 150-token cap spent it all thinking and
+    /// returned empty text, so the safety verifier never got a verdict.
+    #[tokio::test]
+    async fn helper_calls_get_headroom_and_retry_when_reasoning_eats_the_budget() {
+        let (endpoint, seen) = canned_server(vec![
+            (200, openai_reply("", "Let me think about this command...", "length")),
+            (200, openai_reply("ALLOW\nIt only removes the build folder.", "thinking", "stop")),
+        ])
+        .await;
+        let http = reqwest::Client::new();
+        let out = complete_once_with(&http, 40_960, &helper_cfg(endpoint, false), "sys", "is this ok?", 150, 30)
+            .await
+            .unwrap();
+        assert_eq!(out, "ALLOW\nIt only removes the build folder.");
+        assert_eq!(parse_command_verdict(&out), CommandVerdict::Allow("It only removes the build folder.".into()));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        // The caller asked for 150; the request went out with headroom, then a larger retry.
+        assert_eq!(seen[0]["max_tokens"], ONE_SHOT_MIN_TOKENS);
+        assert_eq!(seen[1]["max_tokens"], ONE_SHOT_RETRY_TOKENS);
+        assert_eq!(seen[0]["stream"], false);
+        assert_eq!(seen[0]["messages"][0], json!({"role": "system", "content": "sys"}));
+        assert_eq!(seen[0]["messages"][1], json!({"role": "user", "content": "is this ok?"}));
+    }
+
+    #[tokio::test]
+    async fn helper_call_that_stays_empty_fails_with_the_reason() {
+        let (endpoint, seen) = canned_server(vec![
+            (200, openai_reply("", "thinking", "length")),
+            (200, openai_reply("", "still thinking", "length")),
+        ])
+        .await;
+        let err = complete_once_with(&reqwest::Client::new(), 40_960, &helper_cfg(endpoint, false), "s", "p", 150, 30)
+            .await
+            .unwrap_err();
+        assert!(err.contains("used all 16384 output tokens on reasoning"), "{}", err);
+        assert_eq!(seen.lock().unwrap().len(), 2, "exactly one retry");
+
+        // Empty but NOT truncated: retrying with more tokens can't help, so don't.
+        let (endpoint, seen) = canned_server(vec![(200, openai_reply("", "", "stop"))]).await;
+        let err = complete_once_with(&reqwest::Client::new(), 40_960, &helper_cfg(endpoint, false), "s", "p", 150, 30)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no text") && err.contains("finish reason: stop"), "{}", err);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn helper_call_reports_http_errors_with_the_body() {
+        let (endpoint, seen) = canned_server(vec![(400, json!({"error": {"message": "model does not support this"}}))]).await;
+        let err = complete_once_with(&reqwest::Client::new(), 40_960, &helper_cfg(endpoint, false), "s", "p", 150, 30)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("HTTP 400"), "{}", err);
+        assert!(err.contains("model does not support this"), "{}", err);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn helper_call_speaks_the_anthropic_format_too() {
+        let (endpoint, seen) = canned_server(vec![(
+            200,
+            json!({"content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": "YES"},
+                {"type": "text", "text": "The file exists."}
+            ], "stop_reason": "end_turn"}),
+        )])
+        .await;
+        let out = complete_once_with(&reqwest::Client::new(), 40_960, &helper_cfg(endpoint, true), "sys", "p", 150, 30)
+            .await
+            .unwrap();
+        assert_eq!(out, "YES\nThe file exists.");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0]["system"], "sys");
+        assert_eq!(seen[0]["messages"], json!([{"role": "user", "content": "p"}]));
+    }
+
+    #[test]
+    fn one_shot_replies_are_parsed_in_every_shape() {
+        // Inline thinking is removed; what follows is the answer.
+        let r = parse_one_shot(false, &openai_reply("<think>is it safe?</think>\nDENY\nIt deletes home.", "", "stop"));
+        assert_eq!(r.text, "DENY\nIt deletes home.");
+        assert!(r.had_reasoning && !r.truncated);
+        // Thinking that was cut off mid-thought leaves no answer, and says so.
+        let r = parse_one_shot(false, &openai_reply("<think>is it safe? well", "", "length"));
+        assert_eq!(r.text, "");
+        assert!(r.truncated && r.had_reasoning);
+        // Content as typed parts, null content, and a missing choice.
+        let parts = json!({"choices": [{"message": {"content": [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}]}, "finish_reason": "stop"}]});
+        assert_eq!(parse_one_shot(false, &parts).text, "AB");
+        let null = json!({"choices": [{"message": {"content": null, "reasoning": "x"}, "finish_reason": "stop"}]});
+        let r = parse_one_shot(false, &null);
+        assert!(r.text.is_empty() && r.had_reasoning);
+        assert_eq!(parse_one_shot(false, &json!({})), OneShotReply::default());
+        // Anthropic truncation.
+        let r = parse_one_shot(true, &json!({"content": [{"type": "thinking", "thinking": "..."}], "stop_reason": "max_tokens"}));
+        assert!(r.text.is_empty() && r.truncated && r.had_reasoning);
+    }
+
+    #[test]
+    fn one_shot_budgets_respect_the_configured_ceiling() {
+        // Small asks get headroom, then a bigger retry.
+        assert_eq!(one_shot_budgets(150, 40_960), (4096, 16_384));
+        assert_eq!(one_shot_budgets(40, 40_960), (4096, 16_384));
+        // A user who capped llm/max_tokens low is not exceeded (no retry budget to grow into).
+        assert_eq!(one_shot_budgets(150, 2000), (2000, 2000));
+        // Larger asks are kept as they are.
+        assert_eq!(one_shot_budgets(8000, 40_960), (8000, 16_384));
+        assert_eq!(one_shot_budgets(20_000, 40_960), (20_000, 20_000));
+        // A caller asking for more than the ceiling still gets what it asked for.
+        assert_eq!(one_shot_budgets(4000, 1000), (4000, 4000));
     }
 
     /// Serve one HTTP request with an SSE body that trickles out over ~2.4s.
