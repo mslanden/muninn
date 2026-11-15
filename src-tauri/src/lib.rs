@@ -485,9 +485,15 @@ pub fn run() {
         .run(|app, event| {
             match event {
                 // Closing the window only hides it (see on_window_event), so keep
-                // the process alive for the tray/background agent.
-                tauri::RunEvent::ExitRequested { api, .. } => {
-                    api.prevent_exit();
+                // the process alive for the tray/background agent. That applies to exits
+                // the system asks for (`code` is None, e.g. the last window closing) —
+                // not to deliberate ones: `AppHandle::exit` (tray Quit, the signal
+                // handler) arrives here with `Some(code)`, and preventing it as well
+                // meant those could never actually exit the app.
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    if code.is_none() {
+                        api.prevent_exit();
+                    }
                 }
                 // The app really is exiting (tray Quit, a signal): last chance to stop
                 // the agent's background processes. Harmless if already done.

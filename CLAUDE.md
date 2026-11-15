@@ -61,7 +61,7 @@ Stop generation: the frontend calls `stop_chat` which inserts the session id int
 
 ### System tray / window behavior
 
-The app runs tray-resident: `WindowEvent::CloseRequested` hides the window instead of closing, and `RunEvent::ExitRequested` prevents exit. Quit is only via the tray menu. `TrayIconBuilder` requires an explicit icon (see commit `85c7e73`) — don't remove the `.icon(...)` call.
+The app runs tray-resident: `WindowEvent::CloseRequested` hides the window instead of closing, and `RunEvent::ExitRequested` prevents exit **only when its `code` is `None`** (system-initiated). A deliberate `AppHandle::exit(code)` — the tray's Quit, the termination-signal handler — arrives with `Some(code)` and must be let through; Tauri honours `prevent_exit` for those too, so preventing unconditionally makes the app impossible to quit. Quit is only via the tray menu. `TrayIconBuilder` requires an explicit icon (see commit `85c7e73`) — don't remove the `.icon(...)` call.
 
 ### Frontend structure
 
