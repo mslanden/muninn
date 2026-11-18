@@ -3,7 +3,6 @@
 export const workspace = document.getElementById("workspace");
 export const sessionList = document.getElementById("session-list");
 export const sessionSearchInput = document.getElementById("session-search-input");
-export const sidebarAppsRail = document.getElementById("sidebar-apps-rail");
 export const newChatBtn = document.getElementById("new-chat-btn");
 export const navSettingsBtn = document.getElementById("nav-settings");
 export const sidebarCollapseBtn = document.getElementById("sidebar-collapse-btn");

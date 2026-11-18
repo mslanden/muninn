@@ -64,6 +64,12 @@ document.addEventListener("click", (e) => {
   openConnections();
 });
 
+// Library and Tasks open (or focus) their tile; both can also be dragged into the grid.
+const navTasks = document.getElementById("nav-tasks");
+if (navTasks) {
+  navTasks.addEventListener("click", () => openTileForType("tasks"));
+  makeDragSource(navTasks, { type: "tasks" });
+}
 const navLibrary = document.getElementById("nav-library");
 if (navLibrary) {
   navLibrary.addEventListener("click", () => openTileForType("library"));
