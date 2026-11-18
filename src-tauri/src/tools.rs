@@ -595,7 +595,7 @@ async fn exec_agent_command(
     let id = state.bg_processes.start(session_id, command, &cwd_path)?;
     // Give it a moment so an immediate failure (typo, port in use) is reported right here.
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-    let view = state.bg_processes.view(id, 3000)?;
+    let view = state.bg_processes.view(session_id, id, 3000)?;
     let output = if view.output.trim().is_empty() {
         "(no output yet)".to_string()
     } else {
@@ -640,12 +640,7 @@ pub(crate) fn run_command_capture(state: &AppState, command: &str, cwd: Option<&
     merged.push_str(&String::from_utf8_lossy(&output.stdout));
     merged.push_str(&String::from_utf8_lossy(&output.stderr));
 
-    if merged.len() > 12000 {
-        merged.truncate(12000);
-        merged.push_str("\n...[truncated]");
-    }
-
-    Ok(merged)
+    Ok(cap_command_output(merged))
 }
 
 pub(crate) async fn web_search_impl(state: &AppState, query: &str, count: usize) -> Result<String, String> {
@@ -708,7 +703,9 @@ pub(crate) async fn web_fetch_impl(state: &AppState, url: &str) -> Result<String
     let plain = strip_html_tags(&text);
     let max = 12000;
     if plain.len() > max {
-        Ok(format!("{}...[truncated]", &plain[..max]))
+        // By characters: a byte slice at 12000 panics when it lands inside a multi-byte
+        // character, which any non-ASCII page can trigger.
+        Ok(format!("{}...[truncated]", truncate_chars(&plain, max)))
     } else {
         Ok(plain)
     }
@@ -1660,13 +1657,11 @@ pub(crate) fn read_file_range_scoped(
     Ok(out)
 }
 
-/// Cap merged git/command output the same way `run_command_scoped_unchecked` does.
-fn cap_command_output(mut merged: String) -> String {
-    if merged.len() > 12000 {
-        merged.truncate(12000);
-        merged.push_str("\n...[truncated]");
-    }
-    merged
+/// Cap merged git/command output for the model the same way `run_command` output is capped
+/// (`procs`): head and tail kept, the middle elided — errors and summaries are usually at the
+/// end. Counts characters, so multi-byte text is never cut mid-character.
+fn cap_command_output(merged: String) -> String {
+    crate::procs::cap_middle(&merged, crate::procs::OUTPUT_CAP_CHARS)
 }
 
 /// Run `git` with an explicit argv inside the workspace root. Never interpolates args into a
@@ -2155,42 +2150,7 @@ pub(crate) async fn execute_agent_tool(
     }
 
     // Alias mapping first, then check enabled
-    let tool_name = match tool_name {
-        "shell" | "bash" | "zsh" => "run_command",
-        "cat" | "read" => "read_file",
-        "write" | "save" => "write_file",
-        "edit" | "str_replace" | "replace" => "edit_file",
-        "append" | "append_to_file" => "append_file",
-        "screenshot" | "screen_capture" | "take_screenshot" => "capture_screen",
-        "screenshot_page" | "capture_url" | "preview_page" | "screenshot_url" => "capture_page",
-        "processes" | "background_process" | "background_processes" => "process",
-        "launch_app" | "open_application" | "activate_app" => "open_app",
-        "ls" | "dir" => "list_files",
-        "grep" | "rg" | "find" => "search_files",
-        "search" | "brave" | "brave_search" => "web_search",
-        "fetch" | "curl" | "wget" => "web_fetch",
-        "imagine" | "image" | "draw" => "generate_image",
-        "video_info" => "probe_video",
-        "transcribe_video" => "analyze_video",
-        "cut_video" | "trim_video" | "render_video" => "edit_video",
-        "places" | "find_places" => "search_places",
-        "nearby" | "around_me" => "search_nearby",
-        "directions" | "route" | "navigate" => "get_directions",
-        "diff" => "git_diff",
-        "commit" => "git_commit",
-        "outline" => "code_outline",
-        "references" | "refs" => "find_references",
-        "http" | "http_fetch" => "http_request",
-        "test" | "tests" => "run_tests",
-        "skills" | "load_skill" | "use_skill" => "skill",
-        "delegate" | "spawn_subagent" | "task_agent" => "subagent",
-        "get_setting" | "list_settings" | "read_settings" => "get_settings",
-        "update_setting" | "change_setting" | "set_settings" => "set_setting",
-        "theme" | "change_theme" => "set_theme",
-        "models" | "fetch_models" => "list_models",
-        "test_connection" | "test_model" => "test_llm_connection",
-        other => other,
-    };
+    let tool_name = canonical_tool_name(tool_name);
 
     let is_enabled = enabled.contains(tool_name)
         || (tool_name == "search_nearby" && enabled.contains("search_places"));
@@ -2548,8 +2508,9 @@ pub(crate) async fn execute_agent_tool(
                     if let Some(needle) = wait_for {
                         let wait_secs = arg_u64(arguments, "wait_secs").unwrap_or(30).clamp(1, 120);
                         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+                        let mut scanned = 0u64;
                         loop {
-                            let (found, running) = state.bg_processes.log_contains(id, needle)?;
+                            let (found, running) = state.bg_processes.log_contains(session_id, id, needle, &mut scanned)?;
                             if found {
                                 waited_note = format!("Found \"{}\" in the output.\n", needle);
                                 break;
@@ -2572,7 +2533,7 @@ pub(crate) async fn execute_agent_tool(
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         }
                     }
-                    let view = state.bg_processes.view(id, 6000)?;
+                    let view = state.bg_processes.view(session_id, id, 6000)?;
                     Ok(format!(
                         "{}Process {} is {}.\nOutput:\n{}",
                         waited_note,
@@ -2581,7 +2542,7 @@ pub(crate) async fn execute_agent_tool(
                         if view.output.trim().is_empty() { "(no output yet)" } else { view.output.as_str() }
                     ))
                 }
-                "stop" | "kill" => state.bg_processes.stop(need_id()?, 3000),
+                "stop" | "kill" => state.bg_processes.stop(session_id, need_id()?, 3000),
                 other => Err(format!("unknown process action '{}' (use list, output or stop)", other)),
             }
         }
@@ -3610,18 +3571,11 @@ fn validate_task_skill(state: &AppState, args: &Value) -> Result<Option<String>,
     Ok(Some(skill.meta.name))
 }
 
-pub(crate) fn parse_tool_code_block(text: &str) -> Option<(String, String)> {
-    let start = text.find("<tool_code>")?;
-    let end = text.find("</tool_code>")?;
-    let inner = &text[start + 11..end];
-
-    let tool_start = inner.find("tool => ")? + 8;
-    let args_start = inner.find("args => ")? + 8;
-
-    let tool_name_raw = inner[tool_start..].trim().trim_matches('\'');
-    let args = inner[args_start..].trim().trim_matches('\'').trim();
-
-    let tool_name = match tool_name_raw {
+/// The built-in tool a model-invented name refers to (`"bash"` → `run_command`, ...), or the
+/// name itself. The one alias table — both native tool calls and the fenced-code fallback
+/// resolve through it.
+pub(crate) fn canonical_tool_name(name: &str) -> &str {
+    match name {
         "shell" | "bash" | "zsh" => "run_command",
         "cat" | "read" => "read_file",
         "write" | "save" => "write_file",
@@ -3636,11 +3590,41 @@ pub(crate) fn parse_tool_code_block(text: &str) -> Option<(String, String)> {
         "search" | "brave" | "brave_search" => "web_search",
         "fetch" | "curl" | "wget" => "web_fetch",
         "imagine" | "image" | "draw" => "generate_image",
+        "video_info" => "probe_video",
+        "transcribe_video" => "analyze_video",
+        "cut_video" | "trim_video" | "render_video" => "edit_video",
         "places" | "find_places" => "search_places",
         "nearby" | "around_me" => "search_nearby",
         "directions" | "route" | "navigate" => "get_directions",
+        "diff" => "git_diff",
+        "commit" => "git_commit",
+        "outline" => "code_outline",
+        "references" | "refs" => "find_references",
+        "http" | "http_fetch" => "http_request",
+        "test" | "tests" => "run_tests",
+        "skills" | "load_skill" | "use_skill" => "skill",
+        "delegate" | "spawn_subagent" | "task_agent" => "subagent",
+        "get_setting" | "list_settings" | "read_settings" => "get_settings",
+        "update_setting" | "change_setting" | "set_settings" => "set_setting",
+        "theme" | "change_theme" => "set_theme",
+        "models" | "fetch_models" => "list_models",
+        "test_connection" | "test_model" => "test_llm_connection",
         other => other,
-    };
+    }
+}
+
+pub(crate) fn parse_tool_code_block(text: &str) -> Option<(String, String)> {
+    let start = text.find("<tool_code>")?;
+    let end = text.find("</tool_code>")?;
+    let inner = &text[start + 11..end];
+
+    let tool_start = inner.find("tool => ")? + 8;
+    let args_start = inner.find("args => ")? + 8;
+
+    let tool_name_raw = inner[tool_start..].trim().trim_matches('\'');
+    let args = inner[args_start..].trim().trim_matches('\'').trim();
+
+    let tool_name = canonical_tool_name(tool_name_raw);
 
     Some((tool_name.to_string(), args.to_string()))
 }

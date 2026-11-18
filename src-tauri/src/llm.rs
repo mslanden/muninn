@@ -2714,6 +2714,41 @@ const STREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// dead. Generous because a reasoning model can think for a while before its first token.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Decode as much of `buf` as is complete UTF-8 and remove it, leaving an incomplete trailing
+/// character (one split across network chunks) in `buf` for the next chunk. Invalid bytes are
+/// replaced with U+FFFD, as `from_utf8_lossy` would.
+fn take_utf8(buf: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    let mut start = 0;
+    loop {
+        match std::str::from_utf8(&buf[start..]) {
+            Ok(text) => {
+                out.push_str(text);
+                start = buf.len();
+                break;
+            }
+            Err(e) => {
+                let valid = start + e.valid_up_to();
+                out.push_str(std::str::from_utf8(&buf[start..valid]).unwrap_or_default());
+                match e.error_len() {
+                    // A real encoding error: replace it and keep going.
+                    Some(bad) => {
+                        out.push('\u{FFFD}');
+                        start = valid + bad;
+                    }
+                    // Input ends mid-character: keep the partial bytes for next time.
+                    None => {
+                        start = valid;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    buf.drain(..start);
+    out
+}
+
 /// Endpoints that rejected `stream_options` (remembered for the life of the process so the
 /// extra failed request happens once, not every round).
 fn no_stream_options() -> &'static Mutex<HashSet<String>> {
@@ -2735,9 +2770,39 @@ fn set_insert(set: &Mutex<HashSet<String>>, key: &str) {
     set.lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string());
 }
 
+/// The HTTP status of a `Provider::send` error (`"<label> API error 400 Bad Request: ..."`),
+/// or None for transport errors.
+fn error_status(err: &str) -> Option<u16> {
+    let (_, after) = err.split_once(" API error ")?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 /// Whether a `Provider::send` error is an HTTP 4xx (the request itself was refused).
 fn is_client_error(err: &str) -> bool {
-    err.contains(" API error 4")
+    error_status(err).map_or(false, |s| (400..500).contains(&s))
+}
+
+/// Whether a refusal may be about the images in the request, so that retrying without them
+/// is worth a try: a bad/unprocessable/unsupported/too-large request — never a rate limit,
+/// auth or not-found error.
+fn may_be_image_refusal(err: &str) -> bool {
+    matches!(error_status(err), Some(400 | 413 | 415 | 422))
+}
+
+/// Whether the error says the model does not take image input AT ALL — as opposed to one
+/// image being too big or the request being too long, which retrying without that image
+/// fixes but which says nothing about later images. Only this is remembered.
+fn says_images_unsupported(err: &str) -> bool {
+    if error_status(err) == Some(413) {
+        return false;
+    }
+    let e = err.to_lowercase();
+    let about_images = ["image", "vision", "multimodal", "multi-modal", "image_url"].iter().any(|k| e.contains(k));
+    let about_size = ["exceed", "too large", "too long", "maximum", "max ", "size", "dimension", "context length", "too many"]
+        .iter()
+        .any(|k| e.contains(k));
+    about_images && !about_size
 }
 
 /// Provider-specific wire format. Everything the OpenAI chat/completions and the
@@ -2920,6 +2985,8 @@ impl Provider {
         let mut usage_output: u64 = 0;
         let mut usage_cached: u64 = 0;
         let mut line_buf = String::new();
+        // Bytes of a UTF-8 character split across two network chunks, held for the next one.
+        let mut utf8_carry: Vec<u8> = Vec::new();
 
         // OpenAI keys partial tool calls by stream index; Anthropic appends in order.
         let mut openai_calls: HashMap<u64, ToolCall> = HashMap::new();
@@ -2943,7 +3010,8 @@ impl Provider {
                 }
             };
             let Some(bytes) = chunk else { break };
-            line_buf.push_str(&String::from_utf8_lossy(&bytes));
+            utf8_carry.extend_from_slice(&bytes);
+            line_buf.push_str(&take_utf8(&mut utf8_carry));
 
             while let Some(newline_pos) = line_buf.find('\n') {
                 let line = line_buf[..newline_pos].trim().to_string();
@@ -3412,23 +3480,34 @@ async fn send_round(
     }
 
     if let Err(err) = &result {
-        if is_client_error(err) && crate::context::contains_images(messages) {
+        if may_be_image_refusal(err) && crate::context::contains_images(messages) {
             let mut text_only = messages.clone();
             crate::context::strip_all_images(&mut text_only);
             let retry = provider.build_request(model, system_prompt, &text_only, tools, max_tokens, include_usage);
-            // Only conclude "no vision" if the same request without images is accepted —
-            // otherwise the refusal was about something else and the original error stands.
+            // Only drop the images if the same request without them is accepted — otherwise
+            // the refusal was about something else and the original error stands. They stay
+            // dropped for the rest of this turn (resending them would fail every round), but
+            // the model is only marked text-only when the error says so: an oversized image
+            // or an over-long request says nothing about the next screenshot.
             if let Ok(response) = provider.send(&state.http, &retry).await {
-                set_insert(no_vision(), &vision_key);
                 *messages = text_only;
+                let remembered = says_images_unsupported(err);
+                if remembered {
+                    set_insert(no_vision(), &vision_key);
+                }
                 crate::db::add_feed_item(
                     state,
                     "system",
-                    "Images not supported by this model",
+                    if remembered { "Images not supported by this model" } else { "Images left out of a request" },
                     &format!(
-                        "'{}' rejected image input ({}). Images are being left out for this model until the app restarts.",
+                        "'{}' rejected a request with images ({}). {}",
                         model,
-                        crate::tools::truncate_chars(err, 200)
+                        crate::tools::truncate_chars(err, 200),
+                        if remembered {
+                            "Images are being left out for this model until the app restarts."
+                        } else {
+                            "It was resent without them; images are left out for the rest of this turn only."
+                        }
                     ),
                     "error",
                     session_id,
@@ -4333,11 +4412,52 @@ mod tests {
     }
 
     #[test]
+    fn utf8_split_across_chunks_is_reassembled() {
+        let text = "héllo 👋 世界";
+        let bytes = text.as_bytes();
+        // Every possible split point, including inside the 4-byte emoji and 3-byte CJK.
+        for cut in 0..=bytes.len() {
+            let mut carry = Vec::new();
+            carry.extend_from_slice(&bytes[..cut]);
+            let mut out = take_utf8(&mut carry);
+            carry.extend_from_slice(&bytes[cut..]);
+            out.push_str(&take_utf8(&mut carry));
+            assert_eq!(out, text, "split at {}", cut);
+            assert!(carry.is_empty());
+        }
+        // Genuinely invalid bytes are replaced, not held forever.
+        let mut bad = vec![b'a', 0xff, b'b'];
+        assert_eq!(take_utf8(&mut bad), "a\u{FFFD}b");
+        assert!(bad.is_empty());
+    }
+
+    #[test]
     fn client_errors_are_recognised_from_send_errors() {
         assert!(is_client_error("OpenAI API error 400 Bad Request: {\"error\":\"x\"}"));
         assert!(is_client_error("OpenAI API error 422 Unprocessable Entity: nope"));
         assert!(!is_client_error("OpenAI API error 500 Internal Server Error: boom"));
         assert!(!is_client_error("error sending request for url"));
+        assert_eq!(error_status("MiniMax Anthropic API error 429 Too Many Requests: slow down"), Some(429));
+    }
+
+    #[test]
+    fn only_explicit_no_image_refusals_mark_a_model_text_only() {
+        // Worth retrying without images, but not remembered.
+        let too_big = "MiniMax Anthropic API error 400 Bad Request: {\"error\":{\"message\":\"messages.3.content.1.image.source.base64: image exceeds 5 MB maximum: 5592404 bytes > 5242880 bytes\"}}";
+        assert!(may_be_image_refusal(too_big) && !says_images_unsupported(too_big));
+        let long = "OpenAI API error 400 Bad Request: {\"error\":{\"message\":\"This model's maximum context length is 128000 tokens\"}}";
+        assert!(may_be_image_refusal(long) && !says_images_unsupported(long));
+        let payload = "OpenAI API error 413 Payload Too Large: request entity too large";
+        assert!(may_be_image_refusal(payload) && !says_images_unsupported(payload));
+        // Never retried without images at all.
+        assert!(!may_be_image_refusal("OpenAI API error 429 Too Many Requests: {\"error\":\"rate limit\"}"));
+        assert!(!may_be_image_refusal("OpenAI API error 401 Unauthorized: bad key"));
+        assert!(!may_be_image_refusal("OpenAI API error 500 Internal Server Error: boom"));
+        // A real "this model can't see" refusal is remembered.
+        let no_vision = "OpenAI API error 400 Bad Request: {\"error\":{\"message\":\"Invalid content type. image_url is only supported by certain models.\"}}";
+        assert!(may_be_image_refusal(no_vision) && says_images_unsupported(no_vision));
+        let no_vision2 = "OpenAI API error 400 Bad Request: {\"error\":\"model does not support image input\"}";
+        assert!(says_images_unsupported(no_vision2));
     }
 
     #[test]

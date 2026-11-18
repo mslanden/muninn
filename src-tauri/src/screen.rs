@@ -203,8 +203,9 @@ pub fn capture_app_window(app: &str) -> Result<(String, String, String), String>
 const MODEL_IMAGE_MAX_EDGE: u32 = 1568;
 /// Largest image file `read_file` will load at all.
 const MODEL_IMAGE_MAX_FILE_BYTES: u64 = 40 * 1024 * 1024;
-/// Largest payload sent as-is when it can't be downscaled (providers cap around 5 MB).
-const MODEL_IMAGE_MAX_RAW_BYTES: usize = 4 * 1024 * 1024;
+/// Largest payload sent as-is when it can't be downscaled. Providers cap an image at 5 MB
+/// of base64 (Anthropic: 5,242,880), which is ~3.9 MB of raw bytes after the 4/3 expansion.
+const MODEL_IMAGE_MAX_RAW_BYTES: usize = 3_750_000;
 
 /// If `path` has a raster-image extension the model can be shown, return whether the format
 /// can be sent as-is (`Some(media_type)`) or must be converted first (`None`). Returns `None`

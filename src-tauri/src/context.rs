@@ -45,8 +45,12 @@ const CLEARED_MARK: &str = "[older tool output cleared to save context";
 
 /// Newest stored rows considered for one turn; older unsummarized rows are out of reach.
 const MAX_HISTORY_ROWS: usize = 2000;
-/// Cap on the transcript handed to the summarizer.
+/// Cap on the transcript handed to the summarizer. The real cap is `transcript_cap`, which
+/// also keeps the summarizer request inside the configured budget.
 const MAX_TRANSCRIPT_CHARS: usize = 400_000;
+/// After a summarizer failure, don't try again for this session for this long — every turn
+/// would otherwise wait on (and fail) the same call before it could start.
+const COMPACTION_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// First text of the user message that carries tool images on the OpenAI wire format (tool
 /// messages there are text-only, so images follow in a user message). Also how such a
@@ -69,6 +73,24 @@ pub fn budget_chars(state: &AppState) -> usize {
 
 fn auto_compact_enabled(state: &AppState) -> bool {
     get_app_setting_value(state, "llm/auto_compact").ok().flatten().as_deref() != Some("0")
+}
+
+/// Most transcript characters sent to the summarizer. The summarizer is the same model the
+/// budget was set for, so its request (transcript + earlier summary + instructions + reply)
+/// must fit that budget too: half of it, never more than `MAX_TRANSCRIPT_CHARS`.
+pub fn transcript_cap(budget_chars: usize) -> usize {
+    (budget_chars / 2).min(MAX_TRANSCRIPT_CHARS)
+}
+
+/// When summarizing last failed, per session (in memory: a restart retries at once).
+fn compaction_failures() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
+fn backoff_active(last_failure: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_failure.map_or(false, |at| now.saturating_duration_since(at) < COMPACTION_RETRY_AFTER)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -340,7 +362,7 @@ fn clip(text: &str, max: usize) -> String {
 
 /// Render messages as a plain transcript for the summarizer. Tool calls and results are
 /// abbreviated — the summary needs what was done and found, not full file dumps.
-pub fn render_transcript(messages: &[HistoryMessage]) -> String {
+pub fn render_transcript(messages: &[HistoryMessage], cap: usize) -> String {
     let mut out = String::new();
     for msg in messages {
         let who = if msg.role == "assistant" { "Assistant" } else { "User" };
@@ -374,9 +396,9 @@ pub fn render_transcript(messages: &[HistoryMessage]) -> String {
         }
     }
     let total = out.chars().count();
-    if total > MAX_TRANSCRIPT_CHARS {
-        let head_n = MAX_TRANSCRIPT_CHARS / 5;
-        let tail_n = MAX_TRANSCRIPT_CHARS - head_n;
+    if total > cap {
+        let head_n = cap / 5;
+        let tail_n = cap - head_n;
         let head: String = out.chars().take(head_n).collect();
         let tail: String = out.chars().skip(total - tail_n).collect();
         return format!("{}\n\n[... middle of the transcript omitted for length ...]\n\n{}", head, tail);
@@ -472,12 +494,18 @@ pub async fn prepare_history(app: &AppHandle, state: &AppState, session_id: &str
     let (mut summary, summary_upto) = crate::db::get_context_summary(state, session_id)?;
     let mut rows = crate::db::load_history_rows(state, session_id, summary_upto, MAX_HISTORY_ROWS)?;
 
-    if auto_compact_enabled(state) {
+    let last_failure = compaction_failures()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(session_id)
+        .copied();
+    if auto_compact_enabled(state) && !backoff_active(last_failure, std::time::Instant::now()) {
         let messages: Vec<HistoryMessage> = rows.iter().map(|(_, m)| m.clone()).collect();
         if let Some(cut) = plan_compaction(&messages, summary.len(), budget) {
-            let transcript = render_transcript(&messages[..cut]);
+            let transcript = render_transcript(&messages[..cut], transcript_cap(budget));
             match summarize(state, &summary, &transcript).await {
                 Ok(new_summary) => {
+                    compaction_failures().lock().unwrap_or_else(|p| p.into_inner()).remove(session_id);
                     let upto = rows[cut - 1].0;
                     crate::db::set_context_summary(state, session_id, &new_summary, upto)?;
                     rows.drain(..cut);
@@ -496,11 +524,19 @@ pub async fn prepare_history(app: &AppHandle, state: &AppState, session_id: &str
                     );
                 }
                 Err(e) => {
+                    compaction_failures()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(session_id.to_string(), std::time::Instant::now());
                     add_feed_item(
                         state,
                         "system",
                         "Conversation compaction failed",
-                        &format!("Could not summarize earlier messages ({}); sending the most recent ones instead.", e),
+                        &format!(
+                            "Could not summarize earlier messages ({}); sending the most recent ones instead. Trying again in {} minutes.",
+                            e,
+                            COMPACTION_RETRY_AFTER.as_secs() / 60
+                        ),
                         "error",
                         session_id,
                     );
@@ -785,7 +821,7 @@ mod tests {
             tool_result("a", &"L".repeat(5000)),
             assistant("fixed it"),
         ];
-        let t = render_transcript(&history);
+        let t = render_transcript(&history, MAX_TRANSCRIPT_CHARS);
         assert!(t.contains("User: please fix the bug"));
         assert!(t.contains("Assistant called tool read_file({\"path\":\"a.rs\"})"));
         assert!(t.contains("Tool result: LLL") && t.contains("more characters]"));
@@ -793,10 +829,26 @@ mod tests {
         assert!(t.len() < 1200, "{}", t.len());
 
         let huge: Vec<HistoryMessage> = (0..300).map(|i| user(&format!("{} {}", i, "m".repeat(3500)))).collect();
-        let t = render_transcript(&huge);
+        let t = render_transcript(&huge, MAX_TRANSCRIPT_CHARS);
         assert!(t.chars().count() <= MAX_TRANSCRIPT_CHARS + 100);
         assert!(t.contains("middle of the transcript omitted"));
         assert!(t.starts_with("User: 0 ") && t.contains("User: 299 "));
+
+        // A small budget gets a proportionally small transcript.
+        let small = transcript_cap(32_000 * 4);
+        assert_eq!(small, 64_000);
+        let t = render_transcript(&huge, small);
+        assert!(t.chars().count() <= small + 100, "{}", t.chars().count());
+        assert!(t.starts_with("User: 0 ") && t.contains("User: 299 "));
+        assert_eq!(transcript_cap(2_000_000 * 4), MAX_TRANSCRIPT_CHARS);
+    }
+
+    #[test]
+    fn a_failed_compaction_is_not_retried_every_turn() {
+        let now = std::time::Instant::now();
+        assert!(!backoff_active(None, now));
+        assert!(backoff_active(Some(now), now + std::time::Duration::from_secs(60)));
+        assert!(!backoff_active(Some(now), now + COMPACTION_RETRY_AFTER + std::time::Duration::from_secs(1)));
     }
 
     #[test]

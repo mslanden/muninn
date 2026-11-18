@@ -27,7 +27,7 @@ pub const MAX_RUNNING: usize = 8;
 /// Exited processes kept around (so their final output can still be read) before pruning.
 const MAX_EXITED_KEPT: usize = 12;
 /// Model-facing cap on command output.
-const OUTPUT_CAP_CHARS: usize = 12_000;
+pub(crate) const OUTPUT_CAP_CHARS: usize = 12_000;
 /// Most log bytes ever read back from disk for one result.
 const LOG_READ_CAP_BYTES: u64 = 256 * 1024;
 
@@ -73,7 +73,12 @@ fn signal_group(pid: u32, signal: &str) {
 }
 
 /// Stop a child and everything it started: SIGTERM the group, give it `grace` to exit, then
-/// SIGKILL. Always reaps the child.
+/// SIGKILL whatever is left. Always reaps the child.
+///
+/// The leader is reaped only at the very end. Until then it holds its pid — even as a zombie —
+/// so the process-group id can't be handed to anyone else and every group signal here can only
+/// reach our own processes. (Reaping first and then signalling the group, as this used to,
+/// could hit an unrelated group that was given the freed id in between.)
 fn terminate(child: &mut Child, grace: Duration) -> Option<ExitStatus> {
     // Already exited (and now reaped): its pid may be reused, so never signal it again.
     // Anything it deliberately left running in the background is left alone.
@@ -83,14 +88,16 @@ fn terminate(child: &mut Child, grace: Duration) -> Option<ExitStatus> {
     let pid = child.id();
     signal_group(pid, "TERM");
     let start = Instant::now();
-    while start.elapsed() < grace {
-        if let Ok(Some(status)) = child.try_wait() {
-            signal_group(pid, "KILL");
-            return Some(status);
-        }
+    // `group_alive` turns false once only the (zombie) leader is left — zombies can't be
+    // signalled — so this ends as soon as everything has actually exited.
+    while group_alive(pid) && start.elapsed() < grace {
         std::thread::sleep(Duration::from_millis(50));
     }
-    signal_group(pid, "KILL");
+    if group_alive(pid) {
+        signal_group(pid, "KILL");
+    }
+    // In case the leader itself is somehow unreachable through the group signal; harmless on
+    // a zombie, and its pid is still ours.
     let _ = child.kill();
     child.wait().ok()
 }
@@ -123,7 +130,7 @@ fn read_log(path: &Path, cap_chars: usize) -> String {
 }
 
 /// Keep at most `cap` characters of `text`: the first third and the last two thirds.
-fn cap_middle(text: &str, cap: usize) -> String {
+pub(crate) fn cap_middle(text: &str, cap: usize) -> String {
     let total = text.chars().count();
     if total <= cap {
         return text.to_string();
@@ -158,6 +165,31 @@ fn read_log_tail(path: &Path, cap_chars: usize) -> String {
     }
     let tail: String = text.chars().skip(total.saturating_sub(cap_chars)).collect();
     format!("...[earlier output omitted]...\n{}", tail)
+}
+
+/// Search a log for `needle` (case-insensitive) from byte `*scanned` to the end, in bounded
+/// chunks, advancing `*scanned`. Each chunk starts a little before the previous end so a
+/// match straddling two chunks (or two polls) is still found.
+fn scan_for(path: &Path, needle: &str, scanned: &mut u64) -> bool {
+    const CHUNK: u64 = 1024 * 1024;
+    let Ok(mut file) = File::open(path) else { return false };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let needle = needle.to_lowercase();
+    // Lowercasing can change byte lengths, so overlap generously.
+    let overlap = (needle.len() as u64).saturating_mul(4);
+    while *scanned < len {
+        let start = scanned.saturating_sub(overlap);
+        let end = (*scanned + CHUNK).min(len);
+        let mut buf = vec![0u8; (end - start) as usize];
+        if file.seek(SeekFrom::Start(start)).is_err() || file.read_exact(&mut buf).is_err() {
+            return false;
+        }
+        *scanned = end;
+        if String::from_utf8_lossy(&buf).to_lowercase().contains(&needle) {
+            return true;
+        }
+    }
+    false
 }
 
 fn describe_exit(status: &ExitStatus) -> String {
@@ -307,6 +339,63 @@ struct LedgerEntry {
     /// unrelated one that was later given the same pid.
     started: String,
     command: String,
+    /// Unix time (s) at which the leader was last seen alive (or not yet reaped). Until then
+    /// the pid — and so the process-group id — was reserved by us, so any process that was
+    /// already running at that moment and is in this group now is ours. 0 = unknown (an
+    /// older ledger), in which case a leaderless group is never touched.
+    #[serde(default)]
+    confirmed_at: u64,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse `ps -o etime` (`[[dd-]hh:]mm:ss`) into seconds.
+fn parse_etime(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let parts: Vec<u64> = rest.split(':').map(|p| p.parse::<u64>().ok()).collect::<Option<_>>()?;
+    let (h, m, sec) = match parts.as_slice() {
+        [m, s] => (0, *m, *s),
+        [h, m, s] => (*h, *m, *s),
+        _ => return None,
+    };
+    Some(days * 86_400 + h * 3_600 + m * 60 + sec)
+}
+
+/// Approximate start times (unix s) of every process currently in process group `pgid`.
+fn group_member_starts(pgid: u32) -> Vec<u64> {
+    let Ok(out) = Command::new("/bin/ps").args(["-A", "-o", "pid=,pgid=,etime="]).stderr(Stdio::null()).output() else {
+        return Vec::new();
+    };
+    let now = unix_now();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let _pid = cols.next()?;
+            let group: u32 = cols.next()?.parse().ok()?;
+            let elapsed = parse_etime(cols.next()?)?;
+            (group == pgid).then(|| now.saturating_sub(elapsed))
+        })
+        .collect()
+}
+
+/// For a ledger entry whose leader is gone: whether the process group with its id is still
+/// ours. A pid (and so a pgid) is never reused while it is reserved, and it was reserved by
+/// us at `confirmed_at`; an unrelated group that later got the same id consists only of
+/// processes started after that. So the group is ours iff a member predates `confirmed_at`
+/// (with 2s of slack for `etime`'s one-second resolution).
+fn leaderless_group_is_ours(entry: &LedgerEntry) -> bool {
+    entry.confirmed_at > 0
+        && group_member_starts(entry.pid).iter().any(|&start| start + 2 <= entry.confirmed_at)
 }
 
 /// Start time of `pid` as printed by `ps -o lstart=`, or None if there is no such process.
@@ -358,15 +447,16 @@ fn write_ledger(path: &Path, entries: &[LedgerEntry]) {
 /// - leader alive with the recorded start time → ours, stop the group;
 /// - leader alive with a different start time → the pid was reused, which means our group
 ///   is completely gone → leave it alone;
-/// - leader gone but the group still has members → they are ours (the wrapper exited, its
-///   children did not) → stop the group.
+/// - leader gone but the group still has members → ours only if one of them was already
+///   running when we last saw our leader alive (`leaderless_group_is_ours`). Otherwise our
+///   group died after that and the id now belongs to someone else's group → leave it alone.
 pub fn reap_orphans(path: &Path) -> Vec<String> {
     let entries = read_ledger(path);
     let mut stopped = Vec::new();
     for entry in &entries {
         let ours = match process_start_time(entry.pid) {
             Some(started) => started == entry.started,
-            None => group_alive(entry.pid),
+            None => group_alive(entry.pid) && leaderless_group_is_ours(entry),
         };
         if !ours {
             continue;
@@ -471,13 +561,24 @@ impl ProcessRegistry {
     }
 
     /// Rewrite the ledger from the processes still running. Call after every change.
-    fn sync_ledger(&self, inner: &Inner) {
+    /// Every process is refreshed first, so `confirmed_at` is only stamped on leaders that
+    /// really are still alive (or unreaped) right now.
+    fn sync_ledger(&self, inner: &mut Inner) {
         let Some(path) = &self.ledger else { return };
+        let now = unix_now();
+        for p in inner.procs.values_mut() {
+            p.refresh();
+        }
         let mut entries: Vec<LedgerEntry> = inner
             .procs
             .values()
             .filter(|p| p.exited.is_none())
-            .map(|p| LedgerEntry { pid: p.child.id(), started: p.started_at.clone(), command: p.command.clone() })
+            .map(|p| LedgerEntry {
+                pid: p.child.id(),
+                started: p.started_at.clone(),
+                command: p.command.clone(),
+                confirmed_at: now,
+            })
             .collect();
         entries.sort_by_key(|e| e.pid);
         write_ledger(path, &entries);
@@ -532,14 +633,15 @@ impl ProcessRegistry {
                 exited: None,
             },
         );
-        self.sync_ledger(&inner);
+        self.sync_ledger(&mut inner);
         Ok(id)
     }
 
-    /// Current status and the tail of the log.
-    pub fn view(&self, id: u32, tail_chars: usize) -> Result<ProcessView, String> {
+    /// Current status and the tail of the log. `requester` is the asking chat's session id —
+    /// only the chat that started a process (or its subagents) may read or stop it.
+    pub fn view(&self, requester: &str, id: u32, tail_chars: usize) -> Result<ProcessView, String> {
         let mut inner = self.lock();
-        let p = inner.procs.get_mut(&id).ok_or_else(|| no_such(id))?;
+        let p = owned_mut(&mut inner, requester, id)?;
         p.refresh();
         Ok(ProcessView {
             status: p.status_text(),
@@ -548,33 +650,34 @@ impl ProcessRegistry {
         })
     }
 
-    /// Whether the log contains `needle` (case-insensitive), and whether it is still running.
-    /// Errors when the id is unknown.
-    pub fn log_contains(&self, id: u32, needle: &str) -> Result<(bool, bool), String> {
+    /// Whether `needle` (case-insensitive) has appeared in the log, and whether the process is
+    /// still running. `scanned` is the caller's position in the log: start it at 0 and pass the
+    /// same variable on every poll, so each call reads only what was written since (plus a
+    /// small overlap for a match split across polls). Errors when the id is unknown.
+    pub fn log_contains(&self, requester: &str, id: u32, needle: &str, scanned: &mut u64) -> Result<(bool, bool), String> {
         let (log, running) = {
             let mut inner = self.lock();
-            let p = inner.procs.get_mut(&id).ok_or_else(|| no_such(id))?;
+            let p = owned_mut(&mut inner, requester, id)?;
             p.refresh();
             (p.log.clone(), p.exited.is_none())
         };
-        let mut bytes = Vec::new();
-        if let Ok(file) = File::open(&log) {
-            let _ = file.take(8 * 1024 * 1024).read_to_end(&mut bytes);
-        }
-        let hay = String::from_utf8_lossy(&bytes).to_lowercase();
-        Ok((hay.contains(&needle.to_lowercase()), running))
+        Ok((scan_for(&log, needle, scanned), running))
     }
 
     /// Stop a process (and everything it started) and forget it. Returns its final output.
-    pub fn stop(&self, id: u32, tail_chars: usize) -> Result<String, String> {
-        let mut p = self.lock().procs.remove(&id).ok_or_else(|| no_such(id))?;
+    pub fn stop(&self, requester: &str, id: u32, tail_chars: usize) -> Result<String, String> {
+        let mut p = {
+            let mut inner = self.lock();
+            owned_mut(&mut inner, requester, id)?;
+            inner.procs.remove(&id).ok_or_else(|| no_such(id))?
+        };
         p.refresh();
         let was_running = p.exited.is_none();
         if was_running {
             terminate(&mut p.child, Duration::from_millis(2000));
         }
         // Only after it is really gone: a crash between the two must leave it in the ledger.
-        self.sync_ledger(&self.lock());
+        self.sync_ledger(&mut self.lock());
         let output = read_log_tail(&p.log, tail_chars);
         let head = if was_running {
             format!("Stopped process {} ({}).", id, p.command)
@@ -602,7 +705,7 @@ impl ProcessRegistry {
                     p.status_text(),
                     p.command,
                     p.cwd,
-                    if p.session_id == current_session { "" } else { " [started by another chat]" }
+                    if may_manage(&p.session_id, current_session) { "" } else { " [started by another chat — only it can read or stop this]" }
                 ));
             }
         }
@@ -622,15 +725,33 @@ impl ProcessRegistry {
             ids.into_iter().filter_map(|id| inner.procs.remove(&id)).collect()
         };
         drop(removed); // BgProcess::drop terminates each one, outside the lock.
-        self.sync_ledger(&self.lock());
+        self.sync_ledger(&mut self.lock());
     }
 
     /// Stop everything (app quit).
     pub fn kill_all(&self) {
         let removed: Vec<BgProcess> = self.lock().procs.drain().map(|(_, p)| p).collect();
         drop(removed);
-        self.sync_ledger(&self.lock());
+        self.sync_ledger(&mut self.lock());
     }
+}
+
+/// Whether the chat `requester` may manage a process started by `owner`: the same chat, or a
+/// subagent of it (`<owner>::sub-<n>`). Other chats and scheduled tasks may not — a task or a
+/// prompt-injected page must not be able to read or kill the user's dev server.
+fn may_manage(owner: &str, requester: &str) -> bool {
+    owner == requester || requester.split_once("::sub-").map_or(false, |(parent, _)| parent == owner)
+}
+
+fn owned_mut<'a>(inner: &'a mut Inner, requester: &str, id: u32) -> Result<&'a mut BgProcess, String> {
+    let p = inner.procs.get_mut(&id).ok_or_else(|| no_such(id))?;
+    if !may_manage(&p.session_id, requester) {
+        return Err(format!(
+            "background process {} was started by another chat; only that chat can read or stop it (deleting that chat also stops it)",
+            id
+        ));
+    }
+    Ok(p)
 }
 
 fn no_such(id: u32) -> String {
@@ -709,9 +830,10 @@ mod tests {
             .unwrap();
 
         // Wait for the readiness line.
+        let mut scanned = 0;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let (found, running) = reg.log_contains(id, "READY ON PORT").unwrap();
+            let (found, running) = reg.log_contains("s1", id, "READY ON PORT", &mut scanned).unwrap();
             if found {
                 assert!(running);
                 break;
@@ -720,15 +842,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        let view = reg.view(id, 4000).unwrap();
+        let view = reg.view("s1", id, 4000).unwrap();
         assert!(view.running);
         assert!(view.output.contains("ready on port 1234"));
         assert!(reg.list("s1").contains("running for"));
-        assert!(reg.list("other").contains("[started by another chat]"));
+        assert!(reg.list("other").contains("[started by another chat"));
 
-        let stopped = reg.stop(id, 4000).unwrap();
+        let stopped = reg.stop("s1", id, 4000).unwrap();
         assert!(stopped.starts_with(&format!("Stopped process {}", id)), "got: {}", stopped);
-        assert!(reg.view(id, 100).is_err());
+        assert!(reg.view("s1", id, 100).is_err());
         assert_eq!(reg.list("s1"), "No background processes.");
     }
 
@@ -738,7 +860,7 @@ mod tests {
         let id = reg.start("s1", "echo boom; exit 7", &tmp()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let view = reg.view(id, 4000).unwrap();
+            let view = reg.view("s1", id, 4000).unwrap();
             if !view.running {
                 assert!(view.status.contains("exit code 7"), "got: {}", view.status);
                 assert!(view.output.contains("boom"));
@@ -747,7 +869,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(reg.stop(id, 100).unwrap().contains("had already exited"));
+        assert!(reg.stop("s1", id, 100).unwrap().contains("had already exited"));
     }
 
     #[test]
@@ -756,10 +878,25 @@ mod tests {
         let a = reg.start("a", "sleep 600", &tmp()).unwrap();
         let b = reg.start("b", "sleep 600", &tmp()).unwrap();
         reg.kill_session("a");
-        assert!(reg.view(a, 10).is_err());
-        assert!(reg.view(b, 10).unwrap().running);
+        assert!(reg.view("a", a, 10).is_err());
+        assert!(reg.view("b", b, 10).unwrap().running);
         reg.kill_all();
-        assert!(reg.view(b, 10).is_err());
+        assert!(reg.view("b", b, 10).is_err());
+    }
+
+    #[test]
+    fn only_the_owning_chat_and_its_subagents_can_read_or_stop_a_process() {
+        let reg = ProcessRegistry::default();
+        let id = reg.start("chat-a", "sleep 600", &tmp()).unwrap();
+        for other in ["chat-b", "task-1", "chat-b::sub-1", "chat-a-lookalike"] {
+            assert!(reg.view(other, id, 10).err().unwrap().contains("another chat"), "{}", other);
+            assert!(reg.log_contains(other, id, "x", &mut 0).is_err(), "{}", other);
+            assert!(reg.stop(other, id, 10).is_err(), "{}", other);
+        }
+        // Still running after all those refused attempts.
+        assert!(reg.view("chat-a", id, 10).unwrap().running);
+        assert!(reg.view("chat-a::sub-3", id, 10).unwrap().running);
+        assert!(reg.stop("chat-a", id, 10).unwrap().starts_with("Stopped process"));
     }
 
     #[test]
@@ -808,11 +945,11 @@ mod tests {
         assert!(entries.iter().all(|e| !e.started.is_empty() && e.pid > 0));
         assert!(entries.iter().any(|e| e.command == "sleep 601"));
 
-        reg.stop(a, 100).unwrap();
+        reg.stop("s", a, 100).unwrap();
         assert_eq!(read_ledger(&path).iter().map(|e| e.command.as_str()).collect::<Vec<_>>(), vec!["sleep 601"]);
         reg.kill_session("s");
         assert!(read_ledger(&path).is_empty());
-        assert!(reg.view(b, 10).is_err());
+        assert!(reg.view("s", b, 10).is_err());
         let _ = fs::remove_file(&path);
     }
 
@@ -850,7 +987,10 @@ mod tests {
         assert!(process_start_time(pgid).is_none(), "wrapper should be gone");
         assert!(process_start_time(child_pid).is_some(), "child should still be running");
 
-        write_ledger(&path, &[LedgerEntry { pid: pgid, started, command: "wrapper".into() }]);
+        // Confirmed alive after the child started (as a sync would have recorded it).
+        std::thread::sleep(Duration::from_millis(2100));
+        let confirmed_at = unix_now() + 1;
+        write_ledger(&path, &[LedgerEntry { pid: pgid, started, command: "wrapper".into(), confirmed_at }]);
         assert_eq!(reap_orphans(&path), vec!["wrapper".to_string()]);
         assert!(wait_until(|| process_start_time(child_pid).is_none()), "child {} survived", child_pid);
         let _ = fs::remove_file(&pid_file);
@@ -865,7 +1005,7 @@ mod tests {
         let mut bystander = spawn_detached("sleep 600");
         let pid = bystander.id();
         assert!(process_start_time(pid).is_some());
-        write_ledger(&path, &[LedgerEntry { pid, started: "Thu Jan  1 00:00:00 1970".into(), command: "old".into() }]);
+        write_ledger(&path, &[LedgerEntry { pid, started: "Thu Jan  1 00:00:00 1970".into(), command: "old".into(), confirmed_at: 0 }]);
 
         assert!(reap_orphans(&path).is_empty());
         std::thread::sleep(Duration::from_millis(300));
@@ -874,7 +1014,7 @@ mod tests {
 
         // Entries for processes that are simply gone are dropped quietly too.
         terminate(&mut bystander, Duration::from_millis(500));
-        write_ledger(&path, &[LedgerEntry { pid, started: "x".into(), command: "gone".into() }]);
+        write_ledger(&path, &[LedgerEntry { pid, started: "x".into(), command: "gone".into(), confirmed_at: unix_now() }]);
         assert!(reap_orphans(&path).is_empty());
         // A missing or corrupt ledger is not an error.
         let _ = fs::remove_file(&path);
@@ -882,6 +1022,95 @@ mod tests {
         fs::write(&path, b"not json").unwrap();
         assert!(reap_orphans(&path).is_empty());
         let _ = fs::remove_file(&path);
+    }
+
+    /// Regression: an entry left behind for a process that already exited must not kill an
+    /// unrelated process group that later got the same id (leader gone, members alive, all
+    /// started after we last saw our own leader).
+    #[test]
+    fn a_recycled_leaderless_group_is_never_killed() {
+        let path = ledger_path("recycled");
+        let pid_file = tmp().join(format!("muninn-ledger-recycled-{}.pid", std::process::id()));
+        let _ = fs::remove_file(&pid_file);
+        // "Our" leader was last confirmed alive a minute before this group existed.
+        let confirmed_at = unix_now() - 60;
+        let mut wrapper = spawn_detached(&format!("sleep 600 & echo $! > '{}'", pid_file.display()));
+        let pgid = wrapper.id();
+        wrapper.wait().unwrap();
+        assert!(wait_until(|| pid_file.exists() && !fs::read_to_string(&pid_file).unwrap_or_default().trim().is_empty()));
+        let child_pid: u32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        assert!(group_alive(pgid));
+
+        write_ledger(&path, &[LedgerEntry { pid: pgid, started: "old".into(), command: "stale".into(), confirmed_at }]);
+        assert!(reap_orphans(&path).is_empty());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(process_start_time(child_pid).is_some(), "an unrelated process group was killed");
+        // A ledger from before `confirmed_at` existed never kills a leaderless group either.
+        fs::write(&path, format!(r#"[{{"pid":{},"started":"old","command":"legacy"}}]"#, pgid)).unwrap();
+        assert!(reap_orphans(&path).is_empty());
+        assert!(process_start_time(child_pid).is_some());
+
+        signal_group(pgid, "KILL");
+        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn log_scan_is_incremental_and_reaches_past_8mb() {
+        let path = tmp().join(format!("muninn-scan-test-{}.log", std::process::id()));
+        // A readiness line after 9 MB of output (the old scan stopped reading at 8 MB).
+        let mut text = "x".repeat(9 * 1024 * 1024);
+        text.push_str("\nServer READY on port 3000\n");
+        fs::write(&path, &text).unwrap();
+        let mut scanned = 0;
+        assert!(scan_for(&path, "ready on port", &mut scanned));
+
+        // A match split across two polls is found, and earlier output isn't re-read.
+        fs::write(&path, "starting...\nLis").unwrap();
+        let mut scanned = 0;
+        assert!(!scan_for(&path, "listening", &mut scanned));
+        assert_eq!(scanned, "starting...\nLis".len() as u64);
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut f, b"tening on :8080\n").unwrap();
+        assert!(scan_for(&path, "LISTENING", &mut scanned));
+        // Nothing new: nothing read, no match.
+        let before = scanned;
+        assert!(!scan_for(&path, "nope", &mut scanned));
+        assert_eq!(scanned, before);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Children that ignore SIGTERM are SIGKILLed with the group, and a group that exits on
+    /// SIGTERM isn't held for the whole grace period.
+    #[test]
+    fn terminate_kills_stubborn_children_and_returns_early_when_all_exit() {
+        let pid_file = tmp().join(format!("muninn-terminate-test-{}.pid", std::process::id()));
+        let _ = fs::remove_file(&pid_file);
+        let mut stubborn = spawn_detached(&format!(
+            "/bin/sh -c 'trap \"\" TERM; echo $$ > \"{}\"; while :; do sleep 1; done' & wait",
+            pid_file.display()
+        ));
+        assert!(wait_until(|| fs::read_to_string(&pid_file).map_or(false, |t| !t.trim().is_empty())));
+        let child_pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        let pgid = stubborn.id();
+        terminate(&mut stubborn, Duration::from_millis(500));
+        assert!(wait_until(|| !pid_alive(&child_pid)), "TERM-ignoring child {} survived", child_pid);
+        assert!(!group_alive(pgid));
+        let _ = fs::remove_file(&pid_file);
+
+        let mut polite = spawn_detached("sleep 600");
+        let started = Instant::now();
+        terminate(&mut polite, Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(3), "waited {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn etime_parses() {
+        assert_eq!(parse_etime("00:05"), Some(5));
+        assert_eq!(parse_etime("12:34"), Some(754));
+        assert_eq!(parse_etime("01:00:00"), Some(3600));
+        assert_eq!(parse_etime("2-03:04:05"), Some(2 * 86_400 + 3 * 3600 + 4 * 60 + 5));
+        assert_eq!(parse_etime("bogus"), None);
     }
 
     #[test]
