@@ -37,11 +37,10 @@ import { openSettingsModal } from "./settings.js";
 // App tile types shown as icons in the footer rail (Logs & Tools live under
 // Settings now).
 // Content and Memory live in Library now (see library.js).
-const APPS_TYPES = ["web", "feeds", "tasks"];
+const APPS_TYPES = ["web", "tasks"];
 const APPS_ICONS = {
   content: "image",
   web: "globe",
-  feeds: "rss",
   tasks: "list-checks",
   memory: "brain",
 };

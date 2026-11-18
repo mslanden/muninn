@@ -7,7 +7,7 @@ function todayLocalDate() {
 
 // options.allowOnce: when true, show a Recurring/Once toggle; in Once mode
 // getData() returns { once: true, at: "<datetime-local value>" }. Defaults to
-// false so existing consumers (feeds) keep the recurring-only behavior.
+// false (recurring-only).
 export function renderScheduleWidget(container, initialData, options = {}) {
   const allowOnce = !!options.allowOnce;
   const DAYS = [
@@ -39,11 +39,11 @@ export function renderScheduleWidget(container, initialData, options = {}) {
         <div class="schedule-dates">
           <div class="schedule-date-field">
             <label class="schedule-label">Start date</label>
-            <input type="date" class="feeds-input schedule-start" />
+            <input type="date" class="schedule-input schedule-start" />
           </div>
           <div class="schedule-date-field">
             <label class="schedule-label">End date <span class="schedule-opt">(optional)</span></label>
-            <input type="date" class="feeds-input schedule-end" />
+            <input type="date" class="schedule-input schedule-end" />
           </div>
         </div>
         <div class="schedule-days">
@@ -54,7 +54,7 @@ export function renderScheduleWidget(container, initialData, options = {}) {
       ${allowOnce ? `
       <div class="schedule-once" style="display:none">
         <label class="schedule-label">Run at</label>
-        <input type="datetime-local" class="feeds-input schedule-once-at" />
+        <input type="datetime-local" class="schedule-input schedule-once-at" />
       </div>` : ""}
     </div>
   `;
@@ -94,12 +94,12 @@ export function renderScheduleWidget(container, initialData, options = {}) {
       const row = document.createElement("div");
       row.className = "schedule-day-row";
       const timesHtml = (cfg.times || ["09:00"]).map((t, i) =>
-        `<input type="time" class="feeds-input schedule-time-input" data-day-time="${d.key}" data-time-idx="${i}" value="${t}" />` +
+        `<input type="time" class="schedule-input schedule-time-input" data-day-time="${d.key}" data-time-idx="${i}" value="${t}" />` +
         `<button class="schedule-time-del" data-day-tdel="${d.key}" data-tdel-idx="${i}" title="Remove">&times;</button>`
       ).join("");
       row.innerHTML = `
         <span class="schedule-day-name">${d.full}</span>
-        <select class="feeds-select schedule-mode-select" data-day-mode="${d.key}">
+        <select class="schedule-select schedule-mode-select" data-day-mode="${d.key}">
           <option value="times"${cfg.mode === "times" ? " selected" : ""}>Set times</option>
           <option value="continuous"${cfg.mode === "continuous" ? " selected" : ""}>Continuous</option>
         </select>
@@ -109,7 +109,7 @@ export function renderScheduleWidget(container, initialData, options = {}) {
         </div>
         <div class="schedule-interval-wrap" style="display:${cfg.mode === "continuous" ? "flex" : "none"}">
           <span class="schedule-label">every</span>
-          <input type="number" class="feeds-input schedule-interval-input" data-day-interval="${d.key}" value="${cfg.intervalMins || 60}" min="1" />
+          <input type="number" class="schedule-input schedule-interval-input" data-day-interval="${d.key}" value="${cfg.intervalMins || 60}" min="1" />
           <span class="schedule-label">min</span>
         </div>
       `;

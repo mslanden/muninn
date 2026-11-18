@@ -181,6 +181,28 @@ pub(crate) struct LlmCallConfig {
     pub endpoint: String,
 }
 
+/// Strip reasoning tags (<think>, <thinking>) from model output.
+pub(crate) fn strip_think_tags(text: &str) -> String {
+    let mut result = text.to_string();
+    for (open, close) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
+        loop {
+            let start = result.find(open);
+            let end = result.find(close);
+            match (start, end) {
+                (Some(s), Some(e)) if e > s => {
+                    result = format!("{}{}", &result[..s], &result[e + close.len()..]);
+                }
+                (Some(s), None) => {
+                    result = result[..s].to_string();
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    result.trim().to_string()
+}
+
 /// Time limits for one-shot helper calls: verdicts and titles vs. long-form generation.
 const ONE_SHOT_QUICK_SECS: u64 = 120;
 pub(crate) const ONE_SHOT_LONG_SECS: u64 = 300;
@@ -258,7 +280,7 @@ fn parse_one_shot(is_anthropic: bool, body: &Value) -> OneShotReply {
         had_reasoning = true;
     }
     OneShotReply {
-        text: crate::feeds::strip_think_tags(&raw),
+        text: strip_think_tags(&raw),
         truncated: finish == "length" || finish == "max_tokens",
         had_reasoning,
         finish,
@@ -582,7 +604,7 @@ pub(crate) async fn evaluate_chain_condition(
         Ok(t) => t,
         Err(e) => return (false, format!("eval call failed: {e}")),
     };
-    parse_condition_verdict(&crate::feeds::strip_think_tags(&text))
+    parse_condition_verdict(&strip_think_tags(&text))
 }
 
 /// Evaluate whether a session's goal has been FULLY achieved, judging by the assistant's
@@ -614,7 +636,7 @@ pub(crate) async fn evaluate_goal_met(
 
     let text = complete_once(state, &cfg, system, &prompt, 150, ONE_SHOT_QUICK_SECS).await
         .map_err(|e| format!("eval call failed: {e}"))?;
-    Ok(parse_condition_verdict(&crate::feeds::strip_think_tags(&text)))
+    Ok(parse_condition_verdict(&strip_think_tags(&text)))
 }
 
 /// Generate a short human title for a chat session from its first exchange. One-shot,
@@ -639,7 +661,7 @@ pub(crate) async fn generate_session_title(
 
     let text = complete_once(state, &cfg, system, &prompt, 40, ONE_SHOT_QUICK_SECS).await
         .map_err(|e| format!("title call failed: {e}"))?;
-    let title = sanitize_session_title(&crate::feeds::strip_think_tags(&text));
+    let title = sanitize_session_title(&strip_think_tags(&text));
     if title.is_empty() {
         return Err("title model returned nothing usable".to_string());
     }
@@ -733,7 +755,7 @@ pub(crate) async fn verify_dangerous_command(
         Ok(t) => t,
         Err(e) => return CommandVerdict::Escalate(format!("verifier call failed: {e}")),
     };
-    parse_command_verdict(&crate::feeds::strip_think_tags(&text))
+    parse_command_verdict(&strip_think_tags(&text))
 }
 
 /// Interpret the verifier model's reply. The first non-empty line must start with ALLOW,
@@ -771,55 +793,6 @@ fn parse_command_verdict(text: &str) -> CommandVerdict {
         "ESCALATE" => CommandVerdict::Escalate(if note.is_empty() { "verifier escalated for user judgment".to_string() } else { note }),
         _ => CommandVerdict::Escalate(format!("unrecognized verifier verdict: {}", crate::tools::truncate_chars(trimmed, 200))),
     }
-}
-
-/// One-shot, non-streaming LLM call that expands a short feed summary into a fuller
-/// markdown overview/article. Grounded in `source_text` (the fetched original page) when
-/// available. Returns the article text or an error string.
-pub(crate) async fn generate_feed_article_text(
-    state: &AppState,
-    title: &str,
-    summary: &str,
-    url: &str,
-    source_name: &str,
-    source_text: &str,
-) -> Result<String, String> {
-    let cfg = resolve_llm_config(state)?;
-
-    // Cap fetched source so we stay within a sane token budget.
-    let source_excerpt: String = source_text.chars().take(8000).collect();
-    let source_block = if source_excerpt.trim().is_empty() {
-        "(The original page could not be fetched — write from the headline and summary, and clearly avoid inventing specific facts, numbers, or quotes.)".to_string()
-    } else {
-        format!("Original article content (may be truncated):\n{source_excerpt}")
-    };
-
-    let prompt = format!(
-        "Write a clear, well-structured overview article for this news/feed item.\n\n\
-        Headline: {title}\n\
-        Source: {source_name}\n\
-        URL: {url}\n\
-        Existing short summary: {summary}\n\n\
-        {source_block}\n\n\
-        Guidelines:\n\
-        - Write 3-6 short paragraphs (roughly 250-500 words) in plain, engaging prose.\n\
-        - Use Markdown. You may add a couple of `##` subheadings or a short bullet list if it genuinely helps.\n\
-        - Lead with what happened and why it matters, then add context and key details.\n\
-        - Ground everything in the provided content. Do NOT fabricate specifics. If something is unknown, say so or leave it out.\n\
-        - Do not restate the headline as a title, and do not add a 'Source:' footer (the UI shows that separately).\n\
-        Respond with ONLY the article in Markdown."
-    );
-
-    let system = "You are a sharp, concise editorial writer who turns source material into a faithful, readable overview. Never invent facts.";
-
-    let text = complete_once(state, &cfg, system, &prompt, 1600, ONE_SHOT_LONG_SECS).await
-        .map_err(|e| format!("LLM request failed: {e}"))?;
-
-    let article = text.trim().to_string();
-    if article.is_empty() {
-        return Err("LLM returned an empty article".to_string());
-    }
-    Ok(article)
 }
 
 /// Build the general (non-project) system prompt, including the memory index.

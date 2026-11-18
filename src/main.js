@@ -3,7 +3,6 @@
 import "./theme.js";
 import "./web.js";
 import "./chat.js";
-import "./feeds.js";
 import "./logs.js";
 import "./tasks.js";
 import "./toolspanel.js";

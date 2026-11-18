@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -84,13 +84,8 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
             "ALTER TABLE tasks ADD COLUMN schedule_config TEXT NOT NULL DEFAULT ''",
             // Rename legacy projects.spino_md → agents_md for pre-rename DBs.
             "ALTER TABLE projects RENAME COLUMN spino_md TO agents_md",
-            "ALTER TABLE ai_feeds ADD COLUMN schedule_config TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE ai_feeds ADD COLUMN next_run TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE ai_feed_items ADD COLUMN image_url TEXT NOT NULL DEFAULT ''",
-            // Lazily-generated full AI article for a feed item (empty until requested).
-            "ALTER TABLE ai_feed_items ADD COLUMN article TEXT NOT NULL DEFAULT ''",
-            // Clear old remote http:// image URLs that can't load due to ATS.
-            "UPDATE ai_feed_items SET image_url = '' WHERE image_url LIKE 'http://%'",
+            // (The ai_feeds / ai_feed_items columns once added here are gone: v13 drops
+            // those tables, and init_db no longer creates them.)
         ];
         for sql in statements {
             exec_migration(conn, sql)?;
@@ -295,9 +290,16 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 12)?;
     }
 
+    if version < 13 {
+        // AI news feeds were removed (Activity's `feed_items` log is unrelated and stays).
+        exec_migration(conn, "DROP TABLE IF EXISTS ai_feed_items")?;
+        exec_migration(conn, "DROP TABLE IF EXISTS ai_feeds")?;
+        set_schema_version(conn, 13)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 12, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 13, "add a migration block for the new version");
 
     Ok(())
 }
@@ -478,27 +480,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           embedding BLOB NOT NULL,
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           UNIQUE(source_type, source_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS ai_feeds (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL,
-          topics_json TEXT NOT NULL DEFAULT '[]',
-          refresh_interval_mins INTEGER NOT NULL DEFAULT 60,
-          last_refreshed_at TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS ai_feed_items (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          feed_id INTEGER NOT NULL,
-          title TEXT NOT NULL,
-          summary TEXT NOT NULL DEFAULT '',
-          url TEXT NOT NULL DEFAULT '',
-          source_name TEXT NOT NULL DEFAULT '',
-          is_read INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          FOREIGN KEY(feed_id) REFERENCES ai_feeds(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS deferred_commands (
@@ -1543,6 +1524,31 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(tools, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn feed_removal_migration_drops_the_ai_feed_tables_but_not_activity() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_feeds (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE ai_feed_items (id INTEGER PRIMARY KEY, feed_id INTEGER NOT NULL, title TEXT NOT NULL);
+             CREATE TABLE feed_items (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL);
+             INSERT INTO ai_feeds VALUES (1, 'AI News');
+             INSERT INTO ai_feed_items VALUES (1, 1, 'x');
+             INSERT INTO feed_items VALUES (1, 'system', 'kept');
+             PRAGMA user_version = 12;",
+        )
+        .unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(!table_exists(&conn, "ai_feeds").unwrap());
+        assert!(!table_exists(&conn, "ai_feed_items").unwrap());
+        let kept: i64 = conn.query_row("SELECT COUNT(*) FROM feed_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 1);
+
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        assert!(!table_exists(&fresh, "ai_feeds").unwrap());
+        assert!(table_exists(&fresh, "feed_items").unwrap());
     }
 
     #[test]

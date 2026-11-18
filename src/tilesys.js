@@ -12,7 +12,6 @@ export { updateSidebar };
 // ==================== TILE MANAGEMENT ====================
 export const TILE_TYPES = [
   { type: "chat",       label: "Chat",       dot: "green" },
-  { type: "feeds",      label: "Feeds",      dot: "amber" },
   { type: "web",        label: "Web",        dot: "blue"  },
   { type: "tasks",      label: "Tasks",      dot: "blue"  },
   { type: "skills",     label: "Skills",     dot: "blue"  },

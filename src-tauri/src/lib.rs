@@ -5,7 +5,6 @@ mod commands;
 mod config_tools;
 mod context;
 mod db;
-mod feeds;
 mod interactive;
 mod llm;
 mod mail;
@@ -435,15 +434,6 @@ pub fn run() {
             commands::open_content_file,
             commands::open_pdf,
             commands::read_image_base64,
-            commands::get_ai_feeds,
-            commands::create_ai_feed,
-            commands::delete_ai_feed,
-            commands::update_ai_feed,
-            commands::get_ai_feed_items,
-            commands::mark_ai_feed_item_read,
-            commands::generate_feed_item_image,
-            commands::generate_feed_article,
-            commands::refresh_ai_feed,
             commands::ai_web_search,
             commands::geocode_user_location,
             commands::get_session_todos,

@@ -262,3 +262,52 @@ pub fn set_app_settings(state: State<AppState>, req: SettingsUpdateRequest) -> R
         Ok(())
     })
 }
+
+/// Geocode the user's location (Mapbox) and store it as `user/location_coords` ("lon,lat"),
+/// used to bias place searches.
+#[tauri::command]
+pub async fn geocode_user_location(
+    state: State<'_, AppState>,
+    location: String,
+) -> Result<(), String> {
+    let token = first_non_empty_setting(&state, &["maps/mapbox_api_key"])
+        .map_err(|e| format!("DB error: {}", e))?
+        .ok_or_else(|| "Mapbox API key not configured".to_string())?;
+
+    let url = format!(
+        "https://api.mapbox.com/search/geocode/v6/forward?q={}&limit=1&access_token={}",
+        urlencoding::encode(&location),
+        urlencoding::encode(&token),
+    );
+    let resp = state.http.get(&url).send().await
+        .map_err(|e| format!("Geocoding failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("Geocoding error: {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    let coords = body
+        .get("features")
+        .and_then(|f| f.as_array())
+        .and_then(|a| a.first())
+        .and_then(|f| f.get("geometry"))
+        .and_then(|g| g.get("coordinates"))
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| format!("Could not geocode '{}'", location))?;
+
+    let lon = coords.first().and_then(|v| v.as_f64()).ok_or("Invalid lon")?;
+    let lat = coords.get(1).and_then(|v| v.as_f64()).ok_or("Invalid lat")?;
+
+    // Store as "lon,lat" in settings
+    let proximity = format!("{},{}", lon, lat);
+    with_db(&state, |db| {
+        db.execute(
+            r#"INSERT INTO app_config (key, value, updated_at)
+               VALUES ('user/location_coords', ?1, CURRENT_TIMESTAMP)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP"#,
+            params![proximity],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}

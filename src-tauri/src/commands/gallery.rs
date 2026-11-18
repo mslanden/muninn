@@ -143,5 +143,3 @@ pub fn read_image_base64(path: String) -> Result<String, String> {
     };
     Ok(format!("data:{};base64,{}", mime, b64))
 }
-
-// ==================== AI FEEDS ====================

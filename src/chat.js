@@ -15,37 +15,6 @@ function bumpSessionList() {
   try { refreshSessionList(); } catch {}
 }
 
-export async function openFeedItemInChat(item) {
-  const title = item.title || "";
-  const url = item.url || "";
-  const sourceName = item.sourceName ?? item.source_name ?? "";
-  const summary = item.summary || "";
-
-  let seed = `I'm reading this item from my feed and want to dive deeper. Give me a richer overview, the key context, and why it matters — then I'll ask follow-ups.\n\n`;
-  seed += `Title: ${title}\n`;
-  if (sourceName) seed += `Source: ${sourceName}\n`;
-  if (url) seed += `URL: ${url}\n`;
-  if (summary) seed += `Summary: ${summary}\n`;
-
-  try {
-    const session = await invoke("create_session", { req: { projectPath: "" } });
-    const sid = field(session, "id", "id");
-    await addChatTile(sid, "");
-    const tile = getChatTileBySessionId(sid);
-    if (!tile) return;
-    focusTile(tile.id);
-    const input = tile.el.querySelector(`[data-chat-input="${tile.id}"]`);
-    const sendBtn = tile.el.querySelector(`[data-chat-send="${tile.id}"]`);
-    if (input && sendBtn) {
-      input.value = seed;
-      autoResize(input);
-      sendBtn.click();
-    }
-  } catch (e) {
-    console.error("Failed to open feed item in chat:", e);
-  }
-}
-
 // Open a fresh chat tile seeded with a web-search query and auto-send, so the user can
 // keep digging into a search result conversationally.
 export async function openQueryInChat(query) {
