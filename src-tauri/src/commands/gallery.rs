@@ -110,6 +110,26 @@ pub fn open_content_file(app: AppHandle, req: ContentReadRequest) -> Result<bool
     Ok(true)
 }
 
+/// Open a PDF in the default app (Preview). Unlike `open_content_file` this is not limited to
+/// the Content library — `create_pdf` can save into the workspace — but it only ever opens
+/// real PDF files, never arbitrary paths.
+#[tauri::command]
+pub fn open_pdf(path: String) -> Result<bool, String> {
+    let p = std::path::Path::new(&path);
+    let is_pdf_name = p.extension().and_then(|e| e.to_str()).map_or(false, |e| e.eq_ignore_ascii_case("pdf"));
+    if !is_pdf_name || !p.is_file() {
+        return Err("not a PDF file".to_string());
+    }
+    let mut head = [0u8; 5];
+    use std::io::Read;
+    let is_pdf = fs::File::open(p).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head == b"%PDF-";
+    if !is_pdf {
+        return Err("not a PDF file".to_string());
+    }
+    std::process::Command::new("open").arg(p).spawn().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 #[tauri::command]
 pub fn read_image_base64(path: String) -> Result<String, String> {
     let bytes = fs::read(&path).map_err(|e| format!("Failed to read image: {}", e))?;

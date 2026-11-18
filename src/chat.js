@@ -1,5 +1,5 @@
 import { registerTileRenderer } from "./registry.js";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml, field, projectLabel, renderMarkdown, threadLabel } from "./utils.js";
@@ -924,6 +924,46 @@ export function maybeAutoSpeak(tileObj, text) {
   if (text && text.trim()) void playTts(null, text);
 }
 
+/// The PDF a create_pdf tool result describes ("Saved a 2-page PDF (40 KB) to /x/y.pdf ..."),
+/// so reloaded chats can rebuild the same card the live `pdf-created` event showed.
+export function pdfFromToolOutput(output) {
+  const m = /^Saved an? (\d+)-page PDF \((\d+) KB\) to (.+?\.pdf)(?: \(in the Content library\))?\./i.exec(output || "");
+  return m ? { pages: Number(m[1]), kb: Number(m[2]), path: m[3] } : null;
+}
+
+/// A chat turn showing a PDF in an inline viewer, with a button to open it in Preview.
+export function addPdfCard(chatLog, { path, pages, kb }) {
+  const name = String(path || "").split("/").pop() || "document.pdf";
+  const meta = [pages ? `${pages} page${pages === 1 ? "" : "s"}` : "", kb ? `${kb} KB` : ""].filter(Boolean).join(" · ");
+  const el = document.createElement("div");
+  el.className = "turn pdf-turn";
+  el.innerHTML = `
+    <div class="turn-header">
+      <span class="turn-label muninn">Muninn</span>
+      <span class="turn-time">${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+    </div>
+    <div class="turn-body">
+      <div class="pdf-card">
+        <div class="pdf-card-bar">
+          <span class="pdf-card-name" title="${escapeHtml(path)}">📄 ${escapeHtml(name)}</span>
+          <span class="muted text-xs">${escapeHtml(meta)}</span>
+          <span class="pdf-card-spacer"></span>
+          <button class="form-btn" data-pdf-open>Open in App</button>
+        </div>
+        <iframe class="pdf-frame" title="${escapeHtml(name)}"></iframe>
+      </div>
+    </div>
+  `;
+  // Set via the property (not markup) so the path never needs attribute escaping.
+  el.querySelector("iframe").src = convertFileSrc(path);
+  el.querySelector("[data-pdf-open]").addEventListener("click", async () => {
+    try { await invoke("open_pdf", { path }); } catch (e) { console.error("open_pdf", e); }
+  });
+  chatLog.appendChild(el);
+  chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
+  return el;
+}
+
 export function addTurn(chatLog, role, text, images = []) {
   const turn = document.createElement("div");
   turn.className = `turn ${role}`;
@@ -1208,6 +1248,8 @@ export async function loadMessagesForTile(tileObj) {
       for (const item of timeline) {
         if (item.type === "tool") {
           addToolCard(chatLog, item.kind, "", item.status);
+          const pdf = item.status === "ok" ? pdfFromToolOutput(item.output) : null;
+          if (pdf) addPdfCard(chatLog, pdf);
         } else {
           const role = item.role === "user" ? "you" : "muninn";
           addTurn(chatLog, role, item.content, item.images || []);

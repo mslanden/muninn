@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { tiles, chatStreams, tileMaps, ui } from "./state.js";
 import { escapeHtml, renderMarkdown } from "./utils.js";
 import { getTilesByType, getChatTileBySessionId } from "./tilesys.js";
-import { playTts, maybeAutoSpeak, updateModelChips, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn } from "./chat.js";
+import { playTts, maybeAutoSpeak, updateModelChips, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn, addPdfCard } from "./chat.js";
 import { renderTasksTile } from "./tasks.js";
 import { renderContentTile } from "./content.js";
 import { isDarkTheme, applyTheme } from "./theme.js";
@@ -520,6 +520,23 @@ export async function setupEventListeners() {
     `;
     chatLog.appendChild(el);
     chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
+  });
+
+  // create_pdf finished: show the document inline in the chat that asked for it.
+  await listen("pdf-created", (event) => {
+    const { session_id, path, pages, bytes } = event.payload;
+    const tile = getChatTileBySessionId(session_id);
+    if (!tile) return;
+    const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
+    if (!chatLog) return;
+    const stream = chatStreams[tile.id];
+    // Finalize any open text bubble so later tokens start below the PDF.
+    if (stream && stream.bubble) {
+      stream.bubble.innerHTML = renderMarkdown(stream.text);
+      stream.bubble = null;
+      stream.text = "";
+    }
+    addPdfCard(chatLog, { path, pages, kb: Math.round((bytes || 0) / 1024) });
   });
 
   await listen("screen-captured", (event) => {

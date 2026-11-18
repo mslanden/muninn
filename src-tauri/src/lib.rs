@@ -433,6 +433,7 @@ pub fn run() {
             commands::import_content_files,
             commands::read_content_text,
             commands::open_content_file,
+            commands::open_pdf,
             commands::read_image_base64,
             commands::get_ai_feeds,
             commands::create_ai_feed,

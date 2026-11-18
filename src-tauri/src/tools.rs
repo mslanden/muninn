@@ -2569,6 +2569,17 @@ pub(crate) async fn execute_agent_tool(
             if in_content {
                 let _ = app.emit("content-changed", ());
             }
+            // Show it in the chat right away (chat.js renders an inline viewer). Reloaded
+            // chats rebuild the same card from this tool's logged output.
+            let _ = app.emit(
+                "pdf-created",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "path": out.display().to_string(),
+                    "pages": pdf.pages,
+                    "bytes": pdf.bytes,
+                }),
+            );
             Ok(format!(
                 "Saved a {}-page PDF ({} KB) to {}{}.{}",
                 pdf.pages,
