@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
 
 use crate::AppState;
@@ -59,6 +60,9 @@ fn history_to_openai(history: &[HistoryMessage]) -> Vec<Value> {
             }
             "user" => {
                 let mut text_acc = String::new();
+                // Attached images become `image_url` parts (data URLs), the OpenAI
+                // chat-completions shape that vision models on this wire format accept.
+                let mut image_parts: Vec<Value> = Vec::new();
                 for b in &h.blocks {
                     match b.get("type").and_then(Value::as_str) {
                         Some("text") => {
@@ -67,6 +71,17 @@ fn history_to_openai(history: &[HistoryMessage]) -> Vec<Value> {
                                     text_acc.push('\n');
                                 }
                                 text_acc.push_str(t);
+                            }
+                        }
+                        Some("image") => {
+                            let source = b.get("source");
+                            let media = source.and_then(|s| s.get("media_type")).and_then(Value::as_str);
+                            let data = source.and_then(|s| s.get("data")).and_then(Value::as_str);
+                            if let (Some(media), Some(data)) = (media, data) {
+                                image_parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {"url": format!("data:{};base64,{}", media, data)}
+                                }));
                             }
                         }
                         Some("tool_result") => {
@@ -98,7 +113,14 @@ fn history_to_openai(history: &[HistoryMessage]) -> Vec<Value> {
                         _ => {}
                     }
                 }
-                if !text_acc.is_empty() {
+                if !image_parts.is_empty() {
+                    let mut parts = Vec::with_capacity(image_parts.len() + 1);
+                    if !text_acc.is_empty() {
+                        parts.push(json!({"type": "text", "text": text_acc}));
+                    }
+                    parts.extend(image_parts);
+                    out.push(json!({"role": "user", "content": parts}));
+                } else if !text_acc.is_empty() {
                     out.push(json!({"role": "user", "content": text_acc}));
                 }
             }
@@ -158,6 +180,214 @@ pub(crate) struct LlmCallConfig {
     pub api_key: String,
     pub endpoint: String,
 }
+
+/// Strip reasoning tags (<think>, <thinking>) from model output.
+pub(crate) fn strip_think_tags(text: &str) -> String {
+    let mut result = text.to_string();
+    for (open, close) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
+        loop {
+            let start = result.find(open);
+            let end = result.find(close);
+            match (start, end) {
+                (Some(s), Some(e)) if e > s => {
+                    result = format!("{}{}", &result[..s], &result[e + close.len()..]);
+                }
+                (Some(s), None) => {
+                    result = result[..s].to_string();
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    result.trim().to_string()
+}
+
+/// Time limits for one-shot helper calls: verdicts and titles vs. long-form generation.
+const ONE_SHOT_QUICK_SECS: u64 = 120;
+pub(crate) const ONE_SHOT_LONG_SECS: u64 = 300;
+/// Every helper call gets at least this much output room, whatever the caller asked for.
+/// A reasoning model spends output tokens thinking before it writes a visible answer, so
+/// the tight caps these calls used to send (40-150 tokens) were consumed by the thinking
+/// and the reply came back empty. A model that doesn't think simply stops early, so the
+/// headroom costs nothing.
+const ONE_SHOT_MIN_TOKENS: u64 = 4096;
+/// Budget for the single retry when a reply was still cut off before any visible text.
+const ONE_SHOT_RETRY_TOKENS: u64 = 16_384;
+
+/// What a non-streaming completion contained.
+#[derive(Debug, Default, PartialEq)]
+struct OneShotReply {
+    /// The visible answer, with any inline `<think>` blocks removed.
+    text: String,
+    /// The model hit its output limit (`finish_reason: length` / `stop_reason: max_tokens`).
+    truncated: bool,
+    /// The reply carried reasoning (a separate field, a thinking block, or inline tags).
+    had_reasoning: bool,
+    /// The provider's raw finish/stop reason, for diagnostics.
+    finish: String,
+}
+
+/// Pull the visible text out of a non-streaming response in either wire format.
+fn parse_one_shot(is_anthropic: bool, body: &Value) -> OneShotReply {
+    let mut raw = String::new();
+    let mut had_reasoning = false;
+    let finish;
+    if is_anthropic {
+        for block in body.get("content").and_then(Value::as_array).into_iter().flatten() {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(Value::as_str) {
+                        if !raw.is_empty() {
+                            raw.push('\n');
+                        }
+                        raw.push_str(t);
+                    }
+                }
+                Some("thinking") | Some("redacted_thinking") => had_reasoning = true,
+                _ => {}
+            }
+        }
+        finish = body.get("stop_reason").and_then(Value::as_str).unwrap_or("").to_string();
+    } else {
+        let choice = body.get("choices").and_then(Value::as_array).and_then(|c| c.first());
+        let message = choice.and_then(|c| c.get("message"));
+        match message.and_then(|m| m.get("content")) {
+            Some(Value::String(t)) => raw.push_str(t),
+            // Some providers return content as a list of typed parts.
+            Some(Value::Array(parts)) => {
+                for part in parts {
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        raw.push_str(t);
+                    }
+                }
+            }
+            _ => {}
+        }
+        had_reasoning = ["reasoning_content", "reasoning"].iter().any(|key| {
+            message
+                .and_then(|m| m.get(*key))
+                .and_then(Value::as_str)
+                .map_or(false, |r| !r.trim().is_empty())
+        });
+        finish = choice
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+    }
+    if raw.contains("<think") {
+        had_reasoning = true;
+    }
+    OneShotReply {
+        text: strip_think_tags(&raw),
+        truncated: finish == "length" || finish == "max_tokens",
+        had_reasoning,
+        finish,
+    }
+}
+
+fn one_shot_request(cfg: &LlmCallConfig, system: &str, prompt: &str, max_tokens: u64) -> Value {
+    if cfg.is_anthropic {
+        json!({
+            "model": cfg.model, "max_tokens": max_tokens, "stream": false,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    } else {
+        json!({
+            "model": cfg.model, "max_tokens": max_tokens, "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ]
+        })
+    }
+}
+
+/// Why an empty reply was empty, for the error message and the logs.
+fn empty_reply_reason(reply: &OneShotReply, budget: u64) -> String {
+    let finish = if reply.finish.is_empty() { "unknown" } else { reply.finish.as_str() };
+    match (reply.truncated, reply.had_reasoning) {
+        (true, true) => format!("it used all {budget} output tokens on reasoning before writing an answer"),
+        (true, false) => format!("it hit the {budget}-token output limit without writing anything"),
+        (false, true) => format!("it returned reasoning but no answer (finish reason: {finish})"),
+        (false, false) => format!("the response had no text (finish reason: {finish})"),
+    }
+}
+
+/// Output budget for a helper call's first attempt and for its one retry.
+fn one_shot_budgets(requested: u64, ceiling: u64) -> (u64, u64) {
+    // `ceiling` is the user's llm/max_tokens; never go above it unless the caller itself
+    // asked for more.
+    let ceiling = ceiling.max(requested);
+    let first = requested.max(ONE_SHOT_MIN_TOKENS).min(ceiling);
+    let retry = ONE_SHOT_RETRY_TOKENS.max(first).min(ceiling);
+    (first, retry)
+}
+
+/// The single entry point for one-shot, non-streaming helper calls (verdicts, titles,
+/// summaries, planning, copy). Returns the model's visible text — never empty — or an error
+/// that says what went wrong. `max_tokens` is the caller's expectation for the answer;
+/// the request is given at least `ONE_SHOT_MIN_TOKENS` (bounded by `llm/max_tokens`) and is
+/// retried once with a larger budget if the reply was cut off before any visible text.
+pub(crate) async fn complete_once(
+    state: &AppState,
+    cfg: &LlmCallConfig,
+    system: &str,
+    prompt: &str,
+    max_tokens: u64,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    complete_once_with(&state.http, resolve_max_output_tokens(state), cfg, system, prompt, max_tokens, timeout_secs).await
+}
+
+/// `complete_once` without the app state: `ceiling` is the configured `llm/max_tokens`.
+async fn complete_once_with(
+    http: &reqwest::Client,
+    ceiling: u64,
+    cfg: &LlmCallConfig,
+    system: &str,
+    prompt: &str,
+    max_tokens: u64,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let (mut budget, retry_budget) = one_shot_budgets(max_tokens, ceiling);
+    for attempt in 0..2 {
+        let body = one_shot_request(cfg, system, prompt, budget);
+        let request = if cfg.is_anthropic {
+            http.post(&cfg.endpoint)
+                .header("x-api-key", &cfg.api_key)
+                .header("anthropic-version", "2023-06-01")
+        } else {
+            http.post(&cfg.endpoint).bearer_auth(&cfg.api_key)
+        };
+        let response = request
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .send()
+            .await
+            .map_err(|e| format!("request error: {e}"))?;
+        let status = response.status();
+        let raw = response.text().await.map_err(|e| format!("could not read the response: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("HTTP {}: {}", status, crate::tools::truncate_chars(raw.trim(), 400)));
+        }
+        let parsed: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("unreadable response ({e}): {}", crate::tools::truncate_chars(raw.trim(), 200)))?;
+        let reply = parse_one_shot(cfg.is_anthropic, &parsed);
+        if !reply.text.is_empty() {
+            return Ok(reply.text);
+        }
+        if attempt == 0 && reply.truncated && retry_budget > budget {
+            budget = retry_budget;
+            continue;
+        }
+        return Err(format!("the model gave no answer: {}", empty_reply_reason(&reply, budget)));
+    }
+    Err("the model gave no answer".to_string())
+}
+
 
 /// Resolve provider / model / API key / endpoint for the one-shot helper LLM calls
 /// (entity-summary compaction, feed-article generation, memory extraction). These three
@@ -292,8 +522,7 @@ pub(crate) fn resolve_provider_key(state: &AppState, provider: &str) -> Result<S
 /// setting: "auto" (default) prefers Groq's whisper-large-v3-turbo when a Groq key is
 /// configured and otherwise falls back to OpenAI whisper-1; "groq"/"openai" force the
 /// choice (erroring if that provider's key is missing). Returns `(api_key, model,
-/// transcriptions_endpoint)`. Shared by `transcribe_wav` and the video cloud fallback so
-/// both paths agree.
+/// transcriptions_endpoint)`. Used by `transcribe_wav` (voice input).
 pub(crate) fn resolve_stt(
     state: &AppState,
 ) -> Result<(String, &'static str, &'static str), String> {
@@ -358,7 +587,6 @@ pub(crate) async fn evaluate_chain_condition(
         Ok(c) => c,
         Err(e) => return (false, format!("no LLM configured: {e}")),
     };
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
 
     // Cap the data we send — gate decisions don't need the full payload.
     let data = crate::tools::truncate_chars(upstream_output, 6000);
@@ -372,49 +600,11 @@ pub(crate) async fn evaluate_chain_condition(
         Answer YES only when the condition is clearly satisfied; answer NO if it is not satisfied or you are unsure. \
         First line must be exactly YES or NO.";
 
-    let request_body = if is_anthropic {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
+    let text = match complete_once(state, &cfg, system, &prompt, 150, ONE_SHOT_QUICK_SECS).await {
+        Ok(t) => t,
+        Err(e) => return (false, format!("eval call failed: {e}")),
     };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body).send().await
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
-    };
-    let resp = match resp {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => return (false, format!("eval call failed: HTTP {}", r.status())),
-        Err(e) => return (false, format!("eval call error: {e}")),
-    };
-    let body: Value = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => return (false, format!("eval parse error: {e}")),
-    };
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
-            .and_then(Value::as_str).unwrap_or("")
-    };
-    parse_condition_verdict(&crate::feeds::strip_think_tags(text))
+    parse_condition_verdict(&strip_think_tags(&text))
 }
 
 /// Evaluate whether a session's goal has been FULLY achieved, judging by the assistant's
@@ -429,7 +619,6 @@ pub(crate) async fn evaluate_goal_met(
     last_reply: &str,
 ) -> Result<(bool, String), String> {
     let cfg = resolve_llm_config(state).map_err(|e| format!("no LLM configured: {e}"))?;
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
 
     let data = crate::tools::truncate_chars(last_reply, 6000);
     let prompt = format!(
@@ -445,46 +634,9 @@ pub(crate) async fn evaluate_goal_met(
         partially done, still in progress, uncertain, or the assistant is blocked, answer NO. \
         Then add one short sentence explaining why.";
 
-    let request_body = if is_anthropic {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body).send().await
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
-    };
-    let resp = match resp {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => return Err(format!("eval call failed: HTTP {}", r.status())),
-        Err(e) => return Err(format!("eval call error: {e}")),
-    };
-    let body: Value = resp.json().await.map_err(|e| format!("eval parse error: {e}"))?;
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
-            .and_then(Value::as_str).unwrap_or("")
-    };
-    Ok(parse_condition_verdict(&crate::feeds::strip_think_tags(text)))
+    let text = complete_once(state, &cfg, system, &prompt, 150, ONE_SHOT_QUICK_SECS).await
+        .map_err(|e| format!("eval call failed: {e}"))?;
+    Ok(parse_condition_verdict(&strip_think_tags(&text)))
 }
 
 /// Generate a short human title for a chat session from its first exchange. One-shot,
@@ -496,7 +648,6 @@ pub(crate) async fn generate_session_title(
     assistant_reply: &str,
 ) -> Result<String, String> {
     let cfg = resolve_llm_config(state).map_err(|e| format!("no LLM configured: {e}"))?;
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
 
     let user_part = crate::tools::truncate_chars(user_msg, 1500);
     let reply_part = crate::tools::truncate_chars(assistant_reply, 1500);
@@ -508,46 +659,9 @@ pub(crate) async fn generate_session_title(
     let system = "You name chat conversations. Reply with only a concise 2-6 word title \
         describing the topic — no quotes, no punctuation at the end, no explanations.";
 
-    let request_body = if is_anthropic {
-        json!({
-            "model": model, "max_tokens": 40, "stream": false,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model, "max_tokens": 40, "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body).send().await
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
-    };
-    let resp = match resp {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => return Err(format!("title call failed: HTTP {}", r.status())),
-        Err(e) => return Err(format!("title call error: {e}")),
-    };
-    let body: Value = resp.json().await.map_err(|e| format!("title parse error: {e}"))?;
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
-            .and_then(Value::as_str).unwrap_or("")
-    };
-    let title = sanitize_session_title(&crate::feeds::strip_think_tags(text));
+    let text = complete_once(state, &cfg, system, &prompt, 40, ONE_SHOT_QUICK_SECS).await
+        .map_err(|e| format!("title call failed: {e}"))?;
+    let title = sanitize_session_title(&strip_think_tags(&text));
     if title.is_empty() {
         return Err("title model returned nothing usable".to_string());
     }
@@ -607,7 +721,6 @@ pub(crate) async fn verify_dangerous_command(
         Ok(c) => c,
         Err(e) => return CommandVerdict::Escalate(format!("no LLM configured: {e}")),
     };
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = cfg;
 
     let cwd_str = cwd.unwrap_or("(workspace root)");
     let reasons_str = if reasons.is_empty() {
@@ -638,49 +751,11 @@ pub(crate) async fn verify_dangerous_command(
         First line exactly ALLOW, DENY, or ESCALATE. Then one short sentence explaining why."
     );
 
-    let request_body = if is_anthropic {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model, "max_tokens": 150, "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
+    let text = match complete_once(state, &cfg, system, &prompt, 150, ONE_SHOT_QUICK_SECS).await {
+        Ok(t) => t,
+        Err(e) => return CommandVerdict::Escalate(format!("verifier call failed: {e}")),
     };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body).send().await
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await
-    };
-    let resp = match resp {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => return CommandVerdict::Escalate(format!("verifier call failed: HTTP {}", r.status())),
-        Err(e) => return CommandVerdict::Escalate(format!("verifier call error: {e}")),
-    };
-    let body: Value = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => return CommandVerdict::Escalate(format!("verifier parse error: {e}")),
-    };
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).unwrap_or("")
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|a| a.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content"))
-            .and_then(Value::as_str).unwrap_or("")
-    };
-    parse_command_verdict(&crate::feeds::strip_think_tags(text))
+    parse_command_verdict(&strip_think_tags(&text))
 }
 
 /// Interpret the verifier model's reply. The first non-empty line must start with ALLOW,
@@ -718,972 +793,6 @@ fn parse_command_verdict(text: &str) -> CommandVerdict {
         "ESCALATE" => CommandVerdict::Escalate(if note.is_empty() { "verifier escalated for user judgment".to_string() } else { note }),
         _ => CommandVerdict::Escalate(format!("unrecognized verifier verdict: {}", crate::tools::truncate_chars(trimmed, 200))),
     }
-}
-
-/// One-shot, non-streaming LLM call that expands a short feed summary into a fuller
-/// markdown overview/article. Grounded in `source_text` (the fetched original page) when
-/// available. Returns the article text or an error string.
-pub(crate) async fn generate_feed_article_text(
-    state: &AppState,
-    title: &str,
-    summary: &str,
-    url: &str,
-    source_name: &str,
-    source_text: &str,
-) -> Result<String, String> {
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
-
-    // Cap fetched source so we stay within a sane token budget.
-    let source_excerpt: String = source_text.chars().take(8000).collect();
-    let source_block = if source_excerpt.trim().is_empty() {
-        "(The original page could not be fetched — write from the headline and summary, and clearly avoid inventing specific facts, numbers, or quotes.)".to_string()
-    } else {
-        format!("Original article content (may be truncated):\n{source_excerpt}")
-    };
-
-    let prompt = format!(
-        "Write a clear, well-structured overview article for this news/feed item.\n\n\
-        Headline: {title}\n\
-        Source: {source_name}\n\
-        URL: {url}\n\
-        Existing short summary: {summary}\n\n\
-        {source_block}\n\n\
-        Guidelines:\n\
-        - Write 3-6 short paragraphs (roughly 250-500 words) in plain, engaging prose.\n\
-        - Use Markdown. You may add a couple of `##` subheadings or a short bullet list if it genuinely helps.\n\
-        - Lead with what happened and why it matters, then add context and key details.\n\
-        - Ground everything in the provided content. Do NOT fabricate specifics. If something is unknown, say so or leave it out.\n\
-        - Do not restate the headline as a title, and do not add a 'Source:' footer (the UI shows that separately).\n\
-        Respond with ONLY the article in Markdown."
-    );
-
-    let system = "You are a sharp, concise editorial writer who turns source material into a faithful, readable overview. Never invent facts.";
-
-    let request_body = if is_anthropic {
-        json!({
-            "model": model,
-            "max_tokens": 1600,
-            "stream": false,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model,
-            "max_tokens": 1600,
-            "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint)
-            .bearer_auth(&api_key)
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("LLM request failed ({status}): {body}"));
-    }
-
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = if is_anthropic {
-        body.get("content")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-    } else {
-        body.get("choices")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-    }
-    .ok_or_else(|| "LLM returned no article text".to_string())?;
-
-    let article = text.trim().to_string();
-    if article.is_empty() {
-        return Err("LLM returned an empty article".to_string());
-    }
-    Ok(article)
-}
-
-/// Per-platform copywriting guidance baked into the social-copy prompt.
-fn platform_guidance(platform: &str) -> &'static str {
-    match platform.to_lowercase().replace(['/', ' '], "").as_str() {
-        "x" | "twitter" | "xtwitter" => "≤280 characters, punchy, a strong hook in the first words, 0–2 hashtags, no filler.",
-        "linkedin" => "Professional but human. A scroll-stopping first line, 2–4 short value-packed paragraphs, a clear takeaway, 0–3 hashtags.",
-        "instagram" => "An engaging caption with a hook and light emoji, a call-to-action, then 5–10 relevant hashtags on a new line.",
-        "tiktok" => "Very short, hook-driven caption in a trend-aware voice, 2–4 hashtags.",
-        "youtube" => "A compelling video title, then a 2–3 sentence description with searchable keywords. Keep Shorts snappy.",
-        _ => "Platform-appropriate copy with a strong hook and no generic filler.",
-    }
-}
-
-/// Pull a JSON array out of a model response, tolerating code fences / stray prose.
-fn extract_json_array(text: &str) -> Option<Vec<Value>> {
-    if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(text.trim()) {
-        return Some(a);
-    }
-    let start = text.find('[')?;
-    let end = text.rfind(']')?;
-    if end <= start {
-        return None;
-    }
-    serde_json::from_str::<Value>(&text[start..=end])
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-}
-
-/// Pull a JSON object out of a model response, tolerating code fences / stray prose.
-fn extract_json_object(text: &str) -> Option<Value> {
-    if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(text.trim()) {
-        return Some(v);
-    }
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    serde_json::from_str::<Value>(&text[start..=end]).ok().filter(Value::is_object)
-}
-
-/// Generate tailored social-media post copy (3 variants per platform) in one LLM call.
-/// Returns structured per-platform variants for the Studio tile.
-pub(crate) async fn generate_social_copy(
-    state: &AppState,
-    topic: &str,
-    platforms: &[String],
-    tone: Option<&str>,
-) -> Result<Vec<crate::models::PlatformCopy>, String> {
-    if platforms.is_empty() {
-        return Err("Select at least one platform.".to_string());
-    }
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
-
-    // Shared brand voice (persisted in Settings via the Studio header) + the per-request tone.
-    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
-    let mut tone_line = String::new();
-    if !brand_voice.trim().is_empty() {
-        tone_line.push_str(&format!("Brand voice (apply to all copy): {}\n", brand_voice.trim()));
-    }
-    if let Some(t) = tone.map(str::trim).filter(|t| !t.is_empty()) {
-        tone_line.push_str(&format!("Tone for this batch: {}\n", t));
-    }
-    let mut platform_specs = String::new();
-    for p in platforms {
-        platform_specs.push_str(&format!("- {}: {}\n", p, platform_guidance(p)));
-    }
-
-    let prompt = format!(
-        "Write social media post copy about this topic.\n\nTopic: {topic}\n{tone_line}\n\
-        Generate copy for these platforms, each tailored to its norms:\n{platform_specs}\n\
-        For EACH platform write 3 distinct variants that take different angles or hooks.\n\n\
-        Return ONLY valid JSON — an array where each element is \
-        {{\"platform\": \"<platform name exactly as given above>\", \"variants\": [\"variant 1\", \"variant 2\", \"variant 3\"]}}. \
-        No markdown, no code fences, no commentary — output the JSON array and nothing else."
-    );
-    let system = "You are an expert social media copywriter. You tailor copy precisely to each platform's format and audience, write scroll-stopping hooks, and never use generic filler. You output strict JSON only.";
-
-    let request_body = if is_anthropic {
-        json!({
-            "model": model, "max_tokens": 4000, "stream": false, "system": system,
-            "messages": [{"role": "user", "content": prompt}]
-        })
-    } else {
-        json!({
-            "model": model, "max_tokens": 4000, "stream": false,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ]
-        })
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint)
-            .bearer_auth(&api_key)
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Copy generation failed ({status}): {body}"));
-    }
-
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = if is_anthropic {
-        body.get("content")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-    } else {
-        body.get("choices")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-    }
-    .ok_or_else(|| "Copy generation returned no text".to_string())?;
-
-    let parsed = extract_json_array(&text)
-        .ok_or_else(|| format!("Could not parse copy as JSON. Model said:\n{}", text.trim()))?;
-    let mut out = Vec::new();
-    for el in parsed {
-        let platform = el.get("platform").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let variants: Vec<String> = el
-            .get("variants")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect())
-            .unwrap_or_default();
-        if !platform.is_empty() && !variants.is_empty() {
-            out.push(crate::models::PlatformCopy { platform, variants });
-        }
-    }
-    if out.is_empty() {
-        return Err(format!("No usable copy was generated. Model said:\n{}", text.trim()));
-    }
-    Ok(out)
-}
-
-/// Writing-section assistant: apply `instruction` to `text` (or, when `text` is empty,
-/// treat the instruction as a "write this" request). Returns the revised/written prose,
-/// honoring the persisted brand voice. One-shot, non-streaming.
-pub(crate) async fn writing_assist(
-    state: &AppState,
-    text: &str,
-    instruction: &str,
-) -> Result<String, String> {
-    if instruction.trim().is_empty() {
-        return Err("Tell me what to do (e.g. improve, shorten, continue, or write…).".to_string());
-    }
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
-
-    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
-    let voice_line = if brand_voice.trim().is_empty() {
-        String::new()
-    } else {
-        format!("Write in this brand voice: {}\n\n", brand_voice.trim())
-    };
-
-    let body_block = if text.trim().is_empty() {
-        "(No existing draft — produce the text from scratch per the instruction.)".to_string()
-    } else {
-        format!("Here is the current draft:\n\"\"\"\n{}\n\"\"\"", text.trim())
-    };
-
-    let prompt = format!(
-        "{voice_line}{body_block}\n\nInstruction: {instruction}\n\n\
-        Return ONLY the resulting text (Markdown is fine). No preamble, no explanation, no quotes around it."
-    );
-    let system = "You are a sharp, versatile writing assistant and editor. You improve clarity, flow, and impact while preserving the author's intent. You return only the requested text.";
-
-    let max_tokens = resolve_max_output_tokens(state);
-    let request_body = if is_anthropic {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false, "system": system,
-               "messages": [{"role": "user", "content": prompt}]})
-    } else {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false,
-               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Writing request failed ({status}): {body}"));
-    }
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let out = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-    }
-    .ok_or_else(|| "Writing assistant returned no text".to_string())?;
-    let out = out.trim().to_string();
-    if out.is_empty() {
-        return Err("Writing assistant returned empty text".to_string());
-    }
-    Ok(out)
-}
-
-/// Generate a social carousel/graphic as inline-styled HTML slides (one string per slide).
-/// Inline styles only — no `<style>` blocks (which would leak into the app) and no external
-/// resources — so the frontend can rasterize each slide with html2canvas reliably.
-pub(crate) async fn generate_carousel(
-    state: &AppState,
-    topic: &str,
-    slides: u32,
-    width: u32,
-    height: u32,
-) -> Result<Vec<String>, String> {
-    if topic.trim().is_empty() {
-        return Err("Describe what the graphic should say.".to_string());
-    }
-    let n = slides.clamp(1, 10);
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
-    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
-    let voice_line = if brand_voice.trim().is_empty() {
-        String::new()
-    } else {
-        format!("Brand voice / visual style to reflect: {}\n", brand_voice.trim())
-    };
-
-    let prompt = format!(
-        "Design a {n}-slide social media {kind} about:\n{topic}\n\n{voice_line}\n\
-        Return ONLY a JSON array of {n} strings — each string is the HTML for one slide.\n\
-        STRICT requirements for every slide:\n\
-        - Use ONLY inline styles (the `style` attribute). NO <style> blocks, NO class names, NO <script>, NO external images or web fonts.\n\
-        - The outermost element MUST be a single <div> sized exactly `width:{width}px;height:{height}px` with `box-sizing:border-box;overflow:hidden;` a background (a solid color or CSS gradient) and generous padding.\n\
-        - Use only system-safe fonts: -apple-system, 'Helvetica Neue', Helvetica, Arial, Georgia, sans-serif.\n\
-        - Strong visual hierarchy: a big bold headline and supporting text; high contrast; lay out with inline flexbox (style=\"display:flex;flex-direction:column;justify-content:center;...\").\n\
-        - Slide 1 is a striking cover/hook. Keep text on each slide short and punchy.\n\
-        No commentary, no code fences — just the JSON array of HTML strings.",
-        kind = if n > 1 { "carousel" } else { "graphic" }
-    );
-    let system = "You are a world-class social media graphic designer who builds striking, self-contained, inline-styled HTML cards. You never use <style> blocks, classes, scripts, or external resources. You return only a JSON array of HTML strings.";
-
-    let max_tokens = resolve_max_output_tokens(state);
-    let request_body = if is_anthropic {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false, "system": system,
-               "messages": [{"role": "user", "content": prompt}]})
-    } else {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false,
-               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Carousel generation failed ({status}): {body}"));
-    }
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-    }
-    .ok_or_else(|| "Carousel generation returned no text".to_string())?;
-
-    let arr = extract_json_array(&text)
-        .ok_or_else(|| format!("Could not parse slides as JSON. Model said:\n{}", text.trim()))?;
-    let slides_html: Vec<String> = arr
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .filter(|s| !s.trim().is_empty())
-        .collect();
-    if slides_html.is_empty() {
-        return Err(format!("No usable slides were generated. Model said:\n{}", text.trim()));
-    }
-    Ok(slides_html)
-}
-
-/// Strip a leading/trailing Markdown code fence (```html … ```) the model may wrap output in.
-fn strip_code_fences(text: &str) -> String {
-    let t = text.trim();
-    if let Some(rest) = t.strip_prefix("```") {
-        // Drop the optional language tag on the first line, then the trailing fence.
-        let after_lang = rest.splitn(2, '\n').nth(1).unwrap_or("");
-        return after_lang.trim_end().trim_end_matches("```").trim().to_string();
-    }
-    t.to_string()
-}
-
-/// Generate a complete, self-contained HTML document (slide deck or print-ready doc) for the
-/// Studio Docs section. Honors the persisted brand voice. One-shot, non-streaming.
-pub(crate) async fn generate_doc_html(
-    state: &AppState,
-    doc_type: &str,
-    topic: &str,
-    slides: u32,
-) -> Result<String, String> {
-    if topic.trim().is_empty() {
-        return Err("Describe what the document should cover.".to_string());
-    }
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
-    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
-    let voice_line = if brand_voice.trim().is_empty() {
-        String::new()
-    } else {
-        format!("Brand voice / style to reflect: {}\n", brand_voice.trim())
-    };
-
-    let prompt = if doc_type == "slides" {
-        let n = slides.clamp(3, 20);
-        format!(
-            "Create a COMPLETE, self-contained HTML slide deck about:\n{topic}\n\n{voice_line}\n\
-            Produce about {n} slides. Requirements:\n\
-            - ONE html document with an embedded <style> block. NO external resources (no CDN links, no web fonts, no <script>).\n\
-            - Each slide is `<section class=\"slide\">…</section>`. First slide is a title slide.\n\
-            - Clean, modern, high-contrast design: large readable type, generous spacing, a consistent color theme, a subtle accent.\n\
-            - Include print CSS so each slide prints on its own landscape page: `@media print {{ .slide {{ page-break-after: always; }} }}` and size slides ~16:9.\n\
-            Return ONLY the HTML, starting with <!DOCTYPE html>. No commentary, no code fences."
-        )
-    } else {
-        format!(
-            "Create a COMPLETE, self-contained, print-ready HTML document about:\n{topic}\n\n{voice_line}\n\
-            Requirements:\n\
-            - ONE html file with an embedded <style> block. NO external resources (no CDN links, no web fonts, no <script>).\n\
-            - Clean typographic design: clear hierarchy of headings, readable body text, sensible margins, a title block.\n\
-            - Include print CSS with good page margins.\n\
-            Return ONLY the HTML, starting with <!DOCTYPE html>. No commentary, no code fences."
-        )
-    };
-    let system = "You are an expert document and presentation designer who writes clean, self-contained, print-ready HTML/CSS. You never use external resources or scripts. You return only the HTML.";
-
-    let max_tokens = resolve_max_output_tokens(state);
-    let request_body = if is_anthropic {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false, "system": system,
-               "messages": [{"role": "user", "content": prompt}]})
-    } else {
-        json!({"model": model, "max_tokens": max_tokens, "stream": false,
-               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Doc generation failed ({status}): {body}"));
-    }
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-    }
-    .ok_or_else(|| "Doc generation returned no text".to_string())?;
-
-    let html = strip_code_fences(&text);
-    if !html.to_lowercase().contains("<html") && !html.to_lowercase().contains("<!doctype") {
-        return Err(format!("Model did not return HTML. It said:\n{}", html.chars().take(400).collect::<String>()));
-    }
-    Ok(html)
-}
-
-/// Turn a natural-language edit instruction + the video's analysis (probe, transcript,
-/// silences) into a structured `EditPlan` for the Studio Video tab. One-shot JSON call,
-/// validated by deserializing into the plan struct.
-///
-/// When `current_plan` is `Some`, this is a *refinement*: the existing plan's JSON is
-/// included in the prompt with instructions to mutate only what the new instruction asks
-/// for and preserve every other field verbatim (so "make the captions karaoke" doesn't
-/// silently drop segments/filters/texts from a prior AI or manual edit).
-pub(crate) async fn generate_video_edit_plan(
-    state: &AppState,
-    instruction: &str,
-    probe: &crate::video::VideoProbe,
-    transcript: Option<&crate::video::Transcript>,
-    silences: &[crate::video::SilenceRange],
-    filler_ranges: &[crate::video::SilenceRange],
-    current_plan: Option<&crate::video::EditPlan>,
-) -> Result<crate::video::EditPlan, String> {
-    if instruction.trim().is_empty() {
-        return Err("Describe the edit you want.".to_string());
-    }
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
-
-    let presets = crate::video::FILTER_PRESETS
-        .iter()
-        .map(|(k, label, _)| format!("\"{k}\" ({label})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut context = format!(
-        "Video: {:.1}s, {}x{}, {:.0} fps, audio: {}.\n",
-        probe.duration_s, probe.width, probe.height, probe.fps,
-        if probe.has_audio { "yes" } else { "no" }
-    );
-    if !silences.is_empty() {
-        context.push_str("Detected silences (source seconds):\n");
-        for s in silences.iter().take(60) {
-            context.push_str(&format!("  {:.2}–{:.2}\n", s.start, s.end));
-        }
-    }
-    if !filler_ranges.is_empty() {
-        context.push_str(&format!(
-            "Detected filler words/stutters ({} found — \"um\", \"uh\", repeated words, etc., source seconds):\n",
-            filler_ranges.len()
-        ));
-        for f in filler_ranges.iter().take(60) {
-            context.push_str(&format!("  {:.2}–{:.2}\n", f.start, f.end));
-        }
-    }
-    if let Some(t) = transcript {
-        if !t.segments.is_empty() {
-            context.push_str("Transcript (source seconds):\n");
-            let mut budget = 0usize;
-            for seg in &t.segments {
-                let line = format!("  [{:.1}–{:.1}] {}\n", seg.start, seg.end, seg.text);
-                budget += line.len();
-                if budget > 24_000 {
-                    context.push_str("  … (transcript truncated)\n");
-                    break;
-                }
-                context.push_str(&line);
-            }
-        }
-    }
-
-    let refinement_note = if let Some(existing) = current_plan {
-        let existing_json = serde_json::to_string(existing)
-            .map_err(|e| format!("could not serialize current plan: {e}"))?;
-        context.push_str(&format!(
-            "\nThe user already has an edit plan in progress (JSON below). This is a REFINEMENT \
-            request: apply ONLY what the new instruction below asks for, and copy every other \
-            field from this existing plan UNCHANGED (segments, filter, texts, aspect, smart_reframe, \
-            speed, mute, captions/caption_style, normalize_audio, denoise, fade, output_name). Do not \
-            reset or drop fields the instruction doesn't mention.\n\
-            Current plan JSON:\n{existing_json}\n"
-        ));
-        "Treat the instruction as an incremental change to the current plan above, not a fresh edit — \
-        preserve every field it doesn't ask you to change. "
-    } else {
-        ""
-    };
-
-    let prompt = format!(
-        "You are planning a video edit. Produce an edit plan as JSON.\n\n{context}\n\
-        User's instruction: {instruction}\n\n\
-        {refinement_note}Return ONLY a JSON object with these fields (all optional unless noted):\n\
-        - \"segments\": array of {{\"start\": s, \"end\": s, \"source\": optional path}} — ranges in final playback order. For a MAIN-video segment omit \"source\": start/end are SOURCE-timeline seconds to keep. Omit or [] to keep everything. Use the transcript/silences to pick what matters; cut dead air and filler. When the user asks to tighten things up, remove the \"ums\"/filler, or clean up stutters, exclude the detected filler-word/stutter ranges above from the kept segments. To splice in OTHER media, set \"source\" to a file path: a VIDEO file inserts a b-roll clip (start/end trim THAT file's own timeline); a still IMAGE (.png/.jpg/.jpeg/.webp) is a silent title/intro card shown for end-start seconds (use start=0, duration 0.2–30s). Only add inserts when the user asks for b-roll, a title card, or an intro/outro slide.\n\
-        - \"filter\": one of {presets}\n\
-        - \"texts\": array of {{\"text\", \"start\", \"end\", \"position\" (\"top\"|\"center\"|\"bottom\"), \"size\"}} — overlay times are on the OUTPUT timeline (after cuts and speed), so compute them from the kept segments' cumulative durations.\n\
-        - \"aspect\": \"9:16\", \"1:1\", \"4:5\", or \"16:9\" (center-crop) — only if the user asks for a platform/orientation.\n\
-        - \"smart_reframe\": true to keep faces in frame when converting to a narrower/vertical aspect (subject-aware crop instead of a static center-crop). Only meaningful with an \"aspect\" that narrows the video (e.g. 16:9 → 9:16); harmless otherwise. Prefer it when the user wants a vertical/TikTok/Reels/Shorts cut of talking-head footage.\n\
-        - \"speed\": playback speed 0.25–4.0.\n\
-        - \"mute\": true to drop audio.\n\
-        - \"captions\": true to burn in word-timed subtitles from the transcript. Use when the user mentions captions/subtitles, or wants a social/silent-viewing cut (TikTok, Reels, Shorts).\n\
-        - \"caption_style\": \"boxed\" (default — white text on a black box), \"outline\" (white with a heavy outline), or \"karaoke\" (word-by-word highlight). Only set when captions is true.\n\
-        - \"normalize_audio\": true to loudness-normalize the mix to a publishable level (EBU R128, -14 LUFS). Use when the user wants the audio ready to publish/upload, or mentions it sounding too quiet/loud/inconsistent.\n\
-        - \"denoise\": true to reduce background hiss/hum/fan noise from the recording. Use when the user mentions noisy audio, background noise, or a bad-sounding mic.\n\
-        - \"fade\": overall fade-in/fade-out duration in seconds (0.1–5.0), applied to both video and audio at the very start and end of the clip. Use for a polished open/close; omit for a hard cut in/out.\n\
-        - \"output_name\": short kebab-case stem for the output file.\n\n\
-        Keep cuts conservative: pad speech boundaries ~0.2s so words aren't clipped. \
-        No markdown, no code fences, no commentary — the JSON object only."
-    );
-    let system = "You are a precise video editor. You reason about timestamps carefully and output strict JSON only.";
-
-    let request_body = if is_anthropic {
-        json!({"model": model, "max_tokens": 4000, "stream": false, "system": system,
-               "messages": [{"role": "user", "content": prompt}]})
-    } else {
-        json!({"model": model, "max_tokens": 4000, "stream": false,
-               "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
-    };
-
-    let resp = if is_anthropic {
-        state.http.post(&endpoint)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
-            .send().await.map_err(|e| e.to_string())?
-    } else {
-        state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Edit planning failed ({status}): {body}"));
-    }
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let text = if is_anthropic {
-        body.get("content").and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-            .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-    } else {
-        body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-            .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-    }
-    .ok_or_else(|| "Edit planning returned no text".to_string())?;
-
-    let obj = extract_json_object(&text)
-        .ok_or_else(|| format!("Could not parse the edit plan as JSON. Model said:\n{}", text.trim()))?;
-    let mut plan: crate::video::EditPlan =
-        serde_json::from_value(obj).map_err(|e| format!("Edit plan had the wrong shape: {e}"))?;
-    plan.validate(probe)?;
-    Ok(plan)
-}
-
-/// Parse the model's shorts response into raw specs, tolerating a bare array, a `{"shorts": [...]}`
-/// wrapper (or `specs`/`clips`/`highlights`), or a single bare spec object.
-fn parse_shorts_specs(text: &str) -> Result<Vec<crate::video::ShortSpec>, String> {
-    if let Some(obj) = extract_json_object(text) {
-        for key in ["shorts", "specs", "clips", "highlights"] {
-            if let Some(arr) = obj.get(key).and_then(Value::as_array) {
-                return serde_json::from_value(Value::Array(arr.clone()))
-                    .map_err(|e| format!("shorts had the wrong shape: {e}"));
-            }
-        }
-        // A single unwrapped spec object is also acceptable.
-        if obj.get("segments").is_some() {
-            let spec: crate::video::ShortSpec =
-                serde_json::from_value(obj).map_err(|e| format!("short had the wrong shape: {e}"))?;
-            return Ok(vec![spec]);
-        }
-    }
-    if let Some(arr) = extract_json_array(text) {
-        return serde_json::from_value(Value::Array(arr))
-            .map_err(|e| format!("shorts had the wrong shape: {e}"));
-    }
-    Err(format!("could not parse shorts JSON. Model said:\n{}", text.trim()))
-}
-
-/// Pick the best `count` highlight moments from a (possibly long) transcript for auto-shorts.
-///
-/// Feeds the LLM the SEGMENT-level transcript with timestamps (word-level timings are far too
-/// many tokens for a 40-minute video; precise trims happen later at render), the video duration,
-/// the target clip count + per-clip duration, and an optional user `brief`. Instructs the model
-/// to pick self-contained moments with a strong hook up front, snapping boundaries to transcript
-/// segments and never starting mid-sentence. Validates hard via `sanitize_short_specs` and
-/// re-prompts once with the validation error before giving up.
-pub(crate) async fn generate_shorts_specs(
-    state: &AppState,
-    transcript: &crate::video::Transcript,
-    probe: &crate::video::VideoProbe,
-    count: usize,
-    duration_hint_s: Option<f64>,
-    brief: Option<&str>,
-) -> Result<Vec<crate::video::ShortSpec>, String> {
-    let count = count.clamp(1, 8);
-    let target_s = duration_hint_s
-        .unwrap_or(crate::video::DEFAULT_SHORT_TARGET_S)
-        .clamp(10.0, 180.0);
-    if transcript.segments.is_empty() {
-        return Err("no transcript segments to pick shorts from".to_string());
-    }
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
-
-    // Segment-level transcript with timestamps, budgeted so a long video still fits the context.
-    let mut tr = String::new();
-    let mut budget = 0usize;
-    for seg in &transcript.segments {
-        let line = format!("[{:.1}-{:.1}] {}\n", seg.start, seg.end, seg.text.trim());
-        budget += line.len();
-        if budget > 40_000 {
-            tr.push_str("… (transcript truncated — pick from what's shown above)\n");
-            break;
-        }
-        tr.push_str(&line);
-    }
-
-    let brief_line = match brief.map(str::trim).filter(|b| !b.is_empty()) {
-        Some(b) => format!("\nUser brief (prioritize this): {b}\n"),
-        None => String::new(),
-    };
-
-    let base_prompt = format!(
-        "You are an expert short-form video editor. From the transcript of a {dur:.0}s video, pick the \
-        {count} BEST self-contained moments to cut into vertical short clips (~{target:.0}s each).\n\n\
-        Transcript (segment start–end in source seconds):\n{tr}{brief}\n\
-        Rules for every pick:\n\
-        - Self-contained: it must stand on its own, with a strong HOOK in the first ~3 seconds and a clear payoff.\n\
-        - Never start or end mid-sentence. Snap every start/end to the transcript segment boundaries shown above.\n\
-        - Total kept duration per clip ≈ {target:.0}s (must be between {tmin:.0}s and {tmax:.0}s).\n\
-        - A clip may stitch a few in-order, NON-overlapping segments if that makes a tighter moment.\n\
-        - All timestamps are SOURCE seconds within [0, {dur:.0}]. Segment boundaries are precise enough — finer trims happen later.\n\n\
-        Return ONLY a JSON object of this shape:\n\
-        {{\"shorts\": [ {{\"title\": \"≤60 char title\", \"hook\": \"the opening line you're banking on\", \"rationale\": \"why this moment works as a short\", \"segments\": [{{\"start\": 12.0, \"end\": 55.0}}] }} ]}}\n\
-        Order the array best-first. No markdown, no code fences, no commentary — the JSON object only.",
-        dur = probe.duration_s,
-        count = count,
-        target = target_s,
-        tr = tr,
-        brief = brief_line,
-        tmin = 0.5 * target_s,
-        tmax = 2.0 * target_s,
-    );
-    let system = "You are a precise short-form video editor. You reason about timestamps carefully and output strict JSON only.";
-
-    let mut attempt_prompt = base_prompt.clone();
-    let mut last_err = String::new();
-    for attempt in 0..2 {
-        let request_body = if is_anthropic {
-            json!({"model": model, "max_tokens": 4000, "stream": false, "system": system,
-                   "messages": [{"role": "user", "content": attempt_prompt}]})
-        } else {
-            json!({"model": model, "max_tokens": 4000, "stream": false,
-                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": attempt_prompt}]})
-        };
-        let resp = if is_anthropic {
-            state.http.post(&endpoint)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&request_body)
-                .send().await.map_err(|e| e.to_string())?
-        } else {
-            state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-        };
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Shorts planning failed ({status}): {body}"));
-        }
-        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let text = if is_anthropic {
-            body.get("content").and_then(Value::as_array)
-                .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-                .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-        } else {
-            body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-                .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-        }
-        .unwrap_or_default();
-
-        match parse_shorts_specs(&text)
-            .and_then(|specs| crate::video::sanitize_short_specs(specs, probe, count, target_s))
-        {
-            Ok(specs) => return Ok(specs),
-            Err(e) => {
-                last_err = e;
-                if attempt == 0 {
-                    attempt_prompt = format!(
-                        "{base_prompt}\n\nYour previous answer was rejected: {last_err}\nReturn corrected JSON only."
-                    );
-                }
-            }
-        }
-    }
-    Err(format!("Could not get a usable set of shorts from the model: {last_err}"))
-}
-
-/// Parse a compilation-spec JSON object from the model's reply (tolerating code fences and a
-/// little surrounding prose). Accepts either a bare object or one wrapped under a common key.
-fn parse_compilation_spec(text: &str) -> Result<crate::video::CompilationSpec, String> {
-    if let Some(obj) = extract_json_object(text) {
-        for key in ["compilation", "spec", "result", "plan"] {
-            if let Some(inner) = obj.get(key) {
-                if inner.is_object() {
-                    return serde_json::from_value(inner.clone())
-                        .map_err(|e| format!("compilation had the wrong shape: {e}"));
-                }
-            }
-        }
-        if obj.get("segments").is_some() {
-            return serde_json::from_value(obj).map_err(|e| format!("compilation had the wrong shape: {e}"));
-        }
-    }
-    Err(format!("could not parse compilation JSON. Model said:\n{}", text.trim()))
-}
-
-/// Plan a multi-clip compilation: pick which parts of which clips to keep and in what order,
-/// detecting retakes ("takes" — same content re-recorded, keep the best take per section) vs a
-/// montage ("montage" — distinct moments across clips, ordered for flow).
-///
-/// Feeds the LLM each clip numbered with its duration, segment-level transcript (budgeted so
-/// several long clips still fit the context), and filler/silence stats. `mode` is "auto"
-/// (detect + report in `mode_detected`), "takes", or "montage". Validates hard via
-/// `sanitize_compilation_spec` and re-prompts once with the validation error before giving up.
-pub(crate) async fn generate_compilation_specs(
-    state: &AppState,
-    clips: &[crate::video::ClipInfo],
-    brief: Option<&str>,
-    mode: &str,
-    target_duration_s: Option<f64>,
-) -> Result<crate::video::CompilationSpec, String> {
-    if clips.len() < 2 {
-        return Err("compilation needs at least 2 clips".to_string());
-    }
-    let mode = match mode.trim().to_lowercase().as_str() {
-        "takes" => "takes",
-        "montage" => "montage",
-        _ => "auto",
-    };
-    let target_s = target_duration_s.filter(|t| *t > 0.0);
-    let LlmCallConfig { model, is_anthropic, api_key, endpoint, .. } = resolve_llm_config(state)?;
-
-    let clip_durations: Vec<(String, f64)> =
-        clips.iter().map(|c| (c.path.clone(), c.duration_s)).collect();
-
-    // Numbered clips: each with duration + filler/silence stats + its segment-level transcript,
-    // sharing a global char budget so a set of long clips still fits the context.
-    let mut clip_block = String::new();
-    let mut budget = 0usize;
-    let mut truncated = false;
-    for (i, c) in clips.iter().enumerate() {
-        let header = format!(
-            "\n=== Clip {n} — source: {src}\nduration: {dur:.1}s | fillers: {fill} | silence: {sil:.0}%\ntranscript (source seconds):\n",
-            n = i + 1,
-            src = c.path,
-            dur = c.duration_s,
-            fill = c.filler_count,
-            sil = c.silence_ratio * 100.0,
-        );
-        clip_block.push_str(&header);
-        if c.transcript_segments.is_empty() {
-            clip_block.push_str("(no transcript available for this clip — use its duration only)\n");
-            continue;
-        }
-        for seg in &c.transcript_segments {
-            let line = format!("[{:.1}-{:.1}] {}\n", seg.start, seg.end, seg.text.trim());
-            budget += line.len();
-            if budget > 48_000 {
-                clip_block.push_str("… (transcript truncated — plan from what's shown)\n");
-                truncated = true;
-                break;
-            }
-            clip_block.push_str(&line);
-        }
-        if truncated {
-            break;
-        }
-    }
-
-    let brief_line = match brief.map(str::trim).filter(|b| !b.is_empty()) {
-        Some(b) => format!("\nUser brief (prioritize this): {b}\n"),
-        None => String::new(),
-    };
-    let target_line = match target_s {
-        Some(t) => format!(
-            "Target total duration ≈ {t:.0}s (the final compilation must be between {lo:.0}s and {hi:.0}s).\n",
-            t = t, lo = 0.5 * t, hi = 2.0 * t
-        ),
-        None => "No fixed target duration — keep it as long as the strong material warrants, no longer.\n".to_string(),
-    };
-    let mode_line = match mode {
-        "takes" => "MODE: takes. Treat the clips as retakes of the same material.\n".to_string(),
-        "montage" => "MODE: montage. Treat the clips as distinct content to weave together.\n".to_string(),
-        _ => "MODE: auto — YOU decide. If the clips heavily overlap in transcript (the same lines re-recorded), it's \"takes\"; if they cover distinct content, it's \"montage\". Report which in mode_detected.\n".to_string(),
-    };
-
-    let base_prompt = format!(
-        "You are an expert video editor assembling ONE finished video from {count} source clips.\n\
-        {mode_line}{target_line}{brief}\n\
-        The clips:\n{clips}\n\n\
-        How to choose:\n\
-        - TAKES: align the takes into sections (the same sentence/idea attempted more than once). For each \
-        section pick the SINGLE best take — complete sentences, fewest fillers/stutters, no long pauses. \
-        Assemble the chosen takes in natural narrative order. NEVER mix two takes mid-sentence.\n\
-        - MONTAGE: pick the strongest self-contained moments from across the clips honoring the brief and the \
-        target duration. Order them for flow — lead with the best hook.\n\
-        Universal rules:\n\
-        - Every segment MUST set \"source\" to one of the exact clip source paths shown above.\n\
-        - Segment start/end are SOURCE seconds within THAT clip ([0, its duration]). Snap to transcript \
-        segment boundaries; never start or end mid-sentence.\n\
-        - Segments play in the order you list them. Minimum 0.5s each; at most 100 segments.\n\n\
-        Return ONLY a JSON object of this shape:\n\
-        {{\"title\": \"≤80 char title\", \"mode_detected\": \"takes\" or \"montage\", \"notes\": \"1–2 sentences on what you kept and why\", \"segments\": [ {{\"source\": \"<exact clip path>\", \"start\": 3.0, \"end\": 12.5}} ]}}\n\
-        No markdown, no code fences, no commentary — the JSON object only.",
-        count = clips.len(),
-        mode_line = mode_line,
-        target_line = target_line,
-        brief = brief_line,
-        clips = clip_block,
-    );
-    let system = "You are a precise video editor. You reason about timestamps carefully and output strict JSON only.";
-
-    let mut attempt_prompt = base_prompt.clone();
-    let mut last_err = String::new();
-    for attempt in 0..2 {
-        let request_body = if is_anthropic {
-            json!({"model": model, "max_tokens": 4000, "stream": false, "system": system,
-                   "messages": [{"role": "user", "content": attempt_prompt}]})
-        } else {
-            json!({"model": model, "max_tokens": 4000, "stream": false,
-                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": attempt_prompt}]})
-        };
-        let resp = if is_anthropic {
-            state.http.post(&endpoint)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&request_body)
-                .send().await.map_err(|e| e.to_string())?
-        } else {
-            state.http.post(&endpoint).bearer_auth(&api_key).json(&request_body).send().await.map_err(|e| e.to_string())?
-        };
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Compilation planning failed ({status}): {body}"));
-        }
-        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let text = if is_anthropic {
-            body.get("content").and_then(Value::as_array)
-                .and_then(|arr| arr.iter().find(|b| b.get("type").and_then(Value::as_str) == Some("text")))
-                .and_then(|b| b.get("text")).and_then(Value::as_str).map(|s| s.to_string())
-        } else {
-            body.get("choices").and_then(Value::as_array).and_then(|arr| arr.first())
-                .and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.to_string())
-        }
-        .unwrap_or_default();
-
-        match parse_compilation_spec(&text)
-            .and_then(|spec| crate::video::sanitize_compilation_spec(spec, &clip_durations, target_s))
-        {
-            Ok(spec) => return Ok(spec),
-            Err(e) => {
-                last_err = e;
-                if attempt == 0 {
-                    attempt_prompt = format!(
-                        "{base_prompt}\n\nYour previous answer was rejected: {last_err}\nReturn corrected JSON only."
-                    );
-                }
-            }
-        }
-    }
-    Err(format!("Could not get a usable compilation from the model: {last_err}"))
 }
 
 /// Build the general (non-project) system prompt, including the memory index.
@@ -1733,7 +842,16 @@ Proactively use your tools — don't describe what you *could* do, just do it."
         caps.push("Append or prepend content to a file (append_file)");
     }
     if enabled.contains("capture_screen") {
-        caps.push("Take a screenshot of the screen or frontmost window to see it (capture_screen)");
+        caps.push("Take a screenshot of the screen, or of one app's window in the background without focusing it (capture_screen)");
+    }
+    if enabled.contains("capture_page") {
+        caps.push("Check a web page or local dev server in a headless browser — screenshot, console errors and page text, nothing shown on screen (capture_page)");
+    }
+    if enabled.contains("process") {
+        caps.push("Start long-running processes like dev servers with run_command background: true, then read their output or stop them (process)");
+    }
+    if enabled.contains("create_pdf") {
+        caps.push("Create PDF documents — reports, letters, slides — by writing HTML that is rendered to PDF (create_pdf)");
     }
     if enabled.contains("open_app") {
         caps.push("Launch/focus a macOS app, optionally opening a URL (open_app)");
@@ -1755,10 +873,10 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     }
     if enabled.contains("search_places") {
         caps.push("Show a specific named place on the map (search_places) — Use this to locate and display a KNOWN place by name, like 'Arriba's Mexican Grill' or 'LAX airport'. This is a pin-drop tool, not a discovery tool. For discovering new places use search_nearby, for reviews/recommendations use web_search.");
-        caps.push("Browse nearby places by CATEGORY (search_nearby) — PREFERRED tool for 'find X near me' or 'what restaurants are around here' queries. Use category IDs like 'restaurant', 'mexican_restaurant', 'coffee', 'gas_station', 'grocery', 'pharmacy', 'hotel', 'bar', 'gym', 'parking', 'fast_food', 'pizza'. Always try search_nearby FIRST for general food/service discovery. Falls back to user's saved location automatically. For reviews, ratings, or 'best of' recommendations, combine with web_search for richer results.");
+        caps.push("Browse nearby places by CATEGORY (search_nearby) — PREFERRED tool for 'find X near me' or 'what restaurants are around here' queries. Describe the kind of place in plain words: 'restaurant', 'mexican restaurant', 'coffee', 'gas station', 'grocery store', 'pharmacy', 'hotel', 'bar', 'gym', 'parking', 'pizza'. Always try search_nearby FIRST for general food/service discovery. Falls back to user's saved location automatically. For reviews, ratings, or 'best of' recommendations, combine with web_search for richer results.");
     }
     if enabled.contains("get_directions") {
-        caps.push("Get directions between locations — maps display automatically, ALWAYS use the tool instead of text-only directions. Supports driving, walking, and cycling modes. (get_directions)");
+        caps.push("Get directions between locations — maps display automatically, ALWAYS use the tool instead of text-only directions. Driving, walking and cycling give a full route; transit gives travel time only. Cycling and transit work only where Apple Maps covers them — fall back to driving or walking if they fail. (get_directions)");
     }
     if enabled.contains("list_inbox") {
         caps.push("Read the user's Apple Mail inbox (list_inbox) — recent messages, optionally unread-only.");
@@ -1987,7 +1105,10 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     if enabled.contains("write_file") { caps.push("Write/create files (write_file)"); }
     if enabled.contains("edit_file") { caps.push("Edit part of a file by exact-string replacement (edit_file)"); }
     if enabled.contains("append_file") { caps.push("Append or prepend content to a file (append_file)"); }
-    if enabled.contains("capture_screen") { caps.push("Take a screenshot of the screen or frontmost window (capture_screen)"); }
+    if enabled.contains("capture_screen") { caps.push("Take a screenshot of the screen, or of one app's window in the background without focusing it (capture_screen)"); }
+    if enabled.contains("capture_page") { caps.push("Check a web page or local dev server in a headless browser — screenshot, console errors and page text, nothing shown on screen (capture_page)"); }
+    if enabled.contains("process") { caps.push("Start long-running processes like dev servers with run_command background: true, then read their output or stop them (process)"); }
+    if enabled.contains("create_pdf") { caps.push("Create PDF documents — reports, letters, slides — by writing HTML that is rendered to PDF (create_pdf)"); }
     if enabled.contains("open_app") { caps.push("Launch/focus a macOS app, optionally opening a URL (open_app)"); }
     if enabled.contains("list_files") { caps.push("List directory contents (list_files)"); }
     if enabled.contains("search_files") { caps.push("Search for text in files (search_files)"); }
@@ -2102,12 +1223,14 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("run_command") {
         defs.push((
             "run_command",
-            "Run a shell command in the local workspace and return text output. Commands flagged as potentially dangerous pause and ask the user for approval before running.",
+            "Run a shell command in the local workspace and return its output (stdout and stderr interleaved; a non-zero exit code is reported at the end). Commands flagged as potentially dangerous pause and ask the user for approval before running. A command that runs longer than timeout_secs is killed — so never run a dev server, watcher or anything else that doesn't exit in the foreground: start it with background: true, which returns immediately with a process id you then manage with the process tool.",
             json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "cwd": {"type": "string"}
+                    "cwd": {"type": "string"},
+                    "timeout_secs": {"type": "integer", "description": "Kill the command after this many seconds (default 300, max 1800). Raise it for long builds or installs."},
+                    "background": {"type": "boolean", "description": "Start a long-running process (dev server, watcher) and return right away with its process id. Interactive chat only."}
                 },
                 "required": ["command"]
             }),
@@ -2116,7 +1239,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("read_file") {
         defs.push((
             "read_file",
-            "Read a file within the workspace. Optionally pass start_line and/or end_line (1-based, inclusive) to read only a slice of a large file; when a range is given each line is prefixed with its line number.",
+            "Read a file within the workspace. Image files (png, jpg, gif, webp, heic, bmp, tiff) are returned to you as an image you can see — use this to look at screenshots, photos, and rendered output. Optionally pass start_line and/or end_line (1-based, inclusive) to read only a slice of a large file; when a range is given each line is prefixed with its line number.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2176,11 +1299,12 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("capture_screen") {
         defs.push((
             "capture_screen",
-            "Take a screenshot so you can SEE the user's screen — use this to debug how an app or web page looks. `mode` is \"screen\" (whole display, default) or \"window\" (the frontmost window). To inspect a specific app or URL, call open_app first to bring it to the front, then capture_screen with mode \"window\". The screenshot is returned to you as an image you can read directly.",
+            "Take a screenshot so you can SEE the user's screen or an app — use this to check how a native app looks. To look at a specific app, pass `app` (e.g. \"Safari\", \"Xcode\"): its window is captured in the background, exactly where it is, even if other windows cover it — nothing is brought to the front and the user is not interrupted. Prefer that over focusing the app. Without `app`, `mode` is \"screen\" (whole display, default) or \"window\" (whatever window is frontmost). For web pages and local dev servers use capture_page instead when it is available. The screenshot is returned to you as an image you can read directly.",
             json!({
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "enum": ["screen", "window"], "description": "\"screen\" = whole display (default); \"window\" = the frontmost window."}
+                    "app": {"type": "string", "description": "Name of a running app whose window to capture without focusing it, e.g. \"Safari\". Overrides mode."},
+                    "mode": {"type": "string", "enum": ["screen", "window"], "description": "Used when app is omitted: \"screen\" = whole display (default); \"window\" = the frontmost window."}
                 }
             }),
         ));
@@ -2188,14 +1312,64 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("open_app") {
         defs.push((
             "open_app",
-            "Launch or focus a macOS app and bring it to the front, optionally opening a URL or file in it. Use the app's exact name (e.g. \"Safari\", \"Google Chrome\", \"Preview\"). Pair with capture_screen mode \"window\" to look at what you opened.",
+            "Launch a macOS app, optionally opening a URL or file in it. Use the app's exact name (e.g. \"Safari\", \"Google Chrome\", \"Preview\"). By default the app is brought to the front, which interrupts the user — when you only need to look at it (testing, verification), pass background: true to open it behind their current window, then use capture_screen with `app` to see it. Only bring an app to the front when the user asked to see it.",
             json!({
                 "type": "object",
                 "properties": {
                     "app": {"type": "string", "description": "Exact app name, e.g. \"Safari\" or \"Google Chrome\"."},
-                    "url": {"type": "string", "description": "Optional URL or file path to open in the app."}
+                    "url": {"type": "string", "description": "Optional URL or file path to open in the app."},
+                    "background": {"type": "boolean", "description": "Open without bringing the app to the front or taking focus (default false)."}
                 },
                 "required": ["app"]
+            }),
+        ));
+    }
+    if enabled.contains("capture_page") {
+        defs.push((
+            "capture_page",
+            "Load a web page in a headless browser and get back a screenshot, the page's console output (including uncaught JavaScript errors) and its rendered text — all in the background: no window opens and nothing on the user's screen changes. This is the way to verify web work: after changing a page or app, capture it and check the screenshot AND the console before saying it works. `url` is an http(s) URL — including a local dev server such as http://localhost:5173 — or the path of an HTML file in the workspace. For a dev server, start it first with run_command background: true and wait for it with the process tool. Each call is a fresh page load (no clicking or typing, no login state).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "http(s) URL (localhost allowed) or a workspace-relative path to an HTML file."},
+                    "width": {"type": "integer", "description": "Viewport width in px (default 1280; use ~390 to check a phone layout)."},
+                    "height": {"type": "integer", "description": "Viewport height in px (default 800, max 4000; raise it to see further down a long page)."},
+                    "wait_ms": {"type": "integer", "description": "How long to let the page run (timers, fetches, rendering) before capturing, in ms (default 3000, max 20000)."}
+                },
+                "required": ["url"]
+            }),
+        ));
+    }
+    if enabled.contains("create_pdf") {
+        defs.push((
+            "create_pdf",
+            "Make a PDF (a report, letter, one-pager, invoice, slide deck, handout...) by writing it as an HTML page and rendering it with a headless browser's print engine. Pass `html`: a complete, self-contained HTML document — inline CSS, images as https URLs or data: URIs. Control the page with CSS: `@page { size: A4; margin: 16mm }` (or `size: Letter`, `size: A4 landscape`, or `size: 1280px 720px` with `margin: 0` for 16:9 slides), and `break-before: page` to start a new page. Backgrounds and colors print as shown. Alternatively pass `path` (an HTML file in the workspace, so its relative images and stylesheets load) or `url` (an http(s) page or local dev server). Saved to the Content library unless output_path is given. To check the layout first, write the HTML to a workspace file and look at it with capture_page.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "html": {"type": "string", "description": "A complete HTML document to print."},
+                    "path": {"type": "string", "description": "Instead of html: a workspace-relative HTML file to print."},
+                    "url": {"type": "string", "description": "Instead of html: an http(s) URL (localhost allowed) to print."},
+                    "filename": {"type": "string", "description": "Name for the PDF in the Content library (default: the document's <title>)."},
+                    "output_path": {"type": "string", "description": "Save to this workspace path (ending in .pdf) instead of the Content library."},
+                    "wait_ms": {"type": "integer", "description": "How long to let the page load fonts/images/scripts before printing, in ms (default 1000, max 20000)."}
+                }
+            }),
+        ));
+    }
+    if enabled.contains("process") {
+        defs.push((
+            "process",
+            "Manage long-running background processes that were started with run_command background: true (dev servers, watchers, builds). action \"list\" shows them; \"output\" returns a process's status and the latest output — pass wait_for to block until a line containing that text appears (e.g. \"ready\", \"listening\", \"Local:\"), which is how you wait for a server to come up before testing it; \"stop\" stops the process and everything it started. Stop processes you started once you no longer need them, unless the user wants them left running.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "output", "stop"]},
+                    "id": {"type": "integer", "description": "Process id returned by run_command (required for output and stop)."},
+                    "wait_for": {"type": "string", "description": "For output: wait until the process output contains this text (case-insensitive) before returning."},
+                    "wait_secs": {"type": "integer", "description": "For output with wait_for: how long to wait, in seconds (default 30, max 120)."}
+                },
+                "required": ["action"]
             }),
         ));
     }
@@ -2265,103 +1439,6 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
             }),
         ));
     }
-    if enabled.contains("probe_video") {
-        defs.push((
-            "probe_video",
-            "Get a video file's metadata: duration, resolution, fps, codec, and whether it has audio. Use before analyzing or editing a video.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Video file path within the workspace"}
-                },
-                "required": ["path"]
-            }),
-        ));
-    }
-    if enabled.contains("analyze_video") {
-        defs.push((
-            "analyze_video",
-            "Analyze a video for editing: metadata, detected silence ranges (dead air), detected filler-word/stutter ranges (\"um\", \"uh\", repeated words), suggested keep-segments (silences + fillers removed), and a timestamped speech transcript. Use the timestamps to pick precise cut points for edit_video.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Video file path within the workspace"},
-                    "transcribe": {"type": "boolean", "description": "Include a timestamped transcript (default true; requires a Groq or OpenAI API key)"}
-                },
-                "required": ["path"]
-            }),
-        ));
-    }
-    if enabled.contains("edit_video") {
-        defs.push((
-            "edit_video",
-            "Edit a video with ffmpeg — non-destructive, renders a new .mp4 into the Content library. Keep only chosen segments (cuts), splice in b-roll clips or still-image title/intro cards from other files (segments[].source), apply a color filter preset, overlay timed text, center-crop to an aspect ratio (with optional smart_reframe to keep faces in frame when going vertical), change speed, mute, or burn in word-timed captions/subtitles. Also supports audio polish: normalize_audio for publishable loudness, denoise for noisy recordings, and fade for a smooth fade-in/out. Cuts always get an automatic de-click micro-fade so concatenated segments never pop. Run analyze_video first to choose cut points. Set captions=true for social/silent-viewing cuts or when the user asks for subtitles (the video is auto-transcribed). To build a title/intro card image, render HTML→PNG first (the Studio 'renderSlideToPng' helper) and reference the PNG as an image insert.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Source (main) video path within the workspace"},
-                    "segments": {
-                        "type": "array",
-                        "items": {"type": "object", "properties": {"start": {"type": "number"}, "end": {"type": "number"}, "source": {"type": "string", "description": "Optional. Omit for the MAIN video. A workspace path to another VIDEO file makes this an inserted b-roll clip (start..end trimmed from THAT file). A workspace path to a still IMAGE (.png/.jpg/.jpeg/.webp) makes this a silent title/intro card shown for end-start seconds (use start=0; duration must be 0.2–30s). Inserts are auto-scaled/cropped to the main video's frame."}}, "required": ["start", "end"]},
-                        "description": "Ranges to keep/insert, in final playback order. For MAIN segments (no source) start/end are SOURCE-timeline seconds — pad speech boundaries ~0.2s. For inserts, start/end are on the inserted file's OWN timeline. Omit entirely to keep the whole main video."
-                    },
-                    "filter": {"type": "string", "enum": ["none", "cinematic", "warm", "cool", "vintage", "bw", "punchy"], "description": "Color filter preset"},
-                    "texts": {
-                        "type": "array",
-                        "items": {"type": "object", "properties": {"text": {"type": "string"}, "start": {"type": "number"}, "end": {"type": "number"}, "position": {"type": "string", "enum": ["top", "center", "bottom"]}, "size": {"type": "integer"}}, "required": ["text", "start", "end"]},
-                        "description": "Text overlays. Times are on the OUTPUT timeline (after cuts and speed change)."
-                    },
-                    "aspect": {"type": "string", "description": "Center-crop to an aspect like \"9:16\", \"1:1\", \"4:5\""},
-                    "smart_reframe": {"type": "boolean", "description": "Keep faces in frame when converting to a narrower/vertical aspect (subject-aware crop instead of static center-crop). Only meaningful with an aspect that narrows the video (e.g. 16:9 → 9:16). Use for vertical/TikTok/Reels/Shorts cuts of talking-head footage."},
-                    "speed": {"type": "number", "description": "Playback speed multiplier, 0.25–4.0"},
-                    "mute": {"type": "boolean", "description": "Drop the audio track"},
-                    "captions": {"type": "boolean", "description": "Burn in word-timed subtitles from the transcript (auto-transcribes). Use for social/silent-viewing cuts or when subtitles are requested."},
-                    "caption_style": {"type": "string", "enum": ["boxed", "outline", "karaoke"], "description": "Caption look: boxed (default), outline, or karaoke word-by-word highlight. Only with captions=true."},
-                    "normalize_audio": {"type": "boolean", "description": "Loudness-normalize the mix for publishable audio (EBU R128, -14 LUFS). Use when the audio should be upload-ready or sounds too quiet/loud."},
-                    "denoise": {"type": "boolean", "description": "Reduce background hiss/hum/fan noise from the recording. Use for noisy audio or a bad-sounding mic."},
-                    "fade": {"type": "number", "description": "Overall fade-in/fade-out duration in seconds (0.1-5.0), applied to both video and audio at the clip's start and end."},
-                    "output_name": {"type": "string", "description": "Short kebab-case stem for the output file"}
-                },
-                "required": ["path"]
-            }),
-        ));
-    }
-    if enabled.contains("generate_shorts") {
-        defs.push((
-            "generate_shorts",
-            "Auto-clip a long video into short vertical clips: transcribes it, uses AI to pick the best self-contained highlight moments (strong hook + payoff), and renders each as a captioned 9:16 short (smart-reframed to keep faces in frame, loudness-normalized) into the Content library. Ideal for scheduled/background tasks that auto-clip new recordings into ready-to-post Reels/Shorts/TikToks — it never prompts, so it works in unattended runs. Returns the titles and output paths.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Video file path within the workspace"},
-                    "count": {"type": "integer", "description": "How many shorts to produce (default 3, max 8)"},
-                    "duration_s": {"type": "number", "description": "Target seconds per clip (default ~45; typically 30–60)"},
-                    "brief": {"type": "string", "description": "Optional focus, e.g. 'focus on the pricing discussion' or 'pick the funniest moments'"}
-                },
-                "required": ["path"]
-            }),
-        ));
-    }
-    if enabled.contains("compile_videos") {
-        defs.push((
-            "compile_videos",
-            "Combine several video clips (2–10) into ONE finished video, keeping only the good parts, and render it into the Content library. Transcribes and analyzes every clip, then uses AI to either (retakes/\"takes\" mode) align re-recorded takes into sections and keep the single best take per section — cleanest delivery, fewest fillers/stutters, no long pauses — assembled in narrative order, or (\"montage\" mode) pick the strongest self-contained moments across the clips and order them for flow. Pass mode=\"auto\" (default) to let it detect retakes vs montage. Great for scheduled/background tasks that assemble a polished cut from raw takes or daily clips — it never prompts, so it works unattended. Returns the title, detected mode, and output path.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "2–10 clip file paths within the workspace, in any order (the planner decides the final ordering)."
-                    },
-                    "brief": {"type": "string", "description": "Optional focus, e.g. 'keep the best explanation of pricing' or 'make an upbeat highlight reel'."},
-                    "mode": {"type": "string", "enum": ["auto", "takes", "montage"], "description": "auto (detect retakes vs montage — default), takes (retakes of the same material — keep the best take per section), or montage (distinct moments woven together)."},
-                    "target_duration_s": {"type": "number", "description": "Optional target total duration in seconds. Mostly useful for montage mode."}
-                },
-                "required": ["paths"]
-            }),
-        ));
-    }
     if enabled.contains("search_places") {
         defs.push((
             "search_places",
@@ -2381,7 +1458,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
             json!({
                 "type": "object",
                 "properties": {
-                    "category": {"type": "string", "description": "Mapbox category ID. Common: restaurant, mexican_restaurant, chinese_restaurant, italian_restaurant, pizza, coffee, cafe, bar, fast_food, gas_station, grocery, supermarket, pharmacy, hospital, hotel, gym, parking, bank, atm, laundry, post_office, library, park, beach, movie_theater, shopping_mall, clothing_store, hardware, auto_repair, car_wash, dentist, veterinarian, hair_salon"},
+                    "category": {"type": "string", "description": "What kind of place, in plain words: restaurant, mexican restaurant, chinese restaurant, pizza, coffee, bar, fast food, gas station, grocery store, pharmacy, hospital, hotel, gym, parking, bank, ATM, laundromat, post office, library, park, beach, movie theater, shopping mall, hardware store, auto repair, car wash, dentist, veterinarian, hair salon..."},
                     "near": {"type": "string", "description": "Optional location to search near (e.g., 'Hemet, CA'). Uses saved user location if omitted."},
                     "limit": {"type": "integer", "description": "Max results (default 10, max 25)"}
                 },
@@ -2392,13 +1469,13 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("get_directions") {
         defs.push((
             "get_directions",
-            "Get directions between two locations. Results display on an interactive map with the route.",
+            "Get directions between two locations with Apple Maps. The route is shown to the user on a map. Transit returns travel time only (no steps); cycling and transit are only available where Apple Maps covers them.",
             json!({
                 "type": "object",
                 "properties": {
                     "from": {"type": "string", "description": "Starting address or place"},
                     "to": {"type": "string", "description": "Destination address or place"},
-                    "mode": {"type": "string", "description": "Transport mode: driving, walking, cycling (default driving)"}
+                    "mode": {"type": "string", "description": "Transport mode: driving (default), walking, cycling, or transit"}
                 },
                 "required": ["from", "to"]
             }),
@@ -2889,6 +1966,105 @@ struct StreamOutcome {
     tool_calls: Vec<ToolCall>,
     usage_input: u64,
     usage_output: u64,
+    /// Input tokens served from the provider's prompt cache (0 if not reported).
+    usage_cached: u64,
+}
+
+/// Longest a single streamed model reply may take end to end.
+const STREAM_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Longest gap between two chunks of a streamed reply before the connection is treated as
+/// dead. Generous because a reasoning model can think for a while before its first token.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Decode as much of `buf` as is complete UTF-8 and remove it, leaving an incomplete trailing
+/// character (one split across network chunks) in `buf` for the next chunk. Invalid bytes are
+/// replaced with U+FFFD, as `from_utf8_lossy` would.
+fn take_utf8(buf: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    let mut start = 0;
+    loop {
+        match std::str::from_utf8(&buf[start..]) {
+            Ok(text) => {
+                out.push_str(text);
+                start = buf.len();
+                break;
+            }
+            Err(e) => {
+                let valid = start + e.valid_up_to();
+                out.push_str(std::str::from_utf8(&buf[start..valid]).unwrap_or_default());
+                match e.error_len() {
+                    // A real encoding error: replace it and keep going.
+                    Some(bad) => {
+                        out.push('\u{FFFD}');
+                        start = valid + bad;
+                    }
+                    // Input ends mid-character: keep the partial bytes for next time.
+                    None => {
+                        start = valid;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    buf.drain(..start);
+    out
+}
+
+/// Endpoints that rejected `stream_options` (remembered for the life of the process so the
+/// extra failed request happens once, not every round).
+fn no_stream_options() -> &'static Mutex<HashSet<String>> {
+    static SET: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// `endpoint|model` pairs that rejected image input, so later requests send text only.
+fn no_vision() -> &'static Mutex<HashSet<String>> {
+    static SET: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn set_contains(set: &Mutex<HashSet<String>>, key: &str) -> bool {
+    set.lock().unwrap_or_else(|p| p.into_inner()).contains(key)
+}
+
+fn set_insert(set: &Mutex<HashSet<String>>, key: &str) {
+    set.lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string());
+}
+
+/// The HTTP status of a `Provider::send` error (`"<label> API error 400 Bad Request: ..."`),
+/// or None for transport errors.
+fn error_status(err: &str) -> Option<u16> {
+    let (_, after) = err.split_once(" API error ")?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Whether a `Provider::send` error is an HTTP 4xx (the request itself was refused).
+fn is_client_error(err: &str) -> bool {
+    error_status(err).map_or(false, |s| (400..500).contains(&s))
+}
+
+/// Whether a refusal may be about the images in the request, so that retrying without them
+/// is worth a try: a bad/unprocessable/unsupported/too-large request — never a rate limit,
+/// auth or not-found error.
+fn may_be_image_refusal(err: &str) -> bool {
+    matches!(error_status(err), Some(400 | 413 | 415 | 422))
+}
+
+/// Whether the error says the model does not take image input AT ALL — as opposed to one
+/// image being too big or the request being too long, which retrying without that image
+/// fixes but which says nothing about later images. Only this is remembered.
+fn says_images_unsupported(err: &str) -> bool {
+    if error_status(err) == Some(413) {
+        return false;
+    }
+    let e = err.to_lowercase();
+    let about_images = ["image", "vision", "multimodal", "multi-modal", "image_url"].iter().any(|k| e.contains(k));
+    let about_size = ["exceed", "too large", "too long", "maximum", "max ", "size", "dimension", "context length", "too many"]
+        .iter()
+        .any(|k| e.contains(k));
+    about_images && !about_size
 }
 
 /// Provider-specific wire format. Everything the OpenAI chat/completions and the
@@ -2996,16 +2172,30 @@ impl Provider {
         }
     }
 
-    fn build_request(&self, model: &str, system_prompt: &str, messages: &[Value], tools: &[Value], max_tokens: u64) -> Value {
+    fn endpoint(&self) -> &str {
         match self {
-            Self::OpenAi { .. } => json!({
-                "model": model,
-                "messages": messages,
-                "tools": tools,
-                "tool_choice": "auto",
-                "max_tokens": max_tokens,
-                "stream": true
-            }),
+            Self::OpenAi { endpoint, .. } | Self::Anthropic { endpoint, .. } => endpoint,
+        }
+    }
+
+    /// `include_usage` asks OpenAI-format streams for a final usage chunk (token counts and
+    /// prompt-cache hits); without it they report none. Anthropic streams always report usage.
+    fn build_request(&self, model: &str, system_prompt: &str, messages: &[Value], tools: &[Value], max_tokens: u64, include_usage: bool) -> Value {
+        match self {
+            Self::OpenAi { .. } => {
+                let mut body = json!({
+                    "model": model,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "max_tokens": max_tokens,
+                    "stream": true
+                });
+                if include_usage {
+                    body["stream_options"] = json!({"include_usage": true});
+                }
+                body
+            }
             Self::Anthropic { .. } => json!({
                 "model": model,
                 "max_tokens": max_tokens,
@@ -3025,10 +2215,22 @@ impl Provider {
                 .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01"),
         };
-        let response = request.json(body).send().await.map_err(|e| e.to_string())?;
+        // The shared client's 90s timeout covers the WHOLE request, body included — fine for
+        // one-shot calls, but it cut every streamed reply that took longer than 90s to
+        // generate (a long answer or a big write_file) with "error decoding response
+        // body". Streams get a generous overall cap instead, and `parse_stream` enforces
+        // an idle timeout between chunks, which is what actually detects a dead connection.
+        let response = request
+            .json(body)
+            .timeout(STREAM_TOTAL_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the model: {}", e))?;
         let status = response.status();
         if !status.is_success() {
-            let body: Value = response.json().await.map_err(|e| e.to_string())?;
+            // Keep the status even when the error body isn't JSON (proxies, gateways).
+            let text = response.text().await.unwrap_or_default();
+            let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
             return Err(format!("{} API error {}: {}", self.label(), status, body));
         }
         Ok(response)
@@ -3043,15 +2245,35 @@ impl Provider {
         let mut text = String::new();
         let mut usage_input: u64 = 0;
         let mut usage_output: u64 = 0;
+        let mut usage_cached: u64 = 0;
         let mut line_buf = String::new();
+        // Bytes of a UTF-8 character split across two network chunks, held for the next one.
+        let mut utf8_carry: Vec<u8> = Vec::new();
 
         // OpenAI keys partial tool calls by stream index; Anthropic appends in order.
         let mut openai_calls: HashMap<u64, ToolCall> = HashMap::new();
         let mut anthropic_calls: Vec<ToolCall> = Vec::new();
         let mut current_event_type = String::new();
 
-        while let Some(bytes) = response.chunk().await.map_err(|e| e.to_string())? {
-            line_buf.push_str(&String::from_utf8_lossy(&bytes));
+        loop {
+            let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, response.chunk()).await {
+                Ok(Ok(chunk)) => chunk,
+                Ok(Err(e)) => {
+                    return Err(format!(
+                        "The model's reply was cut off mid-stream ({}). Nothing after this point was received — send the message again to retry.",
+                        e
+                    ))
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "The model stopped sending data for {}s, so the reply was abandoned. Send the message again to retry.",
+                        STREAM_IDLE_TIMEOUT.as_secs()
+                    ))
+                }
+            };
+            let Some(bytes) = chunk else { break };
+            utf8_carry.extend_from_slice(&bytes);
+            line_buf.push_str(&take_utf8(&mut utf8_carry));
 
             while let Some(newline_pos) = line_buf.find('\n') {
                 let line = line_buf[..newline_pos].trim().to_string();
@@ -3077,6 +2299,14 @@ impl Provider {
                             }
                             if let Some(v) = usage.get("completion_tokens").and_then(Value::as_u64) {
                                 usage_output = v;
+                            }
+                            // Prompt-cache hits (already included in prompt_tokens).
+                            if let Some(v) = usage
+                                .get("prompt_tokens_details")
+                                .and_then(|d| d.get("cached_tokens"))
+                                .and_then(Value::as_u64)
+                            {
+                                usage_cached = v;
                             }
                         }
                         let delta = match data
@@ -3120,7 +2350,11 @@ impl Provider {
                     Self::Anthropic { .. } => match current_event_type.as_str() {
                         "message_start" => {
                             if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
-                                usage_input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                                // Anthropic reports cached tokens separately from
+                                // input_tokens; the request's real size is the sum.
+                                let field = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+                                usage_cached = field("cache_read_input_tokens");
+                                usage_input = field("input_tokens") + usage_cached + field("cache_creation_input_tokens");
                             }
                         }
                         "message_delta" => {
@@ -3183,6 +2417,7 @@ impl Provider {
             tool_calls,
             usage_input,
             usage_output,
+            usage_cached,
         })
     }
 
@@ -3232,8 +2467,9 @@ impl Provider {
 
     /// Like `push_tool_result`, but also attaches captured images so a vision model can see
     /// them. For Anthropic the images ride as sibling blocks in the same user turn as the
-    /// tool_result (a well-supported shape); OpenAI tool messages are text-only, so the
-    /// images are dropped there with the text result kept.
+    /// tool_result (a well-supported shape). OpenAI tool messages are text-only and all of a
+    /// round's tool messages must be consecutive, so there the images are sent after the
+    /// round in one user message — see `push_round_images`.
     fn push_tool_result_with_images(
         &self,
         messages: &mut Vec<Value>,
@@ -3243,6 +2479,11 @@ impl Provider {
     ) {
         match self {
             Self::OpenAi { .. } => {
+                let output = format!(
+                    "{}\n[The {} image(s) for this result are in the user message that follows the tool results.]",
+                    output,
+                    images.len()
+                );
                 messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
             }
             Self::Anthropic { .. } => {
@@ -3255,6 +2496,18 @@ impl Provider {
                 }
                 messages.push(json!({"role": "user", "content": content}));
             }
+        }
+    }
+
+    /// OpenAI wire format only: after every tool message of a round has been pushed, send
+    /// the images those tools produced as one user message. No-op for Anthropic (images are
+    /// already attached to their tool_result) and when the round produced none.
+    fn push_round_images(&self, messages: &mut Vec<Value>, images: &[(String, String)]) {
+        if images.is_empty() {
+            return;
+        }
+        if let Self::OpenAi { .. } = self {
+            messages.push(crate::context::tool_image_message_openai(images));
         }
     }
 
@@ -3449,8 +2702,83 @@ fn resolve_max_output_tokens(state: &AppState) -> u64 {
 /// report `usage` (MiniMax's Anthropic-compatible endpoint often omits it) — far closer
 /// to the truth than the frontend's fallback, which counts only visible chat bubbles.
 fn estimate_request_tokens(system_prompt: &str, messages: &[Value]) -> u64 {
-    let messages_chars: usize = messages.iter().map(|m| m.to_string().len()).sum();
-    ((system_prompt.len() + messages_chars) / 4) as u64
+    // Image blocks count as a fixed size: their base64 length would overstate them ~100x.
+    ((system_prompt.len() + crate::context::messages_chars(messages)) / 4) as u64
+}
+
+/// Send one round's request, recovering from two things an OpenAI-compatible endpoint may
+/// refuse outright: the `stream_options` field, and image input on a text-only model. Each
+/// is retried once without the offending part and remembered, so a custom provider that
+/// lacks either keeps working instead of failing every turn. `messages` is updated in place
+/// when images had to be stripped.
+#[allow(clippy::too_many_arguments)]
+async fn send_round(
+    state: &AppState,
+    session_id: &str,
+    provider: &Provider,
+    model: &str,
+    system_prompt: &str,
+    messages: &mut Vec<Value>,
+    tools: &[Value],
+    max_tokens: u64,
+) -> Result<reqwest::Response, String> {
+    let endpoint = provider.endpoint().to_string();
+    let vision_key = format!("{}|{}", endpoint, model);
+    if set_contains(no_vision(), &vision_key) {
+        crate::context::strip_all_images(messages);
+    }
+
+    let mut include_usage = !set_contains(no_stream_options(), &endpoint);
+    let mut body = provider.build_request(model, system_prompt, messages, tools, max_tokens, include_usage);
+    let mut result = provider.send(&state.http, &body).await;
+
+    if let Err(err) = &result {
+        if include_usage && is_client_error(err) && err.contains("stream_options") {
+            set_insert(no_stream_options(), &endpoint);
+            include_usage = false;
+            body = provider.build_request(model, system_prompt, messages, tools, max_tokens, false);
+            result = provider.send(&state.http, &body).await;
+        }
+    }
+
+    if let Err(err) = &result {
+        if may_be_image_refusal(err) && crate::context::contains_images(messages) {
+            let mut text_only = messages.clone();
+            crate::context::strip_all_images(&mut text_only);
+            let retry = provider.build_request(model, system_prompt, &text_only, tools, max_tokens, include_usage);
+            // Only drop the images if the same request without them is accepted — otherwise
+            // the refusal was about something else and the original error stands. They stay
+            // dropped for the rest of this turn (resending them would fail every round), but
+            // the model is only marked text-only when the error says so: an oversized image
+            // or an over-long request says nothing about the next screenshot.
+            if let Ok(response) = provider.send(&state.http, &retry).await {
+                *messages = text_only;
+                let remembered = says_images_unsupported(err);
+                if remembered {
+                    set_insert(no_vision(), &vision_key);
+                }
+                crate::db::add_feed_item(
+                    state,
+                    "system",
+                    if remembered { "Images not supported by this model" } else { "Images left out of a request" },
+                    &format!(
+                        "'{}' rejected a request with images ({}). {}",
+                        model,
+                        crate::tools::truncate_chars(err, 200),
+                        if remembered {
+                            "Images are being left out for this model until the app restarts."
+                        } else {
+                            "It was resent without them; images are left out for the rest of this turn only."
+                        }
+                    ),
+                    "error",
+                    session_id,
+                );
+                return Ok(response);
+            }
+        }
+    }
+    result
 }
 
 /// Take and clear any images `capture_screen` stashed for this session during the current
@@ -3552,6 +2880,7 @@ async fn run_tool_loop(
     tools.extend(provider.mcp_tools_json(&state.mcp.connected_tools(state).await));
     let mut messages = provider.initial_messages(system_prompt, history);
     let max_tokens = resolve_max_output_tokens(state);
+    let context_budget = crate::context::budget_chars(state);
     let mut tool_round: u32 = 0;
     let mut iteration: i64 = 0;
     let mut fallback_tried = false;
@@ -3587,8 +2916,14 @@ async fn run_tool_loop(
             });
         }
 
-        let request_body = provider.build_request(&model, system_prompt, &messages, &tools, max_tokens);
-        let response = match provider.send(&state.http, &request_body).await {
+        // Keep the outgoing conversation inside the budget: drop stale tool images, and once
+        // it nears the limit clear old tool output (see context.rs).
+        crate::context::maintain(&mut messages, context_budget);
+        let response = match send_round(
+            state, session_id, &provider, &model, system_prompt, &mut messages, &tools, max_tokens,
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(err) => {
                 // Provider failover (llm/fallback_provider): only on the turn's FIRST
@@ -3655,6 +2990,7 @@ async fn run_tool_loop(
                 session_id: session_id.to_string(),
                 input_tokens,
                 output_tokens,
+                cached_tokens: outcome.usage_cached.min(input_tokens),
             });
         }
 
@@ -3699,6 +3035,7 @@ async fn run_tool_loop(
             }
 
             let mut tool_result_blocks: Vec<Value> = Vec::new();
+            let mut round_images: Vec<(String, String)> = Vec::new();
             for (call, (output, images)) in calls.iter().zip(results) {
                 let output = note_repeated_failure(&mut failed_calls, &call.name, &call.args, output);
                 // Attach captured images as sibling image blocks in the tool_result turn so
@@ -3716,10 +3053,12 @@ async fn run_tool_loop(
                     tool_result_blocks.push(json!({
                         "type": "tool_result",
                         "tool_use_id": call.id,
-                        "content": format!("{} [{} screenshot(s) shown to the model]", output, images.len()),
+                        "content": format!("{} [{} image(s) shown to the model]", output, images.len()),
                     }));
+                    round_images.extend(images);
                 }
             }
+            provider.push_round_images(&mut messages, &round_images);
             let _ = insert_message(
                 state,
                 session_id,
@@ -4007,6 +3346,391 @@ pub(crate) async fn run_project_init(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn openai_provider() -> Provider {
+        Provider::OpenAi { endpoint: "https://example.test/v1/chat/completions".into(), api_key: "k".into() }
+    }
+    fn anthropic_provider() -> Provider {
+        Provider::Anthropic { endpoint: "https://example.test/v1/messages".into(), api_key: "k".into() }
+    }
+
+    /// A mock model endpoint: answers each request in turn with the next canned
+    /// (status, JSON body), recording the JSON it was sent.
+    async fn canned_server(responses: Vec<(u16, Value)>) -> (String, std::sync::Arc<Mutex<Vec<Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let request_body = loop {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break String::new();
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).to_string();
+                        }
+                    }
+                };
+                seen_in.lock().unwrap().push(serde_json::from_str(&request_body).unwrap_or(Value::Null));
+                let payload = body.to_string();
+                let head = format!(
+                    "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    payload.len()
+                );
+                sock.write_all(head.as_bytes()).await.unwrap();
+                sock.write_all(payload.as_bytes()).await.unwrap();
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{}/v1/chat/completions", addr), seen)
+    }
+
+    fn helper_cfg(endpoint: String, is_anthropic: bool) -> LlmCallConfig {
+        LlmCallConfig { provider: "custom".into(), model: "test-model".into(), is_anthropic, api_key: "k".into(), endpoint }
+    }
+
+    fn openai_reply(content: &str, reasoning: &str, finish: &str) -> Value {
+        json!({"choices": [{"message": {"role": "assistant", "content": content, "reasoning_content": reasoning}, "finish_reason": finish}]})
+    }
+
+    /// Regression: a reasoning model given a 150-token cap spent it all thinking and
+    /// returned empty text, so the safety verifier never got a verdict.
+    #[tokio::test]
+    async fn helper_calls_get_headroom_and_retry_when_reasoning_eats_the_budget() {
+        let (endpoint, seen) = canned_server(vec![
+            (200, openai_reply("", "Let me think about this command...", "length")),
+            (200, openai_reply("ALLOW\nIt only removes the build folder.", "thinking", "stop")),
+        ])
+        .await;
+        let http = reqwest::Client::new();
+        let out = complete_once_with(&http, 40_960, &helper_cfg(endpoint, false), "sys", "is this ok?", 150, 30)
+            .await
+            .unwrap();
+        assert_eq!(out, "ALLOW\nIt only removes the build folder.");
+        assert_eq!(parse_command_verdict(&out), CommandVerdict::Allow("It only removes the build folder.".into()));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        // The caller asked for 150; the request went out with headroom, then a larger retry.
+        assert_eq!(seen[0]["max_tokens"], ONE_SHOT_MIN_TOKENS);
+        assert_eq!(seen[1]["max_tokens"], ONE_SHOT_RETRY_TOKENS);
+        assert_eq!(seen[0]["stream"], false);
+        assert_eq!(seen[0]["messages"][0], json!({"role": "system", "content": "sys"}));
+        assert_eq!(seen[0]["messages"][1], json!({"role": "user", "content": "is this ok?"}));
+    }
+
+    #[tokio::test]
+    async fn helper_call_that_stays_empty_fails_with_the_reason() {
+        let (endpoint, seen) = canned_server(vec![
+            (200, openai_reply("", "thinking", "length")),
+            (200, openai_reply("", "still thinking", "length")),
+        ])
+        .await;
+        let err = complete_once_with(&reqwest::Client::new(), 40_960, &helper_cfg(endpoint, false), "s", "p", 150, 30)
+            .await
+            .unwrap_err();
+        assert!(err.contains("used all 16384 output tokens on reasoning"), "{}", err);
+        assert_eq!(seen.lock().unwrap().len(), 2, "exactly one retry");
+
+        // Empty but NOT truncated: retrying with more tokens can't help, so don't.
+        let (endpoint, seen) = canned_server(vec![(200, openai_reply("", "", "stop"))]).await;
+        let err = complete_once_with(&reqwest::Client::new(), 40_960, &helper_cfg(endpoint, false), "s", "p", 150, 30)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no text") && err.contains("finish reason: stop"), "{}", err);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn helper_call_reports_http_errors_with_the_body() {
+        let (endpoint, seen) = canned_server(vec![(400, json!({"error": {"message": "model does not support this"}}))]).await;
+        let err = complete_once_with(&reqwest::Client::new(), 40_960, &helper_cfg(endpoint, false), "s", "p", 150, 30)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("HTTP 400"), "{}", err);
+        assert!(err.contains("model does not support this"), "{}", err);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn helper_call_speaks_the_anthropic_format_too() {
+        let (endpoint, seen) = canned_server(vec![(
+            200,
+            json!({"content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": "YES"},
+                {"type": "text", "text": "The file exists."}
+            ], "stop_reason": "end_turn"}),
+        )])
+        .await;
+        let out = complete_once_with(&reqwest::Client::new(), 40_960, &helper_cfg(endpoint, true), "sys", "p", 150, 30)
+            .await
+            .unwrap();
+        assert_eq!(out, "YES\nThe file exists.");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0]["system"], "sys");
+        assert_eq!(seen[0]["messages"], json!([{"role": "user", "content": "p"}]));
+    }
+
+    #[test]
+    fn one_shot_replies_are_parsed_in_every_shape() {
+        // Inline thinking is removed; what follows is the answer.
+        let r = parse_one_shot(false, &openai_reply("<think>is it safe?</think>\nDENY\nIt deletes home.", "", "stop"));
+        assert_eq!(r.text, "DENY\nIt deletes home.");
+        assert!(r.had_reasoning && !r.truncated);
+        // Thinking that was cut off mid-thought leaves no answer, and says so.
+        let r = parse_one_shot(false, &openai_reply("<think>is it safe? well", "", "length"));
+        assert_eq!(r.text, "");
+        assert!(r.truncated && r.had_reasoning);
+        // Content as typed parts, null content, and a missing choice.
+        let parts = json!({"choices": [{"message": {"content": [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}]}, "finish_reason": "stop"}]});
+        assert_eq!(parse_one_shot(false, &parts).text, "AB");
+        let null = json!({"choices": [{"message": {"content": null, "reasoning": "x"}, "finish_reason": "stop"}]});
+        let r = parse_one_shot(false, &null);
+        assert!(r.text.is_empty() && r.had_reasoning);
+        assert_eq!(parse_one_shot(false, &json!({})), OneShotReply::default());
+        // Anthropic truncation.
+        let r = parse_one_shot(true, &json!({"content": [{"type": "thinking", "thinking": "..."}], "stop_reason": "max_tokens"}));
+        assert!(r.text.is_empty() && r.truncated && r.had_reasoning);
+    }
+
+    #[test]
+    fn one_shot_budgets_respect_the_configured_ceiling() {
+        // Small asks get headroom, then a bigger retry.
+        assert_eq!(one_shot_budgets(150, 40_960), (4096, 16_384));
+        assert_eq!(one_shot_budgets(40, 40_960), (4096, 16_384));
+        // A user who capped llm/max_tokens low is not exceeded (no retry budget to grow into).
+        assert_eq!(one_shot_budgets(150, 2000), (2000, 2000));
+        // Larger asks are kept as they are.
+        assert_eq!(one_shot_budgets(8000, 40_960), (8000, 16_384));
+        assert_eq!(one_shot_budgets(20_000, 40_960), (20_000, 20_000));
+        // A caller asking for more than the ceiling still gets what it asked for.
+        assert_eq!(one_shot_budgets(4000, 1000), (4000, 4000));
+    }
+
+    /// Serve one HTTP request with an SSE body that trickles out over ~2.4s.
+    async fn slow_sse_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read the request: headers, then Content-Length bytes of body.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            for word in ["slow ", "but ", "complete"] {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                let line = format!("data: {}\n\n", json!({"choices": [{"delta": {"content": word}}]}));
+                sock.write_all(line.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            sock.write_all(b"data: [DONE]\n\n").await.unwrap();
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{}/v1/chat/completions", addr)
+    }
+
+    /// Regression: the shared client's total timeout used to cut any streamed reply that
+    /// took longer than it to generate ("error decoding response body").
+    #[tokio::test]
+    async fn streamed_replies_outlive_the_clients_total_timeout() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        // Baseline: without the per-request override the stream dies at the client timeout.
+        let endpoint = slow_sse_server().await;
+        let mut resp = client.post(&endpoint).json(&json!({})).send().await.unwrap();
+        let mut failed = false;
+        loop {
+            match resp.chunk().await {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "expected the 1s client timeout to cut a 2.4s stream");
+
+        // Through Provider::send the same stream completes.
+        let endpoint = slow_sse_server().await;
+        let provider = Provider::OpenAi { endpoint, api_key: "k".into() };
+        let body = provider.build_request("m", "sys", &[], &[], 100, true);
+        let response = provider.send(&client, &body).await.unwrap();
+        let mut seen = String::new();
+        let outcome = provider.parse_stream(response, |t| seen.push_str(t)).await.unwrap();
+        assert_eq!(outcome.text, "slow but complete");
+        assert_eq!(seen, "slow but complete");
+    }
+
+    #[test]
+    fn openai_history_carries_user_images_as_image_url_parts() {
+        let history = vec![
+            HistoryMessage {
+                role: "user".into(),
+                blocks: vec![
+                    json!({"type": "text", "text": "what is this?"}),
+                    json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}),
+                ],
+            },
+            HistoryMessage::text("assistant", "a cat"),
+            HistoryMessage::text("user", "thanks"),
+        ];
+        let out = history_to_openai(&history);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["content"][0], json!({"type": "text", "text": "what is this?"}));
+        assert_eq!(out[0]["content"][1]["type"], "image_url");
+        assert_eq!(out[0]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        // Text-only turns keep the plain-string shape.
+        assert_eq!(out[2]["content"], "thanks");
+
+        // An image-only turn has no empty text part.
+        let image_only = vec![HistoryMessage {
+            role: "user".into(),
+            blocks: vec![json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "Zm9v"}})],
+        }];
+        let out = history_to_openai(&image_only);
+        assert_eq!(out[0]["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn openai_tool_images_follow_the_tool_messages_in_one_user_message() {
+        let p = openai_provider();
+        let img = ("image/png".to_string(), "QUJD".to_string());
+        let mut messages = vec![json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1"}, {"id": "c2"}]})];
+        p.push_tool_result_with_images(&mut messages, "c1", "Captured.", &[img.clone()]);
+        p.push_tool_result(&mut messages, "c2", "ok");
+        p.push_round_images(&mut messages, &[img.clone()]);
+        // Tool messages stay consecutive; the image comes after them.
+        assert_eq!(messages[1]["role"], "tool");
+        assert!(messages[1]["content"].as_str().unwrap().contains("user message that follows"));
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"][0]["text"], crate::context::TOOL_IMAGE_NOTE);
+        assert_eq!(messages[3]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        // No images → nothing pushed.
+        let before = messages.len();
+        p.push_round_images(&mut messages, &[]);
+        assert_eq!(messages.len(), before);
+
+        // Anthropic attaches the image to the tool_result turn and adds no extra message.
+        let a = anthropic_provider();
+        let mut messages = Vec::new();
+        a.push_tool_result_with_images(&mut messages, "t1", "Captured.", &[img.clone()]);
+        a.push_round_images(&mut messages, &[img]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[0]["content"][1]["type"], "image");
+    }
+
+    #[test]
+    fn openai_requests_ask_for_usage_unless_told_not_to() {
+        let p = openai_provider();
+        let with = p.build_request("m", "sys", &[], &[], 100, true);
+        assert_eq!(with["stream_options"], json!({"include_usage": true}));
+        let without = p.build_request("m", "sys", &[], &[], 100, false);
+        assert!(without.get("stream_options").is_none());
+        // Anthropic never gets the OpenAI-only field.
+        let a = anthropic_provider().build_request("m", "sys", &[], &[], 100, true);
+        assert!(a.get("stream_options").is_none());
+        assert_eq!(a["system"], "sys");
+    }
+
+    #[test]
+    fn utf8_split_across_chunks_is_reassembled() {
+        let text = "héllo 👋 世界";
+        let bytes = text.as_bytes();
+        // Every possible split point, including inside the 4-byte emoji and 3-byte CJK.
+        for cut in 0..=bytes.len() {
+            let mut carry = Vec::new();
+            carry.extend_from_slice(&bytes[..cut]);
+            let mut out = take_utf8(&mut carry);
+            carry.extend_from_slice(&bytes[cut..]);
+            out.push_str(&take_utf8(&mut carry));
+            assert_eq!(out, text, "split at {}", cut);
+            assert!(carry.is_empty());
+        }
+        // Genuinely invalid bytes are replaced, not held forever.
+        let mut bad = vec![b'a', 0xff, b'b'];
+        assert_eq!(take_utf8(&mut bad), "a\u{FFFD}b");
+        assert!(bad.is_empty());
+    }
+
+    #[test]
+    fn client_errors_are_recognised_from_send_errors() {
+        assert!(is_client_error("OpenAI API error 400 Bad Request: {\"error\":\"x\"}"));
+        assert!(is_client_error("OpenAI API error 422 Unprocessable Entity: nope"));
+        assert!(!is_client_error("OpenAI API error 500 Internal Server Error: boom"));
+        assert!(!is_client_error("error sending request for url"));
+        assert_eq!(error_status("MiniMax Anthropic API error 429 Too Many Requests: slow down"), Some(429));
+    }
+
+    #[test]
+    fn only_explicit_no_image_refusals_mark_a_model_text_only() {
+        // Worth retrying without images, but not remembered.
+        let too_big = "MiniMax Anthropic API error 400 Bad Request: {\"error\":{\"message\":\"messages.3.content.1.image.source.base64: image exceeds 5 MB maximum: 5592404 bytes > 5242880 bytes\"}}";
+        assert!(may_be_image_refusal(too_big) && !says_images_unsupported(too_big));
+        let long = "OpenAI API error 400 Bad Request: {\"error\":{\"message\":\"This model's maximum context length is 128000 tokens\"}}";
+        assert!(may_be_image_refusal(long) && !says_images_unsupported(long));
+        let payload = "OpenAI API error 413 Payload Too Large: request entity too large";
+        assert!(may_be_image_refusal(payload) && !says_images_unsupported(payload));
+        // Never retried without images at all.
+        assert!(!may_be_image_refusal("OpenAI API error 429 Too Many Requests: {\"error\":\"rate limit\"}"));
+        assert!(!may_be_image_refusal("OpenAI API error 401 Unauthorized: bad key"));
+        assert!(!may_be_image_refusal("OpenAI API error 500 Internal Server Error: boom"));
+        // A real "this model can't see" refusal is remembered.
+        let no_vision = "OpenAI API error 400 Bad Request: {\"error\":{\"message\":\"Invalid content type. image_url is only supported by certain models.\"}}";
+        assert!(may_be_image_refusal(no_vision) && says_images_unsupported(no_vision));
+        let no_vision2 = "OpenAI API error 400 Bad Request: {\"error\":\"model does not support image input\"}";
+        assert!(says_images_unsupported(no_vision2));
+    }
+
+    #[test]
+    fn request_estimate_counts_images_at_a_fixed_size() {
+        let messages = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(2_000_000)}}
+        ]})];
+        let tokens = estimate_request_tokens("system", &messages);
+        assert!(tokens < 3_000, "a 2 MB screenshot must not read as {} tokens", tokens);
+    }
 
     #[test]
     fn repeated_identical_failures_get_a_stop_note() {

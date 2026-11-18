@@ -13,12 +13,9 @@ use crate::models::*;
 /// configured without ever holding the actual secret in JS memory.
 pub(crate) const SECRET_PLACEHOLDER: &str = "__secret_set__";
 
-/// Settings keys whose values must never be sent to the webview. The Mapbox key is
-/// deliberately excluded: it is a client-side token consumed by Mapbox GL JS in the
-/// frontend, so withholding it would break the maps feature without a security gain.
+/// Settings keys whose values must never be sent to the webview.
 fn is_secret_setting(key: &str) -> bool {
-    (key.contains("api_key") || key.ends_with("_token") || key.ends_with("_secret"))
-        && key != "maps/mapbox_api_key"
+    key.contains("api_key") || key.ends_with("_token") || key.ends_with("_secret")
 }
 
 #[tauri::command]

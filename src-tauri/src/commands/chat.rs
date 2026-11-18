@@ -65,21 +65,12 @@ pub(crate) async fn chat_core(app: &AppHandle, state: &AppState, req: ChatReques
         &req.session_id,
     );
 
-    let mut history = load_history_structured(&state, &req.session_id, 200)?;
-
-    // Trim history to fit within ~300k tokens (MiniMax-M3 has a 1M context window; this
-    // leaves ample room for the system prompt, tool definitions, images, and the response).
-    // Rough estimate: 1 token ≈ 4 chars. `char_len` counts tool_use/tool_result blocks toward
-    // the budget and counts image blocks at a fixed cost rather than their base64 length.
-    // After trimming we sanitize so no dangling tool_use/tool_result pairs survive (the
-    // provider API rejects those with a 400).
-    let max_history_chars: usize = 300_000 * 4;
-    let mut total_chars: usize = history.iter().map(|h| h.char_len()).sum();
-    while total_chars > max_history_chars && history.len() > 2 {
-        total_chars -= history[0].char_len();
-        history.remove(0);
-    }
-    sanitize_tool_pairs(&mut history);
+    // Load what this turn sends: the session's summary of older messages (if it has been
+    // compacted) plus every message since, compacting first when that has grown past the
+    // context budget (`llm/context_budget_tokens`, default 300k tokens). The result is
+    // sanitized so no dangling tool_use/tool_result pairs survive (providers reject those
+    // with a 400). See context.rs.
+    let history = crate::context::prepare_history(app, state, &req.session_id).await?;
 
     let configured_provider =
         get_app_setting_value(&state, "llm/provider")?.unwrap_or_else(|| "minimax".to_string());
@@ -246,14 +237,8 @@ pub(crate) async fn chat_core(app: &AppHandle, state: &AppState, req: ChatReques
                 }),
             );
 
-            // Reload history exactly like the initial turn (load + char-budget trim + sanitize).
-            let mut history = load_history_structured(&state, &req.session_id, 200)?;
-            let mut total_chars: usize = history.iter().map(|h| h.char_len()).sum();
-            while total_chars > max_history_chars && history.len() > 2 {
-                total_chars -= history[0].char_len();
-                history.remove(0);
-            }
-            sanitize_tool_pairs(&mut history);
+            // Reload history exactly like the initial turn (compact if needed + sanitize).
+            let history = crate::context::prepare_history(app, state, &req.session_id).await?;
 
             let (iter_reply, iter_blocks) = dispatch_chat_turn(
                 &app, &state, &req.session_id, req.skill.as_deref(), &provider, &model, &history, scope.as_ref(),

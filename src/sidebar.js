@@ -12,7 +12,6 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import {
   sessionList,
   sessionSearchInput,
-  sidebarAppsRail,
   navSettingsBtn,
   sidebarCollapseBtn,
   tiles,
@@ -22,30 +21,14 @@ import {
 import { escapeHtml, field, threadLabel, feedTimeAgo, projectLabel } from "./utils.js";
 import { icon } from "./icons.js";
 import {
-  TILE_TYPES,
   getTilesByType,
   focusTile,
-  openTileForType,
   removeTile,
   makeDragSource,
   replaceSingleTileIfAlone,
 } from "./tilesys.js";
 import { addChatTile, updateModelChips } from "./chat.js";
 import { openSettingsModal } from "./settings.js";
-
-// ==================== APP RAIL ====================
-// App tile types shown as icons in the footer rail (Logs & Tools live under
-// Settings now).
-// Content and Memory live in Library now (see library.js).
-const APPS_TYPES = ["studio", "web", "feeds", "tasks"];
-const APPS_ICONS = {
-  studio: "video",
-  content: "image",
-  web: "globe",
-  feeds: "rss",
-  tasks: "list-checks",
-  memory: "brain",
-};
 
 const COLLAPSE_KEY = "muninn.sidebar-collapsed";
 
@@ -86,34 +69,6 @@ function isSecCollapsed(id) {
 function toggleSection(id) {
   localStorage.setItem(SEC_KEY(id), isSecCollapsed(id) ? "0" : "1");
   refreshSessionList();
-}
-
-// ==================== APP RAIL (footer icons) ====================
-function renderAppsRail() {
-  if (!sidebarAppsRail) return;
-  sidebarAppsRail.innerHTML = "";
-  for (const type of APPS_TYPES) {
-    const def = TILE_TYPES.find((t) => t.type === type);
-    if (!def) continue;
-    const openTiles = getTilesByType(type);
-    const isOpen = openTiles.length > 0;
-
-    const btn = document.createElement("button");
-    btn.className = `apps-rail-btn${isOpen ? " open" : ""}`;
-    btn.dataset.tip = def.label;
-    btn.setAttribute("aria-label", isOpen ? `${def.label} (open)` : def.label);
-    btn.innerHTML = icon(APPS_ICONS[type] || "grid", 15);
-
-    btn.addEventListener("click", () => {
-      if (isOpen) {
-        focusTile(openTiles[0].id);
-      } else {
-        openTileForType(type);
-      }
-    });
-    makeDragSource(btn, { type });
-    sidebarAppsRail.appendChild(btn);
-  }
 }
 
 // ==================== CHAT HISTORY BROWSER ====================
@@ -476,14 +431,17 @@ function wirePopoverDismiss() {
 
 // ==================== PUBLIC ENTRY ====================
 export function updateSidebar() {
-  document.getElementById("nav-library")?.classList.toggle("open", getTilesByType("library").length > 0);
+  // Highlight a nav item while its tile is open.
+  for (const type of ["tasks", "library"]) {
+    document.getElementById(`nav-${type}`)?.classList.toggle("open", getTilesByType(type).length > 0);
+  }
   refreshSessionList();
-  renderAppsRail();
 }
 
 export function initSidebar() {
   const navItems = [
     ["new-chat-btn", "message-circle", "New chat"],
+    ["nav-tasks", "list-checks", "Tasks"],
     ["nav-library", "book-open", "Library"],
     ["nav-connections", "plug", "Connections"],
     ["nav-settings", "settings", "Settings"],

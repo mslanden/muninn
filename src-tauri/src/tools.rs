@@ -524,27 +524,98 @@ pub(crate) fn run_command_scoped(scope: &WorkspaceScope, command: &str, cwd: Opt
 /// Run a command without the safety check. Only call this after the user has
 /// explicitly approved the command (or from `run_command_scoped`, which checks).
 pub(crate) fn run_command_scoped_unchecked(scope: &WorkspaceScope, command: &str, cwd: Option<&str>) -> Result<String, String> {
-    let cwd_path = match cwd {
-        Some(value) => resolve_within_workspace(&scope.root, &scope.root_canon, value, false)?,
-        None => scope.root.clone(),
-    };
-    let output = Command::new("/bin/zsh")
-        .arg("-lc")
-        .arg(command)
-        .current_dir(cwd_path)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let cwd_path = resolve_command_cwd(scope, cwd)?;
+    crate::procs::run_blocking(
+        command,
+        &cwd_path,
+        std::time::Duration::from_secs(crate::procs::DEFAULT_TIMEOUT_SECS),
+    )
+}
 
-    let mut merged = String::new();
-    merged.push_str(&String::from_utf8_lossy(&output.stdout));
-    merged.push_str(&String::from_utf8_lossy(&output.stderr));
+/// Read an integer tool argument, tolerating models that send numbers as strings ("30").
+fn arg_u64(arguments: &Value, key: &str) -> Option<u64> {
+    let v = arguments.get(key)?;
+    v.as_u64()
+        .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
 
-    if merged.len() > 12000 {
-        merged.truncate(12000);
-        merged.push_str("\n...[truncated]");
+/// Read a boolean tool argument (default false), tolerating "true"/"false" strings.
+fn arg_bool(arguments: &Value, key: &str) -> bool {
+    match arguments.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Resolve a command's working directory inside the workspace (default: the workspace root).
+fn resolve_command_cwd(scope: &WorkspaceScope, cwd: Option<&str>) -> Result<PathBuf, String> {
+    match cwd {
+        Some(value) => resolve_within_workspace(&scope.root, &scope.root_canon, value, false),
+        None => Ok(scope.root.clone()),
+    }
+}
+
+/// Whether the user has pressed Stop for this session (or, for a subagent, its parent chat).
+/// Peeks without clearing — `run_tool_loop` consumes the flag between rounds.
+fn stop_requested_peek(state: &AppState, session_id: &str) -> bool {
+    let stops = state.stop_requests.lock().unwrap_or_else(|p| p.into_inner());
+    stops.contains(session_id)
+        || session_id
+            .split_once("::sub-")
+            .map(|(parent, _)| stops.contains(parent))
+            .unwrap_or(false)
+}
+
+/// Run an agent `run_command` that has already passed, or been approved past, the
+/// dangerous-command check — never call this before that check. Foreground commands are
+/// killed after `timeout_secs` or when the user presses Stop; `background` starts a
+/// long-running process and returns immediately with its id (see the `process` tool).
+async fn exec_agent_command(
+    state: &AppState,
+    session_id: &str,
+    scope: &WorkspaceScope,
+    command: &str,
+    cwd: Option<&str>,
+    timeout_secs: u64,
+    background: bool,
+) -> Result<String, String> {
+    let cwd_path = resolve_command_cwd(scope, cwd)?;
+    if !background {
+        return crate::procs::run_async(
+            command,
+            &cwd_path,
+            std::time::Duration::from_secs(timeout_secs),
+            || stop_requested_peek(state, session_id),
+        )
+        .await;
     }
 
-    Ok(merged)
+    let id = state.bg_processes.start(session_id, command, &cwd_path)?;
+    // Give it a moment so an immediate failure (typo, port in use) is reported right here.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let view = state.bg_processes.view(session_id, id, 3000)?;
+    let output = if view.output.trim().is_empty() {
+        "(no output yet)".to_string()
+    } else {
+        view.output
+    };
+    Ok(if view.running {
+        format!(
+            "Started background process {id} ({status}).\nOutput so far:\n{output}\n\nIt keeps running after this turn. Use the process tool: action \"output\" with id {id} (add wait_for to block until a readiness line appears), and action \"stop\" with id {id} when you are done with it.",
+            id = id,
+            status = view.status,
+            output = output
+        )
+    } else {
+        format!(
+            "Background process {id} already {status} — it did not stay running.\nOutput:\n{output}",
+            id = id,
+            status = view.status,
+            output = output
+        )
+    })
 }
 
 #[allow(dead_code)]
@@ -569,12 +640,7 @@ pub(crate) fn run_command_capture(state: &AppState, command: &str, cwd: Option<&
     merged.push_str(&String::from_utf8_lossy(&output.stdout));
     merged.push_str(&String::from_utf8_lossy(&output.stderr));
 
-    if merged.len() > 12000 {
-        merged.truncate(12000);
-        merged.push_str("\n...[truncated]");
-    }
-
-    Ok(merged)
+    Ok(cap_command_output(merged))
 }
 
 pub(crate) async fn web_search_impl(state: &AppState, query: &str, count: usize) -> Result<String, String> {
@@ -637,7 +703,9 @@ pub(crate) async fn web_fetch_impl(state: &AppState, url: &str) -> Result<String
     let plain = strip_html_tags(&text);
     let max = 12000;
     if plain.len() > max {
-        Ok(format!("{}...[truncated]", &plain[..max]))
+        // By characters: a byte slice at 12000 panics when it lands inside a multi-byte
+        // character, which any non-ASCII page can trigger.
+        Ok(format!("{}...[truncated]", truncate_chars(&plain, max)))
     } else {
         Ok(plain)
     }
@@ -652,6 +720,58 @@ pub(crate) async fn web_fetch_impl(state: &AppState, url: &str) -> Result<String
 /// rebinding (a public hostname that resolves to a private IP); that would require
 /// resolving and pinning the address before the request.
 pub(crate) fn validate_public_url(url: &str) -> Result<(), String> {
+    let host = http_url_host(url)?;
+    if is_blocked_host(&host) {
+        return Err(format!(
+            "Blocked URL: '{}' resolves to a local or private address",
+            host
+        ));
+    }
+
+    Ok(())
+}
+
+/// `<title>` of an HTML document, if it has a non-empty one.
+fn html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let open = lower.find("<title")?;
+    let start = open + lower[open..].find('>')? + 1;
+    let end = start + lower[start..].find("</title")?;
+    let title = html.get(start..end)?.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then_some(title)
+}
+
+/// A safe `.pdf` file name from a title or requested name: letters, digits, `-`, `_`.
+fn pdf_file_name(name: &str) -> String {
+    let stem = name.trim().trim_end_matches(".pdf").trim_end_matches(".PDF");
+    let mut slug: String = stem
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '-' })
+        .collect();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    let slug: String = slug.trim_matches('-').chars().take(80).collect();
+    format!("{}.pdf", if slug.is_empty() { "document" } else { &slug })
+}
+
+/// `dir/name`, or `dir/stem-2.ext`, `-3`, ... — whichever doesn't exist yet.
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = Path::new(name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|s| s.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
+    (2..)
+        .map(|n| dir.join(format!("{}-{}{}", stem, n, ext)))
+        .find(|p| !p.exists())
+        .unwrap_or(candidate)
+}
+
+/// Extract the lowercased host of an http(s) URL, rejecting every other scheme.
+fn http_url_host(url: &str) -> Result<String, String> {
     let trimmed = url.trim();
     let lower = trimmed.to_lowercase();
     let rest = if let Some(r) = lower.strip_prefix("http://") {
@@ -684,15 +804,59 @@ pub(crate) fn validate_public_url(url: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("Blocked URL: missing host".to_string());
     }
+    Ok(host)
+}
 
-    if is_blocked_host(&host) {
+/// Whether `host` is this machine's loopback address (where local dev servers listen).
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h == "::1" {
+        return true;
+    }
+    let parts: Vec<&str> = h.split('.').collect();
+    parts.len() == 4 && parts[0] == "127" && parts.iter().all(|p| p.parse::<u8>().is_ok())
+}
+
+/// Turn a `capture_page` target into the URL the headless browser loads.
+///
+/// Allowed: public http(s) URLs (same rule as `web_fetch`), http(s) on this machine's
+/// loopback address (the point of the tool — previewing a local dev server), and a file
+/// inside the workspace (opened as `file://`). Everything else is refused: other schemes,
+/// private-network and link-local/metadata hosts, and paths outside the workspace.
+pub(crate) fn resolve_page_target(scope: &WorkspaceScope, target: &str) -> Result<String, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("missing url".to_string());
+    }
+    let lower = target.to_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let host = http_url_host(target)?;
+        if !is_loopback_host(&host) {
+            validate_public_url(target)?;
+        }
+        if target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("invalid URL: contains whitespace".to_string());
+        }
+        return Ok(target.to_string());
+    }
+    // `scheme:` of any other kind (file:, chrome:, javascript:, data:, view-source:, ...).
+    let scheme_len = lower.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')).count();
+    if scheme_len > 1 && lower[scheme_len..].starts_with(':') {
         return Err(format!(
-            "Blocked URL: '{}' resolves to a local or private address",
-            host
+            "Blocked URL scheme '{}': capture_page takes an http(s) URL or the path of a file in the workspace.",
+            &lower[..scheme_len]
         ));
     }
-
-    Ok(())
+    let resolved = resolve_within_workspace(&scope.root, &scope.root_canon, target, false)?;
+    if !resolved.is_file() {
+        return Err(format!("no such file in the workspace: {}", target));
+    }
+    let encoded: Vec<String> = resolved
+        .to_string_lossy()
+        .split('/')
+        .map(|seg| urlencoding::encode(seg).into_owned())
+        .collect();
+    Ok(format!("file://{}", encoded.join("/")))
 }
 
 /// Returns true for hosts that should never be reachable via `web_fetch`:
@@ -744,7 +908,7 @@ fn is_blocked_host(host: &str) -> bool {
     false
 }
 
-fn strip_html_tags(html: &str) -> String {
+pub(crate) fn strip_html_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut in_script = false;
@@ -802,118 +966,8 @@ fn strip_html_tags(html: &str) -> String {
     result.trim().to_string()
 }
 
-/// Fetch a URL and extract the OG image meta tag value.
-/// Returns Some(image_url) if found, None otherwise.
-pub(crate) async fn extract_og_image(state: &AppState, url: &str) -> Option<String> {
-    if url.is_empty() {
-        return None;
-    }
-    let resp = state
-        .http
-        .get(url)
-        .header("User-Agent", "Muninn/1.0")
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    // Only read first 50KB to find the og:image tag (it's always in <head>)
-    let body = resp.text().await.ok()?;
-    let search_area = if body.len() > 50_000 { &body[..50_000] } else { &body };
-
-    // Match <meta property="og:image" content="..."> (or twitter:image)
-    let re = Regex::new(r#"<meta\s[^>]*(?:property|name)\s*=\s*["'](?:og:image|twitter:image)["'][^>]*content\s*=\s*["']([^"']+)["']"#).ok()?;
-    if let Some(caps) = re.captures(search_area) {
-        let img = caps.get(1)?.as_str().trim().to_string();
-        if !img.is_empty() && (img.starts_with("http://") || img.starts_with("https://")) {
-            return Some(img);
-        }
-    }
-    // Also try reversed attribute order: content before property
-    let re2 = Regex::new(r#"<meta\s[^>]*content\s*=\s*["']([^"']+)["'][^>]*(?:property|name)\s*=\s*["'](?:og:image|twitter:image)["']"#).ok()?;
-    if let Some(caps) = re2.captures(search_area) {
-        let img = caps.get(1)?.as_str().trim().to_string();
-        if !img.is_empty() && (img.starts_with("http://") || img.starts_with("https://")) {
-            return Some(img);
-        }
-    }
-    None
-}
-
-/// Generate a feed thumbnail image using MiniMax image-01.
-/// Downloads the image and saves it locally. Returns the local file path.
-pub(crate) async fn generate_feed_thumbnail(state: &AppState, title: &str, app: &AppHandle) -> Result<String, String> {
-    let api_key = first_non_empty_setting(state, &["llm/minimax_api_key"])
-        .map_err(|e| format!("DB error reading API key: {}", e))?
-        .ok_or_else(|| "MiniMax API key not configured".to_string())?;
-
-    let prompt = format!("A clean, editorial illustration for a news article titled: \"{}\". Minimalist, modern, vibrant colors, no text.", title);
-
-    let body = serde_json::json!({
-        "model": "image-01",
-        "prompt": prompt,
-        "aspect_ratio": "16:9",
-        "response_format": "url",
-        "n": 1,
-        "prompt_optimizer": true
-    });
-
-    let resp = state
-        .http
-        .post("https://api.minimax.io/v1/image_generation")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("MiniMax request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_body = resp.text().await.unwrap_or_default();
-        return Err(format!("MiniMax image API error {}: {}", status, err_body));
-    }
-
-    let resp_json: Value = resp.json().await
-        .map_err(|e| format!("Failed to parse MiniMax response: {}", e))?;
-
-    let remote_url = resp_json
-        .get("data")
-        .and_then(|d| d.get("image_urls").and_then(|urls| urls.get(0)).and_then(|v| v.as_str()))
-        .ok_or_else(|| format!("No image URL in MiniMax response: {}", resp_json))?;
-
-    // Download the image and save locally to avoid ATS/CSP issues
-    let download_url = remote_url.replace("http://", "https://");
-    download_feed_image(state, app, &download_url).await
-}
-
-/// Download an image from a URL and save it to the local feed_images directory.
-/// Returns the local file path.
-pub(crate) async fn download_feed_image(state: &AppState, app: &AppHandle, url: &str) -> Result<String, String> {
-    let img_resp = state.http.get(url)
-        .send().await
-        .map_err(|e| format!("Failed to download image: {}", e))?;
-    if !img_resp.status().is_success() {
-        return Err(format!("Image download failed: HTTP {}", img_resp.status()));
-    }
-    let bytes = img_resp.bytes().await
-        .map_err(|e| format!("Failed to read image bytes: {}", e))?;
-
-    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let feed_img_dir = data_dir.join("media").join("feed_images");
-    fs::create_dir_all(&feed_img_dir).map_err(|e| e.to_string())?;
-
-    let filename = format!("{}.jpg", uuid::Uuid::new_v4());
-    let path = feed_img_dir.join(&filename);
-    fs::write(&path, &bytes).map_err(|e| format!("Failed to save image: {}", e))?;
-
-    Ok(path.display().to_string())
-}
-
-/// Generate an image and return the saved file path. Shared by the agent tool
-/// (`generate_image_impl`, which emits events and returns a status string) and the Studio
-/// image command (which needs the actual path).
+/// Generate an image into the Content library and return the saved file path
+/// (`generate_image_impl` wraps it for the agent tool: events + a status string).
 pub(crate) async fn generate_image_to_path(
     app: &AppHandle,
     state: &AppState,
@@ -1082,6 +1136,83 @@ pub(crate) async fn generate_image_impl(
     Ok("Image generated and saved to content folder.".to_string())
 }
 
+/// Where map searches are centered: the user's saved location (`user/location_coords`,
+/// set from Settings → Profile), if any.
+fn saved_location(state: &AppState) -> Option<crate::maps::LatLon> {
+    get_app_setting_value(state, "user/location_coords")
+        .ok()
+        .flatten()
+        .and_then(|v| crate::maps::parse_stored_coords(&v))
+}
+
+fn fmt_distance(m: f64) -> String {
+    if m < 1000.0 {
+        format!("{}m", m.round() as i64)
+    } else {
+        format!("{:.1}km", m / 1000.0)
+    }
+}
+
+fn fmt_duration(s: f64) -> String {
+    let min = (s / 60.0).round() as i64;
+    if min < 60 {
+        format!("{} min", min)
+    } else {
+        format!("{}h {}m", min / 60, min % 60)
+    }
+}
+
+/// Numbered list of places for the model, one line each.
+fn places_text(places: &[crate::maps::Place]) -> String {
+    let mut out = String::new();
+    for (i, p) in places.iter().enumerate() {
+        out.push_str(&format!("{}. {}", i + 1, p.display()));
+        if let Some(c) = &p.category {
+            out.push_str(&format!(" ({})", c));
+        }
+        if let Some(d) = p.distance_m {
+            out.push_str(&format!(" ~{}", fmt_distance(d)));
+        }
+        if let Some(phone) = &p.phone {
+            out.push_str(&format!(" · {}", phone));
+        }
+        out.push_str(&format!(" [{:.5}, {:.5}]\n", p.lat, p.lon));
+    }
+    out
+}
+
+/// Show a map card in the chat that ran the tool (chat.js draws it with an Apple Maps
+/// image) and save it with the chat, so reloading the chat draws it again.
+fn show_map_card(app: &AppHandle, state: &AppState, session_id: &str, kind: &str, payload: serde_json::Value) {
+    crate::db::add_session_card(state, session_id, kind, &payload);
+    let _ = app.emit(kind, payload);
+}
+
+fn emit_places(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    title: &str,
+    places: &[crate::maps::Place],
+    center: Option<&crate::maps::LatLon>,
+    query: &str,
+) {
+    show_map_card(
+        app,
+        state,
+        session_id,
+        "map-places",
+        serde_json::json!({
+            "session_id": session_id,
+            "query": title,
+            "results": places,
+            "maps_url": crate::maps::apple_maps_search_url(query, center),
+        }),
+    );
+}
+
+/// Find specific places by name or description ("Arriba's Mexican Grill", "LAX", "Home
+/// Depot near Escondido") with Apple Maps, biased toward the user's saved location.
 pub(crate) async fn search_places_impl(
     app: &AppHandle,
     state: &AppState,
@@ -1089,114 +1220,18 @@ pub(crate) async fn search_places_impl(
     query: &str,
     limit: usize,
 ) -> Result<String, String> {
-    let token = first_non_empty_setting(state, &["maps/mapbox_api_key"])
-        .map_err(|e| format!("DB error reading Mapbox key: {}", e))?
-        .ok_or_else(|| "Mapbox API key not configured. Add it in Settings.".to_string())?;
-
-    let limit = limit.min(10).max(1);
-
-    // Get user's stored location for proximity bias
-    let proximity = get_app_setting_value(state, "user/location_coords")
-        .ok().flatten().unwrap_or_default();
-    let proximity_param = if proximity.is_empty() { String::new() } else { format!("&proximity={}", proximity) };
-
-    // Use Mapbox Search Box API for POI/business search
-    let url = format!(
-        "https://api.mapbox.com/search/searchbox/v1/forward?q={}&limit={}&types=poi,address&country=US{}&access_token={}",
-        urlencoding::encode(query),
-        limit,
-        proximity_param,
-        urlencoding::encode(&token),
-    );
-
-    let resp = state
-        .http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Mapbox search request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_body = resp.text().await.unwrap_or_default();
-        return Err(format!("Mapbox search error {}: {}", status, err_body));
+    let near = saved_location(state);
+    let places = crate::maps::search(query, near.as_ref(), 50_000.0, limit.clamp(1, 10)).await?;
+    if places.is_empty() {
+        return Ok(format!("No places found for '{}'.", query));
     }
-
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Mapbox search response: {}", e))?;
-
-    let features = body
-        .get("features")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Unexpected Mapbox response format".to_string())?;
-
-    let mut results = Vec::new();
-    let mut out = String::new();
-    for (i, feat) in features.iter().enumerate() {
-        let props = feat.get("properties");
-        let name = props
-            .and_then(|p| p.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or("Unknown");
-        let address = props
-            .and_then(|p| p.get("full_address").or_else(|| p.get("place_formatted")))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let place_type = props
-            .and_then(|p| p.get("poi_category"))
-            .and_then(Value::as_str)
-            .unwrap_or("place");
-
-        let coords = feat.get("geometry")
-            .and_then(|g| g.get("coordinates"))
-            .and_then(Value::as_array);
-
-        let (lon, lat) = match coords {
-            Some(c) if c.len() >= 2 => {
-                let lon = c[0].as_f64();
-                let lat = c[1].as_f64();
-                match (lon, lat) {
-                    (Some(lo), Some(la)) => (lo, la),
-                    _ => continue,
-                }
-            }
-            _ => continue,
-        };
-
-        let display = if address.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}, {}", name, address)
-        };
-
-        results.push(serde_json::json!({
-            "name": display,
-            "lat": lat,
-            "lon": lon,
-            "type": place_type,
-        }));
-
-        out.push_str(&format!("{}. {} ({}) [{}, {}]\n", i + 1, display, place_type, lat, lon));
-    }
-
-    if results.is_empty() {
-        out = "No places found.".to_string();
-    }
-
-    let _ = app.emit(
-        "map-places",
-        serde_json::json!({
-            "session_id": session_id,
-            "query": query,
-            "results": results,
-        }),
-    );
-
-    Ok(out)
+    let center = places.first().map(|p| crate::maps::LatLon { lat: p.lat, lon: p.lon });
+    emit_places(app, state, session_id, query, &places, center.as_ref(), query);
+    Ok(places_text(&places))
 }
 
+/// Find places of a kind ("coffee", "mexican restaurant", "gas station") around a location:
+/// `near` when given, else the user's saved location.
 pub(crate) async fn search_nearby_impl(
     app: &AppHandle,
     state: &AppState,
@@ -1205,154 +1240,41 @@ pub(crate) async fn search_nearby_impl(
     near: Option<&str>,
     limit: usize,
 ) -> Result<String, String> {
-    let token = first_non_empty_setting(state, &["maps/mapbox_api_key"])
-        .map_err(|e| format!("DB error reading Mapbox key: {}", e))?
-        .ok_or_else(|| "Mapbox API key not configured. Add it in Settings.".to_string())?;
-
-    // Try saved coords first, then geocode the 'near' param, then fall back to user/location text
-    let proximity = if let Some(coords) = get_app_setting_value(state, "user/location_coords").ok().flatten() {
-        coords
-    } else if let Some(loc) = near {
-        let (lon, lat, _) = mapbox_geocode(state, &token, loc).await?;
-        format!("{},{}", lon, lat)
-    } else if let Some(loc) = get_app_setting_value(state, "user/location").ok().flatten() {
-        if loc.is_empty() {
-            return Err("Location not set. Add your location in Settings > Profile, or pass a 'near' parameter.".to_string());
+    // Older tool calls used Mapbox category ids like "mexican_restaurant".
+    let what = category.replace('_', " ");
+    let center = match near.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(place) => {
+            let p = crate::maps::geocode(place, saved_location(state).as_ref()).await?;
+            crate::maps::LatLon { lat: p.lat, lon: p.lon }
         }
-        let (lon, lat, _) = mapbox_geocode(state, &token, &loc).await?;
-        format!("{},{}", lon, lat)
-    } else {
-        return Err("Location not set. Add your location in Settings > Profile, or pass a 'near' parameter.".to_string());
+        None => match saved_location(state) {
+            Some(c) => c,
+            None => {
+                let typed = get_app_setting_value(state, "user/location").ok().flatten().unwrap_or_default();
+                if typed.trim().is_empty() {
+                    return Err("Location not set. Add your location in Settings > Profile, or pass a 'near' place.".to_string());
+                }
+                let p = crate::maps::geocode(&typed, None).await?;
+                crate::maps::LatLon { lat: p.lat, lon: p.lon }
+            }
+        },
     };
-
-    let limit = limit.min(25).max(1);
-
-    let url = format!(
-        "https://api.mapbox.com/search/searchbox/v1/category/{}?limit={}&proximity={}&country=US&access_token={}",
-        urlencoding::encode(category),
-        limit,
-        urlencoding::encode(&proximity),
-        urlencoding::encode(&token),
-    );
-
-    let resp = state.http.get(&url).send().await
-        .map_err(|e| format!("Mapbox category search failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_body = resp.text().await.unwrap_or_default();
-        return Err(format!("Mapbox category search error {}: {}", status, err_body));
+    let mut places = crate::maps::search(&what, Some(&center), 8_000.0, limit.clamp(1, 25)).await?;
+    if places.is_empty() {
+        return Ok(format!("No {} found nearby.", what));
     }
-
-    let body: Value = resp.json().await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    let features = body.get("features").and_then(Value::as_array)
-        .ok_or_else(|| "Unexpected response format".to_string())?;
-
-    let mut results = Vec::new();
-    let mut out = String::new();
-    for (i, feat) in features.iter().enumerate() {
-        let props = feat.get("properties");
-        let name = props.and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or("Unknown");
-        let address = props
-            .and_then(|p| p.get("full_address").or_else(|| p.get("place_formatted")))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let dist = props.and_then(|p| p.get("distance"))
-            .and_then(Value::as_f64);
-
-        let coords = feat.get("geometry")
-            .and_then(|g| g.get("coordinates"))
-            .and_then(Value::as_array);
-
-        let (lon, lat) = match coords {
-            Some(c) if c.len() >= 2 => match (c[0].as_f64(), c[1].as_f64()) {
-                (Some(lo), Some(la)) => (lo, la),
-                _ => continue,
-            },
-            _ => continue,
-        };
-
-        let display = if address.is_empty() { name.to_string() } else { format!("{}, {}", name, address) };
-        let dist_text = dist.map(|d| {
-            if d < 1000.0 { format!(" ~{}m", d as i64) } else { format!(" ~{:.1}km", d / 1000.0) }
-        }).unwrap_or_default();
-
-        results.push(serde_json::json!({ "name": display, "lat": lat, "lon": lon, "type": category }));
-        out.push_str(&format!("{}. {}{}\n", i + 1, display, dist_text));
-    }
-
-    if results.is_empty() {
-        out = format!("No {} found nearby.", category);
-    }
-
-    let _ = app.emit("map-places", serde_json::json!({
-        "session_id": session_id,
-        "query": format!("Nearby: {}", category),
-        "results": results,
-    }));
-
-    Ok(out)
+    places.sort_by(|a, b| {
+        a.distance_m
+            .unwrap_or(f64::MAX)
+            .partial_cmp(&b.distance_m.unwrap_or(f64::MAX))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    emit_places(app, state, session_id, &format!("Nearby: {}", what), &places, Some(&center), &what);
+    Ok(places_text(&places))
 }
 
-/// Geocode a single address using Mapbox Geocoding v6.
-/// Returns (lon, lat, display_name) or an error.
-async fn mapbox_geocode(
-    state: &AppState,
-    token: &str,
-    address: &str,
-) -> Result<(f64, f64, String), String> {
-    let url = format!(
-        "https://api.mapbox.com/search/geocode/v6/forward?q={}&limit=1&access_token={}",
-        urlencoding::encode(address),
-        urlencoding::encode(token),
-    );
-    let resp = state
-        .http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Mapbox geocoding request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_body = resp.text().await.unwrap_or_default();
-        return Err(format!("Mapbox geocoding error {}: {}", status, err_body));
-    }
-
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Mapbox geocoding response: {}", e))?;
-
-    let feat = body
-        .get("features")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .ok_or_else(|| format!("Could not geocode '{}'", address))?;
-
-    let coords = feat
-        .get("geometry")
-        .and_then(|g| g.get("coordinates"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("No coordinates for '{}'", address))?;
-
-    let lon = coords.first().and_then(Value::as_f64)
-        .ok_or_else(|| format!("Invalid longitude for '{}'", address))?;
-    let lat = coords.get(1).and_then(Value::as_f64)
-        .ok_or_else(|| format!("Invalid latitude for '{}'", address))?;
-
-    let name = feat
-        .get("properties")
-        .and_then(|p| p.get("full_address").or_else(|| p.get("name")))
-        .and_then(Value::as_str)
-        .unwrap_or(address)
-        .to_string();
-
-    Ok((lon, lat, name))
-}
-
+/// Directions between two places with Apple Maps: driving, walking, cycling, or transit
+/// (transit is a travel-time estimate only; cycling and transit only where Apple covers them).
 pub(crate) async fn get_directions_impl(
     app: &AppHandle,
     state: &AppState,
@@ -1361,120 +1283,49 @@ pub(crate) async fn get_directions_impl(
     to: &str,
     mode: Option<&str>,
 ) -> Result<String, String> {
-    let token = first_non_empty_setting(state, &["maps/mapbox_api_key"])
-        .map_err(|e| format!("DB error reading Mapbox key: {}", e))?
-        .ok_or_else(|| "Mapbox API key not configured. Add it in Settings.".to_string())?;
+    let route = crate::maps::directions(from, to, mode.unwrap_or("driving"), saved_location(state).as_ref()).await?;
 
-    // Geocode both endpoints
-    let (from_lon, from_lat, from_name) = mapbox_geocode(state, &token, from).await?;
-    let (to_lon, to_lat, to_name) = mapbox_geocode(state, &token, to).await?;
-
-    // Map mode to Mapbox profile
-    let profile = match mode.unwrap_or("driving") {
-        "walking" | "walk" | "foot" => "walking",
-        "cycling" | "cycle" | "bike" => "cycling",
-        _ => "driving",
-    };
-
-    // Get route from Mapbox Directions API
-    let route_url = format!(
-        "https://api.mapbox.com/directions/v5/mapbox/{}/{},{};{},{}?geometries=geojson&overview=full&steps=true&access_token={}",
-        profile, from_lon, from_lat, to_lon, to_lat, urlencoding::encode(&token),
-    );
-    let route_resp = state
-        .http
-        .get(&route_url)
-        .send()
-        .await
-        .map_err(|e| format!("Mapbox directions request failed: {}", e))?;
-
-    if !route_resp.status().is_success() {
-        let status = route_resp.status();
-        let err_body = route_resp.text().await.unwrap_or_default();
-        return Err(format!("Mapbox directions error {}: {}", status, err_body));
-    }
-
-    let route_body: Value = route_resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Mapbox directions response: {}", e))?;
-
-    let route = route_body
-        .get("routes")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .ok_or_else(|| "No route found".to_string())?;
-
-    let distance_m = route.get("distance").and_then(Value::as_f64).unwrap_or(0.0);
-    let duration_s = route.get("duration").and_then(Value::as_f64).unwrap_or(0.0);
-    let distance_km = distance_m / 1000.0;
-    let duration_min = duration_s / 60.0;
-
-    // Extract geometry coordinates (already [lon, lat] from Mapbox)
-    let geometry_coords = route
-        .get("geometry")
-        .and_then(|g| g.get("coordinates"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    // Extract step instructions (Mapbox provides full human-readable text)
-    let mut steps = Vec::new();
-    if let Some(legs) = route.get("legs").and_then(Value::as_array) {
-        for leg in legs {
-            if let Some(leg_steps) = leg.get("steps").and_then(Value::as_array) {
-                for step in leg_steps {
-                    let instruction = step
-                        .get("maneuver")
-                        .and_then(|m| m.get("instruction"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("Continue");
-                    let step_dist = step.get("distance").and_then(Value::as_f64).unwrap_or(0.0);
-
-                    steps.push(serde_json::json!({
-                        "instruction": instruction,
-                        "distance": step_dist as i64,
-                    }));
-                }
-            }
-        }
-    }
-
-    let _ = app.emit(
+    show_map_card(
+        app,
+        state,
+        session_id,
         "map-route",
         serde_json::json!({
             "session_id": session_id,
-            "from": from_name,
-            "to": to_name,
-            "distance_km": distance_km,
-            "duration_min": duration_min,
-            "geometry": geometry_coords,
-            "steps": steps,
+            "from": route.from.display(),
+            "to": route.to.display(),
+            "from_point": {"lat": route.from.lat, "lon": route.from.lon},
+            "to_point": {"lat": route.to.lat, "lon": route.to.lon},
+            "mode": route.mode,
+            "distance_km": route.distance_m / 1000.0,
+            "duration_min": route.duration_s / 60.0,
+            "polyline": route.polyline,
+            "steps": route.steps.iter().map(|s| serde_json::json!({
+                "instruction": s.instruction,
+                "distance": s.distance_m.round() as i64,
+            })).collect::<Vec<_>>(),
+            "note": route.note,
+            "maps_url": crate::maps::apple_maps_directions_url(&route),
         }),
     );
 
-    // Build text summary for LLM
-    let dist_text = if distance_km < 1.0 {
-        format!("{}m", (distance_km * 1000.0) as i64)
-    } else {
-        format!("{:.1}km", distance_km)
-    };
-    let dur_text = if duration_min < 60.0 {
-        format!("{} min", duration_min as i64)
-    } else {
-        format!("{}h {}m", (duration_min / 60.0) as i64, (duration_min % 60.0) as i64)
-    };
-
     let mut out = format!(
-        "Directions ({}) from {} to {}\nDistance: {} | Duration: {}\n\nSteps:\n",
-        profile, from_name, to_name, dist_text, dur_text
+        "Directions ({}) from {} to {}\nDistance: {} | Duration: {}\n",
+        route.mode,
+        route.from.display(),
+        route.to.display(),
+        fmt_distance(route.distance_m),
+        fmt_duration(route.duration_s)
     );
-    for (i, step) in steps.iter().enumerate() {
-        let instr = step.get("instruction").and_then(Value::as_str).unwrap_or("");
-        let dist = step.get("distance").and_then(Value::as_i64).unwrap_or(0);
-        out.push_str(&format!("{}. {} ({}m)\n", i + 1, instr, dist));
+    if let Some(note) = &route.note {
+        out.push_str(&format!("Note: {}\n", note));
     }
-
+    if !route.steps.is_empty() {
+        out.push_str("\nSteps:\n");
+        for (i, step) in route.steps.iter().enumerate() {
+            out.push_str(&format!("{}. {} ({})\n", i + 1, step.instruction, fmt_distance(step.distance_m)));
+        }
+    }
     Ok(out)
 }
 
@@ -1532,13 +1383,11 @@ pub(crate) fn read_file_range_scoped(
     Ok(out)
 }
 
-/// Cap merged git/command output the same way `run_command_scoped_unchecked` does.
-fn cap_command_output(mut merged: String) -> String {
-    if merged.len() > 12000 {
-        merged.truncate(12000);
-        merged.push_str("\n...[truncated]");
-    }
-    merged
+/// Cap merged git/command output for the model the same way `run_command` output is capped
+/// (`procs`): head and tail kept, the middle elided — errors and summaries are usually at the
+/// end. Counts characters, so multi-byte text is never cut mid-character.
+fn cap_command_output(merged: String) -> String {
+    crate::procs::cap_middle(&merged, crate::procs::OUTPUT_CAP_CHARS)
 }
 
 /// Run `git` with an explicit argv inside the workspace root. Never interpolates args into a
@@ -2027,40 +1876,7 @@ pub(crate) async fn execute_agent_tool(
     }
 
     // Alias mapping first, then check enabled
-    let tool_name = match tool_name {
-        "shell" | "bash" | "zsh" => "run_command",
-        "cat" | "read" => "read_file",
-        "write" | "save" => "write_file",
-        "edit" | "str_replace" | "replace" => "edit_file",
-        "append" | "append_to_file" => "append_file",
-        "screenshot" | "screen_capture" | "take_screenshot" => "capture_screen",
-        "launch_app" | "open_application" | "activate_app" => "open_app",
-        "ls" | "dir" => "list_files",
-        "grep" | "rg" | "find" => "search_files",
-        "search" | "brave" | "brave_search" => "web_search",
-        "fetch" | "curl" | "wget" => "web_fetch",
-        "imagine" | "image" | "draw" => "generate_image",
-        "video_info" => "probe_video",
-        "transcribe_video" => "analyze_video",
-        "cut_video" | "trim_video" | "render_video" => "edit_video",
-        "places" | "find_places" => "search_places",
-        "nearby" | "around_me" => "search_nearby",
-        "directions" | "route" | "navigate" => "get_directions",
-        "diff" => "git_diff",
-        "commit" => "git_commit",
-        "outline" => "code_outline",
-        "references" | "refs" => "find_references",
-        "http" | "http_fetch" => "http_request",
-        "test" | "tests" => "run_tests",
-        "skills" | "load_skill" | "use_skill" => "skill",
-        "delegate" | "spawn_subagent" | "task_agent" => "subagent",
-        "get_setting" | "list_settings" | "read_settings" => "get_settings",
-        "update_setting" | "change_setting" | "set_settings" => "set_setting",
-        "theme" | "change_theme" => "set_theme",
-        "models" | "fetch_models" => "list_models",
-        "test_connection" | "test_model" => "test_llm_connection",
-        other => other,
-    };
+    let tool_name = canonical_tool_name(tool_name);
 
     let is_enabled = enabled.contains(tool_name)
         || (tool_name == "search_nearby" && enabled.contains("search_places"));
@@ -2091,9 +1907,17 @@ pub(crate) async fn execute_agent_tool(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing command".to_string())?;
             let cwd = arguments.get("cwd").and_then(Value::as_str);
+            let timeout_secs = arg_u64(arguments, "timeout_secs")
+                .unwrap_or(crate::procs::DEFAULT_TIMEOUT_SECS)
+                .clamp(1, crate::procs::MAX_TIMEOUT_SECS);
+            let background = arg_bool(arguments, "background");
+            if background && !interactive {
+                // Nothing would ever stop a server started by a scheduled task or subagent.
+                return Err("background: true is only available in interactive chat. Run the command in the foreground (optionally with timeout_secs) instead.".to_string());
+            }
             let safety = is_dangerous_command(command);
             if !safety.dangerous {
-                run_command_scoped_unchecked(&effective_scope, command, cwd)
+                exec_agent_command(state, session_id, &effective_scope, command, cwd, timeout_secs, background).await
             } else if !interactive {
                 // Scheduled / background runs have no user to ask — hard block.
                 Err(format!(
@@ -2116,7 +1940,7 @@ pub(crate) async fn execute_agent_tool(
                 )
                 .await?;
                 if answer.trim().eq_ignore_ascii_case("run it") {
-                    run_command_scoped_unchecked(&effective_scope, command, cwd)
+                    exec_agent_command(state, session_id, &effective_scope, command, cwd, timeout_secs, background).await
                 } else {
                     Err(format!(
                         "The user declined to run this command (answered: {}). Do not retry it; choose a safer approach or ask the user what to do instead.",
@@ -2144,7 +1968,7 @@ pub(crate) async fn execute_agent_tool(
                             &format!("ALLOW: {}", note),
                             "ok",
                         );
-                        let out = run_command_scoped_unchecked(&effective_scope, command, cwd)?;
+                        let out = exec_agent_command(state, session_id, &effective_scope, command, cwd, timeout_secs, background).await?;
                         Ok(format!("[auto-verified: {}]\n{}", note, out))
                     }
                     crate::llm::CommandVerdict::Deny(note) => {
@@ -2192,7 +2016,7 @@ pub(crate) async fn execute_agent_tool(
                         .await;
                         match answer {
                             Ok(a) if a.trim().eq_ignore_ascii_case("run it") => {
-                                run_command_scoped_unchecked(&effective_scope, command, cwd)
+                                exec_agent_command(state, session_id, &effective_scope, command, cwd, timeout_secs, background).await
                             }
                             Ok(a) => Err(format!(
                                 "The user declined to run this command (answered: {}). Do not retry it; choose a safer approach or ask the user what to do instead.",
@@ -2244,7 +2068,26 @@ pub(crate) async fn execute_agent_tool(
                 .ok_or_else(|| "missing path".to_string())?;
             let start_line = arguments.get("start_line").and_then(Value::as_u64).map(|v| v as usize);
             let end_line = arguments.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
-            read_file_range_scoped(&effective_scope, path, start_line, end_line)
+            // Image files are shown to the model as an image rather than returned as
+            // (garbled) text. Same workspace boundary as a text read; the image rides the
+            // per-session side channel that capture_screen uses.
+            let image_path = if start_line.is_none() && end_line.is_none() {
+                resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)
+                    .ok()
+                    .filter(|p| crate::screen::image_kind(p).is_some() && p.is_file())
+            } else {
+                None
+            };
+            match image_path {
+                Some(resolved) => {
+                    let (media_type, data, note) = crate::screen::load_image_for_model(&resolved)?;
+                    if let Ok(mut map) = state.captured_images.lock() {
+                        map.entry(session_id.to_string()).or_default().push((media_type, data));
+                    }
+                    Ok(note)
+                }
+                None => read_file_range_scoped(&effective_scope, path, start_line, end_line),
+            }
         }
         "write_file" => {
             let path = arguments
@@ -2302,7 +2145,17 @@ pub(crate) async fn execute_agent_tool(
         }
         "capture_screen" => {
             let mode = arguments.get("mode").and_then(Value::as_str).unwrap_or("screen");
-            let (media_type, data, note) = crate::screen::capture_screen(mode)?;
+            let target_app = arguments
+                .get("app")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|a| !a.is_empty());
+            // With `app`, grab that app's window where it sits (even behind other windows)
+            // instead of whatever is frontmost — no focus change, nothing moves on screen.
+            let (media_type, data, note) = match target_app {
+                Some(name) => crate::screen::capture_app_window(name)?,
+                None => crate::screen::capture_screen(mode)?,
+            };
             // Stash the image on the per-session side channel; the chat loop attaches it to
             // this tool_result so the vision model can see it (tool dispatch returns text only).
             if let Ok(mut map) = state.captured_images.lock() {
@@ -2310,7 +2163,7 @@ pub(crate) async fn execute_agent_tool(
                     .or_default()
                     .push((media_type.clone(), data.clone()));
             }
-            // Surface the screenshot to any open UI (desktop chat tile + paired phones) so the
+            // Surface the screenshot in the chat tile so the
             // user can see what the model was shown. The base64 may be a few MB — acceptable.
             let _ = app.emit(
                 "screen-captured",
@@ -2329,7 +2182,158 @@ pub(crate) async fn execute_agent_tool(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing app".to_string())?;
             let url = arguments.get("url").and_then(Value::as_str);
-            crate::screen::open_app(app_name, url)
+            crate::screen::open_app(app_name, url, arg_bool(arguments, "background"))
+        }
+        "capture_page" => {
+            let target = arguments
+                .get("url")
+                .or_else(|| arguments.get("path"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing url".to_string())?;
+            let url = resolve_page_target(&effective_scope, target)?;
+            let width = arg_u64(arguments, "width").unwrap_or(1280).clamp(320, 2560) as u32;
+            let height = arg_u64(arguments, "height").unwrap_or(800).clamp(240, 4000) as u32;
+            let wait_ms = arg_u64(arguments, "wait_ms").unwrap_or(3000).clamp(0, 20_000);
+            let capture = crate::browser::capture_page(&url, width, height, wait_ms).await?;
+            if let Some((media_type, data)) = capture.image {
+                // Nothing appeared on the user's screen, so show them in the chat what the
+                // model was shown (the same event the chat tile renders
+                // for capture_screen).
+                let _ = app.emit(
+                    "screen-captured",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "media_type": media_type,
+                        "data": data,
+                        "note": format!("Headless capture of {} ({}x{})", target, width, height),
+                    }),
+                );
+                if let Ok(mut map) = state.captured_images.lock() {
+                    map.entry(session_id.to_string()).or_default().push((media_type, data));
+                }
+            }
+            Ok(capture.report)
+        }
+        "create_pdf" => {
+            let html = arguments.get("html").and_then(Value::as_str).filter(|h| !h.trim().is_empty());
+            let target = arguments
+                .get("path")
+                .or_else(|| arguments.get("url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty());
+            let resolved_url;
+            let source = match (html, target) {
+                (Some(h), None) => crate::browser::PdfSource::Html(h),
+                (None, Some(t)) => {
+                    resolved_url = resolve_page_target(&effective_scope, t)?;
+                    crate::browser::PdfSource::Url(&resolved_url)
+                }
+                (Some(_), Some(_)) => return Err("pass either html or path/url, not both".to_string()),
+                (None, None) => {
+                    return Err("pass html (a complete HTML document) or the path/url of a page to print".to_string())
+                }
+            };
+            let wait_ms = arg_u64(arguments, "wait_ms").unwrap_or(1000).clamp(0, 20_000);
+            let title = html.and_then(html_title);
+            let (out, in_content) = match arguments.get("output_path").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()) {
+                Some(p) => {
+                    if !p.to_ascii_lowercase().ends_with(".pdf") {
+                        return Err("output_path must end in .pdf".to_string());
+                    }
+                    (resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, p, true)?, false)
+                }
+                None => {
+                    let name = arguments
+                        .get("filename")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or(title)
+                        .unwrap_or_else(|| "document".to_string());
+                    (unique_path(&content_dir(app)?, &pdf_file_name(&name)), true)
+                }
+            };
+            let pdf = crate::browser::print_pdf(source, &out, wait_ms).await?;
+            if in_content {
+                let _ = app.emit("content-changed", ());
+            }
+            // Show it in the chat right away (chat.js renders an inline viewer). Reloaded
+            // chats rebuild the same card from this tool's logged output.
+            let _ = app.emit(
+                "pdf-created",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "path": out.display().to_string(),
+                    "pages": pdf.pages,
+                    "bytes": pdf.bytes,
+                }),
+            );
+            Ok(format!(
+                "Saved a {}-page PDF ({} KB) to {}{}.{}",
+                pdf.pages,
+                pdf.bytes / 1024,
+                out.display(),
+                if in_content { " (in the Content library)" } else { "" },
+                pdf.blocked_note
+            ))
+        }
+        "process" => {
+            let action = arguments.get("action").and_then(Value::as_str).unwrap_or("list");
+            let need_id = || {
+                arg_u64(arguments, "id")
+                    .map(|v| v as u32)
+                    .ok_or_else(|| "missing id (the number run_command returned when it started the process)".to_string())
+            };
+            match action {
+                "list" => Ok(state.bg_processes.list(session_id)),
+                "output" | "read" | "logs" | "status" => {
+                    let id = need_id()?;
+                    let wait_for = arguments
+                        .get("wait_for")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|w| !w.is_empty());
+                    let mut waited_note = String::new();
+                    if let Some(needle) = wait_for {
+                        let wait_secs = arg_u64(arguments, "wait_secs").unwrap_or(30).clamp(1, 120);
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+                        let mut scanned = 0u64;
+                        loop {
+                            let (found, running) = state.bg_processes.log_contains(session_id, id, needle, &mut scanned)?;
+                            if found {
+                                waited_note = format!("Found \"{}\" in the output.\n", needle);
+                                break;
+                            }
+                            if !running {
+                                waited_note = format!("The process exited before \"{}\" appeared.\n", needle);
+                                break;
+                            }
+                            if stop_requested_peek(state, session_id) {
+                                waited_note = "Stopped waiting (the user pressed Stop).\n".to_string();
+                                break;
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                waited_note = format!(
+                                    "Waited {}s but \"{}\" has not appeared in the output yet.\n",
+                                    wait_secs, needle
+                                );
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                    }
+                    let view = state.bg_processes.view(session_id, id, 6000)?;
+                    Ok(format!(
+                        "{}Process {} is {}.\nOutput:\n{}",
+                        waited_note,
+                        id,
+                        view.status,
+                        if view.output.trim().is_empty() { "(no output yet)" } else { view.output.as_str() }
+                    ))
+                }
+                "stop" | "kill" => state.bg_processes.stop(session_id, need_id()?, 3000),
+                other => Err(format!("unknown process action '{}' (use list, output or stop)", other)),
+            }
         }
         "list_files" => {
             let path = arguments
@@ -2387,224 +2391,6 @@ pub(crate) async fn execute_agent_tool(
                 .ok_or_else(|| "missing prompt".to_string())?;
             let style = arguments.get("style").and_then(Value::as_str);
             generate_image_impl(app, state, session_id, prompt, style).await
-        }
-        "probe_video" => {
-            let path = arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing path".to_string())?;
-            let resolved =
-                resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)?;
-            let probe = crate::video::probe_video(&resolved)?;
-            serde_json::to_string_pretty(&probe).map_err(|e| e.to_string())
-        }
-        "analyze_video" => {
-            let path = arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing path".to_string())?;
-            let transcribe = arguments.get("transcribe").and_then(Value::as_bool).unwrap_or(true);
-            let resolved =
-                resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)?;
-            let probe = crate::video::probe_video(&resolved)?;
-            let silences = crate::video::detect_silences(&resolved, -35.0, 0.6)?;
-            let suggested = crate::video::keep_segments(probe.duration_s, &silences, 0.15);
-
-            let mut out = format!(
-                "Video: {:.1}s, {}x{}, {:.0} fps, audio: {}\n",
-                probe.duration_s, probe.width, probe.height, probe.fps,
-                if probe.has_audio { "yes" } else { "no" }
-            );
-            if silences.is_empty() {
-                out.push_str("No silences detected (≥0.6s below -35dB).\n");
-            } else {
-                out.push_str("Silences (source seconds):\n");
-                for s in silences.iter().take(100) {
-                    out.push_str(&format!("  {:.2}–{:.2}\n", s.start, s.end));
-                }
-                out.push_str("Suggested keep-segments (silences removed, padded 0.15s):\n");
-                for s in &suggested {
-                    out.push_str(&format!("  {:.2}–{:.2}\n", s.start, s.end));
-                }
-            }
-            if transcribe && probe.has_audio {
-                match crate::video::transcribe_video(state, &resolved).await {
-                    Ok(t) => {
-                        let filler_ranges = crate::video::detect_filler_words(&t);
-                        if filler_ranges.is_empty() {
-                            out.push_str("No filler words/stutters detected.\n");
-                        } else {
-                            out.push_str(&format!(
-                                "Filler words/stutters detected ({} found, source seconds):\n",
-                                filler_ranges.len()
-                            ));
-                            for f in filler_ranges.iter().take(100) {
-                                out.push_str(&format!("  {:.2}–{:.2}\n", f.start, f.end));
-                            }
-                            let combined =
-                                crate::video::combined_keep_segments(probe.duration_s, &silences, &filler_ranges, 0.15);
-                            out.push_str("Suggested keep-segments (silences + fillers removed, padded 0.15s):\n");
-                            for s in &combined {
-                                out.push_str(&format!("  {:.2}–{:.2}\n", s.start, s.end));
-                            }
-                        }
-                        out.push_str("Transcript (source seconds):\n");
-                        let mut budget = 0usize;
-                        for seg in &t.segments {
-                            let line = format!("  [{:.1}–{:.1}] {}\n", seg.start, seg.end, seg.text);
-                            budget += line.len();
-                            if budget > 30_000 {
-                                out.push_str("  … (transcript truncated)\n");
-                                break;
-                            }
-                            out.push_str(&line);
-                        }
-                    }
-                    Err(e) => out.push_str(&format!("Transcript unavailable: {e}\n")),
-                }
-            }
-            Ok(out)
-        }
-        "edit_video" => {
-            let path = arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing path".to_string())?;
-            let resolved =
-                resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)?;
-            // The plan fields live flat in the tool arguments; serde ignores `path`.
-            let mut plan: crate::video::EditPlan = serde_json::from_value(arguments.clone())
-                .map_err(|e| format!("invalid edit plan: {e}"))?;
-            // SAFETY BOUNDARY: every insert source an agent supplies is an arbitrary path, so
-            // each MUST be re-resolved through the workspace scope (rejecting escapes) and
-            // rewritten to its canonical in-workspace path before it ever reaches the renderer.
-            // The studio command path (commands/video.rs) is user-picked and stays unscoped.
-            for seg in &mut plan.segments {
-                if let Some(src) = seg.source.as_ref() {
-                    let resolved = resolve_within_workspace(
-                        &effective_scope.root,
-                        &effective_scope.root_canon,
-                        src,
-                        false,
-                    )?;
-                    seg.source = Some(resolved.to_string_lossy().to_string());
-                }
-            }
-            // Burned captions need a transcript — transcribe on-demand before rendering.
-            let transcript = if plan.captions {
-                Some(crate::video::transcribe_video(state, &resolved).await.map_err(|e| {
-                    format!("captions were requested but transcription failed: {e}")
-                })?)
-            } else {
-                None
-            };
-            let prefer_hw_encode = crate::video::hw_encode_preferred(state);
-            let out_dir = content_dir(app)?;
-            let job_id = format!("agent-{session_id}");
-            let app_clone = app.clone();
-            let out = tauri::async_runtime::spawn_blocking(move || {
-                let transcripts = crate::video::TranscriptMap::from_single(transcript.as_ref());
-                crate::video::render_edit(
-                    &app_clone,
-                    &job_id,
-                    &resolved,
-                    &plan,
-                    &transcripts,
-                    &out_dir,
-                    prefer_hw_encode,
-                )
-            })
-            .await
-            .map_err(|e| e.to_string())??;
-            let _ = app.emit("content-changed", ());
-            Ok(format!(
-                "Rendered edit saved to {} (visible in the Content library).",
-                out.display()
-            ))
-        }
-        "generate_shorts" => {
-            let path = arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing path".to_string())?;
-            // SAFETY BOUNDARY: agent-supplied path must be resolved through the workspace scope.
-            let resolved =
-                resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, path, false)?;
-            let count = arguments.get("count").and_then(Value::as_u64).unwrap_or(3) as u32;
-            let duration_hint_s = arguments.get("duration_s").and_then(Value::as_f64);
-            let brief = arguments.get("brief").and_then(Value::as_str);
-            // Background/scheduled runs must work: this pipeline never calls ask_user — it only
-            // transcribes + renders, so it's safe unattended. Job id is namespaced per session.
-            let job_id = format!("agent-shorts-{session_id}");
-            let results = crate::video::run_shorts_pipeline(
-                app,
-                state,
-                &resolved,
-                count,
-                duration_hint_s,
-                brief,
-                &job_id,
-                true,  // captions on by default for social clips
-                false, // keep the polish pass
-            )
-            .await?;
-            if results.is_empty() {
-                return Ok("No shorts were produced (the video may have no clear highlight moments).".to_string());
-            }
-            let mut out = format!("Generated {} short{}:\n", results.len(), if results.len() == 1 { "" } else { "s" });
-            for r in &results {
-                out.push_str(&format!("- \"{}\" ({:.0}s) → {}\n", r.title, r.duration_s, r.path));
-            }
-            Ok(out.trim_end().to_string())
-        }
-        "compile_videos" => {
-            let raw_paths = arguments
-                .get("paths")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "missing paths (an array of 2–10 clip paths)".to_string())?;
-            if raw_paths.len() < 2 {
-                return Err("compile_videos needs at least 2 clips".to_string());
-            }
-            if raw_paths.len() > 10 {
-                return Err("compile_videos takes at most 10 clips".to_string());
-            }
-            // SAFETY BOUNDARY: every clip path an agent supplies is arbitrary, so EACH one MUST be
-            // resolved through the workspace scope (rejecting escapes) and rewritten to its
-            // canonical in-workspace path before it ever reaches the compile pipeline / renderer.
-            let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(raw_paths.len());
-            for p in raw_paths {
-                let p = p.as_str().ok_or_else(|| "each entry in paths must be a string".to_string())?;
-                let resolved =
-                    resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, p, false)?;
-                paths.push(resolved);
-            }
-            let brief = arguments.get("brief").and_then(Value::as_str);
-            let mode = arguments.get("mode").and_then(Value::as_str).unwrap_or("auto");
-            let target_duration_s = arguments.get("target_duration_s").and_then(Value::as_f64);
-            // Background/scheduled runs must work: this pipeline never calls ask_user — it only
-            // transcribes, plans, and renders, so it's safe unattended. Job id is per session.
-            let job_id = format!("agent-compile-{session_id}");
-            let result = crate::video::run_compile_pipeline(
-                app,
-                state,
-                &paths,
-                brief,
-                mode,
-                target_duration_s,
-                true,  // captions on by default
-                false, // keep the polish pass
-                &job_id,
-            )
-            .await?;
-            Ok(format!(
-                "Compiled {} clips into \"{}\" ({} mode, {:.0}s) → {}\n{}",
-                paths.len(),
-                result.title,
-                result.mode_detected,
-                result.duration_s,
-                result.path,
-                result.notes
-            ))
         }
         "search_places" => {
             let query = arguments
@@ -3356,6 +3142,46 @@ fn validate_task_skill(state: &AppState, args: &Value) -> Result<Option<String>,
     Ok(Some(skill.meta.name))
 }
 
+/// The built-in tool a model-invented name refers to (`"bash"` → `run_command`, ...), or the
+/// name itself. The one alias table — both native tool calls and the fenced-code fallback
+/// resolve through it.
+pub(crate) fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "shell" | "bash" | "zsh" => "run_command",
+        "cat" | "read" => "read_file",
+        "write" | "save" => "write_file",
+        "edit" | "str_replace" | "replace" => "edit_file",
+        "append" | "append_to_file" => "append_file",
+        "screenshot" | "screen_capture" | "take_screenshot" => "capture_screen",
+        "screenshot_page" | "capture_url" | "preview_page" | "screenshot_url" => "capture_page",
+        "pdf" | "make_pdf" | "html_to_pdf" | "print_pdf" | "export_pdf" => "create_pdf",
+        "processes" | "background_process" | "background_processes" => "process",
+        "launch_app" | "open_application" | "activate_app" => "open_app",
+        "ls" | "dir" => "list_files",
+        "grep" | "rg" | "find" => "search_files",
+        "search" | "brave" | "brave_search" => "web_search",
+        "fetch" | "curl" | "wget" => "web_fetch",
+        "imagine" | "image" | "draw" => "generate_image",
+        "places" | "find_places" => "search_places",
+        "nearby" | "around_me" => "search_nearby",
+        "directions" | "route" | "navigate" => "get_directions",
+        "diff" => "git_diff",
+        "commit" => "git_commit",
+        "outline" => "code_outline",
+        "references" | "refs" => "find_references",
+        "http" | "http_fetch" => "http_request",
+        "test" | "tests" => "run_tests",
+        "skills" | "load_skill" | "use_skill" => "skill",
+        "delegate" | "spawn_subagent" | "task_agent" => "subagent",
+        "get_setting" | "list_settings" | "read_settings" => "get_settings",
+        "update_setting" | "change_setting" | "set_settings" => "set_setting",
+        "theme" | "change_theme" => "set_theme",
+        "models" | "fetch_models" => "list_models",
+        "test_connection" | "test_model" => "test_llm_connection",
+        other => other,
+    }
+}
+
 pub(crate) fn parse_tool_code_block(text: &str) -> Option<(String, String)> {
     let start = text.find("<tool_code>")?;
     let end = text.find("</tool_code>")?;
@@ -3367,24 +3193,7 @@ pub(crate) fn parse_tool_code_block(text: &str) -> Option<(String, String)> {
     let tool_name_raw = inner[tool_start..].trim().trim_matches('\'');
     let args = inner[args_start..].trim().trim_matches('\'').trim();
 
-    let tool_name = match tool_name_raw {
-        "shell" | "bash" | "zsh" => "run_command",
-        "cat" | "read" => "read_file",
-        "write" | "save" => "write_file",
-        "edit" | "str_replace" | "replace" => "edit_file",
-        "append" | "append_to_file" => "append_file",
-        "screenshot" | "screen_capture" | "take_screenshot" => "capture_screen",
-        "launch_app" | "open_application" | "activate_app" => "open_app",
-        "ls" | "dir" => "list_files",
-        "grep" | "rg" | "find" => "search_files",
-        "search" | "brave" | "brave_search" => "web_search",
-        "fetch" | "curl" | "wget" => "web_fetch",
-        "imagine" | "image" | "draw" => "generate_image",
-        "places" | "find_places" => "search_places",
-        "nearby" | "around_me" => "search_nearby",
-        "directions" | "route" | "navigate" => "get_directions",
-        other => other,
-    };
+    let tool_name = canonical_tool_name(tool_name_raw);
 
     Some((tool_name.to_string(), args.to_string()))
 }
@@ -3495,6 +3304,26 @@ pub(crate) fn list_content_files(dir: &Path) -> Result<Vec<MediaItemRecord>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_names_titles_and_unique_paths() {
+        assert_eq!(pdf_file_name("Q3 Report: Sales / Ops"), "Q3-Report-Sales-Ops.pdf");
+        assert_eq!(pdf_file_name("invoice.pdf"), "invoice.pdf");
+        assert_eq!(pdf_file_name("../../etc/passwd"), "etc-passwd.pdf");
+        assert_eq!(pdf_file_name("   "), "document.pdf");
+        assert_eq!(html_title("<html><head><TITLE> My  Deck </TITLE>").as_deref(), Some("My Deck"));
+        assert_eq!(html_title("<p>no title</p>"), None);
+
+        let dir = std::env::temp_dir().join(format!("muninn-unique-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(unique_path(&dir, "a.pdf"), dir.join("a.pdf"));
+        std::fs::write(dir.join("a.pdf"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "a.pdf"), dir.join("a-2.pdf"));
+        std::fs::write(dir.join("a-2.pdf"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "a.pdf"), dir.join("a-3.pdf"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // ---- is_dangerous_command ----
 
@@ -3685,6 +3514,69 @@ mod tests {
         fs::write(root.join("a.txt"), "hi").unwrap();
         let resolved = resolve_within_workspace(&root, &canon, "a.txt", false).unwrap();
         assert!(resolved.starts_with(&canon));
+    }
+
+    #[test]
+    fn page_target_allows_loopback_public_and_workspace_files_only() {
+        let (root, root_canon) = test_workspace("page-target");
+        fs::create_dir_all(root.join("site dir")).unwrap();
+        fs::write(root.join("site dir").join("index.html"), "<h1>hi</h1>").unwrap();
+        let scope = WorkspaceScope { root: root.clone(), root_canon: root_canon.clone() };
+        let ok = |t: &str| resolve_page_target(&scope, t);
+
+        // Local dev servers are the point of the tool.
+        assert_eq!(ok("http://localhost:5173/app?x=1").unwrap(), "http://localhost:5173/app?x=1");
+        assert!(ok("http://127.0.0.1:3000").is_ok());
+        assert!(ok("http://[::1]:8080/").is_ok());
+        assert!(ok("http://app.localhost:1420").is_ok());
+        assert!(ok("https://example.com/docs").is_ok());
+
+        // Private-network, link-local/metadata and odd loopback spellings stay blocked.
+        assert!(ok("http://192.168.1.1/").is_err());
+        assert!(ok("http://10.0.0.5:8080/").is_err());
+        assert!(ok("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(ok("http://0.0.0.0:8000/").is_err());
+        assert!(ok("http://localhost.evil.com@10.0.0.1/").is_err());
+
+        // No other schemes.
+        for bad in ["file:///etc/passwd", "chrome://settings", "javascript:alert(1)", "data:text/html,x", "view-source:http://localhost"] {
+            assert!(ok(bad).is_err(), "{} should be refused", bad);
+        }
+        assert!(ok("").is_err());
+        assert!(ok("http://local host/").is_err());
+
+        // Workspace files become file:// URLs (percent-encoded); nothing outside the root.
+        let url = ok("site dir/index.html").unwrap();
+        assert!(url.starts_with("file:///"), "got {}", url);
+        assert!(url.ends_with("/site%20dir/index.html"), "got {}", url);
+        assert!(ok("../../etc/hosts").is_err());
+        assert!(ok("/etc/hosts").is_err());
+        assert!(ok("missing.html").is_err());
+        assert!(ok("site dir").is_err(), "a directory is not a page");
+    }
+
+    #[test]
+    fn tool_args_tolerate_stringly_typed_values() {
+        let args = serde_json::json!({"a": 30, "b": "45", "c": 2.0, "d": "x", "t": true, "u": "TRUE", "f": "no"});
+        assert_eq!(arg_u64(&args, "a"), Some(30));
+        assert_eq!(arg_u64(&args, "b"), Some(45));
+        assert_eq!(arg_u64(&args, "c"), Some(2));
+        assert_eq!(arg_u64(&args, "d"), None);
+        assert_eq!(arg_u64(&args, "missing"), None);
+        assert!(arg_bool(&args, "t"));
+        assert!(arg_bool(&args, "u"));
+        assert!(!arg_bool(&args, "f"));
+        assert!(!arg_bool(&args, "missing"));
+    }
+
+    #[test]
+    fn run_command_reports_exit_code_and_scopes_cwd() {
+        let (root, root_canon) = test_workspace("run-cmd");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let scope = WorkspaceScope { root: root.clone(), root_canon };
+        let out = run_command_scoped_unchecked(&scope, "basename \"$PWD\"; false", Some("sub")).unwrap();
+        assert_eq!(out, "sub\n[exit code 1]");
+        assert!(run_command_scoped_unchecked(&scope, "pwd", Some("../..")).is_err());
     }
 
     #[test]

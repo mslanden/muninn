@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 15;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -23,6 +23,17 @@ fn set_schema_version(conn: &Connection, version: i64) -> Result<(), String> {
 /// applied (installs that predate schema versioning are at unknown intermediate states).
 /// Any other failure is a real migration error and is propagated instead of being
 /// silently swallowed.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        params![name],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|r| r.is_some())
+    .map_err(|e| e.to_string())
+}
+
 fn exec_migration(conn: &Connection, sql: &str) -> Result<(), String> {
     match conn.execute(sql, []) {
         Ok(_) => Ok(()),
@@ -53,16 +64,8 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
             // reload; hidden=1 marks intermediate tool rounds replayed to the model only.
             "ALTER TABLE messages ADD COLUMN content_json TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE messages ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE entities ADD COLUMN aliases_json TEXT NOT NULL DEFAULT '[]'",
-            // Note: ALTER TABLE ADD COLUMN can't use CURRENT_TIMESTAMP (non-constant
-            // default) — the pre-versioning code tried and silently failed forever.
-            "ALTER TABLE entities ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN identity TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN personality TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN goals TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN preferences TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN current_state TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN patterns TEXT NOT NULL DEFAULT ''",
+            // (Columns once added here to the old entities / memory_profile tables are gone:
+            // v15 drops those tables, and init_db no longer creates them.)
             "ALTER TABLE tasks ADD COLUMN completed_at TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN result TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0",
@@ -73,13 +76,8 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
             "ALTER TABLE tasks ADD COLUMN schedule_config TEXT NOT NULL DEFAULT ''",
             // Rename legacy projects.spino_md → agents_md for pre-rename DBs.
             "ALTER TABLE projects RENAME COLUMN spino_md TO agents_md",
-            "ALTER TABLE ai_feeds ADD COLUMN schedule_config TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE ai_feeds ADD COLUMN next_run TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE ai_feed_items ADD COLUMN image_url TEXT NOT NULL DEFAULT ''",
-            // Lazily-generated full AI article for a feed item (empty until requested).
-            "ALTER TABLE ai_feed_items ADD COLUMN article TEXT NOT NULL DEFAULT ''",
-            // Clear old remote http:// image URLs that can't load due to ATS.
-            "UPDATE ai_feed_items SET image_url = '' WHERE image_url LIKE 'http://%'",
+            // (The ai_feeds / ai_feed_items columns once added here are gone: v13 drops
+            // those tables, and init_db no longer creates them.)
         ];
         for sql in statements {
             exec_migration(conn, sql)?;
@@ -155,7 +153,8 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
     }
 
     if version < 7 {
-        // Per-source-video edit plan persistence for the Studio Video tab: keyed by the
+        // (Dropped again in v12, when the video editor was removed.) Per-source-video edit
+        // plan persistence for the Studio Video tab: keyed by the
         // video's absolute path so reopening the same file restores the last plan (AI or
         // manual) instead of starting over.
         conn.execute_batch(
@@ -177,7 +176,7 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         // (system prompt + tool allowlist). Empty = current default behavior.
         let statements = [
             "ALTER TABLE tasks ADD COLUMN project_path TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE tasks ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''",
+            // (tasks.agent_id was added here too; v15 drops it — agents became skills.)
         ];
         for sql in statements {
             exec_migration(conn, sql)?;
@@ -239,9 +238,89 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 10)?;
     }
 
+    if version < 11 {
+        // Conversation compaction: a rolling summary of the session's older messages and the
+        // id of the last message it covers. A turn sends the summary plus every message
+        // after that id (see context.rs). Messages themselves are never deleted.
+        let has_sessions = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .is_some();
+        if has_sessions {
+            exec_migration(conn, "ALTER TABLE sessions ADD COLUMN context_summary TEXT NOT NULL DEFAULT ''")?;
+            exec_migration(conn, "ALTER TABLE sessions ADD COLUMN summary_upto_id INTEGER NOT NULL DEFAULT 0")?;
+        }
+        set_schema_version(conn, 11)?;
+    }
+
+    if version < 12 {
+        // The video editor was removed. Drop its saved edit plans and tool rows, and carry the
+        // on-device transcription switch (which voice input also used) over to its new key.
+        exec_migration(conn, "DROP TABLE IF EXISTS video_plans")?;
+        if table_exists(conn, "tools")? {
+            exec_migration(
+                conn,
+                "DELETE FROM tools WHERE tool_id IN ('probe_video', 'analyze_video', 'edit_video', 'generate_shorts', 'compile_videos')",
+            )?;
+        }
+        if table_exists(conn, "app_config")? {
+            exec_migration(
+                conn,
+                "INSERT OR IGNORE INTO app_config (key, value) \
+                 SELECT 'voice/local_transcription', value FROM app_config WHERE key = 'video/local_transcription'",
+            )?;
+            exec_migration(
+                conn,
+                "DELETE FROM app_config WHERE key IN ('video/local_transcription', 'video/hw_encode')",
+            )?;
+        }
+        set_schema_version(conn, 12)?;
+    }
+
+    if version < 13 {
+        // AI news feeds were removed (Activity's `feed_items` log is unrelated and stays).
+        exec_migration(conn, "DROP TABLE IF EXISTS ai_feed_items")?;
+        exec_migration(conn, "DROP TABLE IF EXISTS ai_feeds")?;
+        set_schema_version(conn, 13)?;
+    }
+
+    if version < 14 {
+        // Maps moved from Mapbox to Apple Maps (no key). Drop the now-unused Mapbox token.
+        if table_exists(conn, "app_config")? {
+            exec_migration(conn, "DELETE FROM app_config WHERE key = 'maps/mapbox_api_key'")?;
+        }
+        set_schema_version(conn, 14)?;
+    }
+
+    if version < 15 {
+        // Leftovers: the old memory (replaced by markdown notes, 2026-10) and agents
+        // (replaced by skills) tables, tasks.agent_id, and the removed phone server's settings.
+        for table in ["relationships", "episode_entities", "episodes", "entities", "embeddings", "memory_profile", "agents"] {
+            exec_migration(conn, &format!("DROP TABLE IF EXISTS {}", table))?;
+        }
+        if table_exists(conn, "tasks")? {
+            let has_agent_id = conn
+                .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'agent_id'")
+                .and_then(|mut st| st.exists([]))
+                .map_err(|e| e.to_string())?;
+            if has_agent_id {
+                exec_migration(conn, "ALTER TABLE tasks DROP COLUMN agent_id")?;
+            }
+        }
+        if table_exists(conn, "app_config")? {
+            exec_migration(conn, "DELETE FROM app_config WHERE key LIKE 'mobile/%'")?;
+        }
+        set_schema_version(conn, 15)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 10, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 15, "add a migration block for the new version");
 
     Ok(())
 }
@@ -306,7 +385,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           status TEXT NOT NULL DEFAULT 'scheduled',
           pending_input TEXT NOT NULL DEFAULT '',
           project_path TEXT NOT NULL DEFAULT '',
-          agent_id TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -331,18 +409,15 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE TABLE IF NOT EXISTS agents (
-          agent_id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          description TEXT NOT NULL DEFAULT '',
-          slash_command TEXT NOT NULL DEFAULT '',
-          system_prompt TEXT NOT NULL DEFAULT '',
-          max_iterations INTEGER NOT NULL DEFAULT 5,
-          enabled INTEGER NOT NULL DEFAULT 1,
-          allowed_tools_json TEXT NOT NULL DEFAULT '[]',
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        -- Cards a tool showed in a chat (maps), so a reloaded chat can draw them again.
+        CREATE TABLE IF NOT EXISTS session_cards (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE INDEX IF NOT EXISTS idx_session_cards_session ON session_cards(session_id, id);
 
         CREATE TABLE IF NOT EXISTS projects (
           path TEXT PRIMARY KEY,
@@ -358,93 +433,12 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE TABLE IF NOT EXISTS memory_profile (
-          id INTEGER PRIMARY KEY CHECK (id = 1),
-          user_name TEXT NOT NULL DEFAULT '',
-          user_about TEXT NOT NULL DEFAULT '',
-          profile_text TEXT NOT NULL DEFAULT '',
-          identity TEXT NOT NULL DEFAULT '',
-          personality TEXT NOT NULL DEFAULT '',
-          goals TEXT NOT NULL DEFAULT '',
-          preferences TEXT NOT NULL DEFAULT '',
-          current_state TEXT NOT NULL DEFAULT '',
-          patterns TEXT NOT NULL DEFAULT '',
-          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS entities (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          kind TEXT NOT NULL,
-          name TEXT NOT NULL,
-          summary TEXT NOT NULL DEFAULT '',
-          aliases_json TEXT NOT NULL DEFAULT '[]',
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS relationships (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          from_entity_id INTEGER NOT NULL,
-          to_entity_id INTEGER NOT NULL,
-          label TEXT NOT NULL,
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          FOREIGN KEY(from_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
-          FOREIGN KEY(to_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
-          UNIQUE(from_entity_id, to_entity_id, label)
-        );
-
-        CREATE TABLE IF NOT EXISTS episodes (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          description TEXT NOT NULL,
-          timestamp TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS episode_entities (
-          episode_id INTEGER NOT NULL,
-          entity_id INTEGER NOT NULL,
-          PRIMARY KEY(episode_id, entity_id),
-          FOREIGN KEY(episode_id) REFERENCES episodes(id) ON DELETE CASCADE,
-          FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE
-        );
         "#,
     )
     .map_err(|e| e.to_string())?;
 
-    // Embeddings table for semantic memory retrieval
     conn.execute_batch(
         r#"
-        CREATE TABLE IF NOT EXISTS embeddings (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          source_type TEXT NOT NULL,
-          source_id INTEGER NOT NULL,
-          content TEXT NOT NULL,
-          embedding BLOB NOT NULL,
-          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          UNIQUE(source_type, source_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS ai_feeds (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL,
-          topics_json TEXT NOT NULL DEFAULT '[]',
-          refresh_interval_mins INTEGER NOT NULL DEFAULT 60,
-          last_refreshed_at TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS ai_feed_items (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          feed_id INTEGER NOT NULL,
-          title TEXT NOT NULL,
-          summary TEXT NOT NULL DEFAULT '',
-          url TEXT NOT NULL DEFAULT '',
-          source_name TEXT NOT NULL DEFAULT '',
-          is_read INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          FOREIGN KEY(feed_id) REFERENCES ai_feeds(id) ON DELETE CASCADE
-        );
-
         CREATE TABLE IF NOT EXISTS deferred_commands (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           session_id TEXT NOT NULL,
@@ -457,27 +451,30 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           resolved_at TEXT
         );
-
-        CREATE TABLE IF NOT EXISTS video_plans (
-          path TEXT PRIMARY KEY,
-          plan_json TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
         "#,
     )
     .map_err(|e| e.to_string())?;
 
     run_migrations(conn)?;
 
-    conn.execute(
-        r#"
-        INSERT INTO memory_profile (id, user_name, user_about, profile_text, identity, personality, goals, preferences, current_state, patterns, updated_at)
-        VALUES (1, '', '', '', '', '', '', '', '', '', CURRENT_TIMESTAMP)
-        ON CONFLICT(id) DO NOTHING
-        "#,
-        [],
-    )
-    .map_err(|e| e.to_string())?;
+    // Tools added to the "Files and shell" connection after it shipped inherit that
+    // connection's current switch, so a user who turned the shell off doesn't get new
+    // shell-adjacent tools switched on by an update. (Fresh DB: no row yet → enabled.)
+    for (tool_id, name, description, icon_name) in [
+        ("capture_page", "Capture Page", "Screenshot a web page or local dev server in a headless browser, with its console output and text.", "image"),
+        ("process", "Background Processes", "Read the output of, or stop, long-running processes started by Run Command.", "terminal"),
+        ("create_pdf", "Create PDF", "Render an HTML document to a PDF with a headless browser.", "file"),
+    ] {
+        conn.execute(
+            r#"
+            INSERT INTO tools (tool_id, name, description, icon_name, enabled)
+            VALUES (?1, ?2, ?3, ?4, COALESCE((SELECT enabled FROM tools WHERE tool_id = 'run_command'), 1))
+            ON CONFLICT(tool_id) DO NOTHING
+            "#,
+            params![tool_id, name, description, icon_name],
+        )
+        .map_err(|e| e.to_string())?;
+    }
 
     let default_tools = [
         (
@@ -490,8 +487,11 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
         ("write_file", "Write File", "Write content to a workspace file.", "edit"),
         ("edit_file", "Edit File", "Edit part of a file by exact-string replacement.", "edit"),
         ("append_file", "Append File", "Append or prepend content to a workspace file.", "edit"),
-        ("capture_screen", "Capture Screen", "Take a screenshot of the screen or frontmost window so the model can see it.", "image"),
+        ("capture_screen", "Capture Screen", "Take a screenshot of the screen, the frontmost window, or one app's window in the background.", "image"),
         ("open_app", "Open App", "Launch or focus a macOS app, optionally opening a URL in it.", "terminal"),
+        ("capture_page", "Capture Page", "Screenshot a web page or local dev server in a headless browser, with its console output and text.", "image"),
+        ("process", "Background Processes", "Read the output of, or stop, long-running processes started by Run Command.", "terminal"),
+        ("create_pdf", "Create PDF", "Render an HTML document to a PDF with a headless browser.", "file"),
         ("list_files", "List Files", "List files in a workspace directory.", "folder"),
         (
             "search_files",
@@ -515,36 +515,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             "generate_image",
             "Generate Image",
             "Generate images from text descriptions.",
-            "image",
-        ),
-        (
-            "probe_video",
-            "Probe Video",
-            "Read a video's metadata (duration, resolution, fps, audio).",
-            "image",
-        ),
-        (
-            "analyze_video",
-            "Analyze Video",
-            "Detect silences and produce a timestamped transcript to plan video edits.",
-            "image",
-        ),
-        (
-            "edit_video",
-            "Edit Video",
-            "Cut, filter, caption, reframe, and re-render videos with ffmpeg.",
-            "image",
-        ),
-        (
-            "generate_shorts",
-            "Generate Shorts",
-            "Auto-clip a long recording into captioned 9:16 vertical shorts (great for scheduled runs).",
-            "image",
-        ),
-        (
-            "compile_videos",
-            "Compile Videos",
-            "Combine several clips into one video, keeping the good parts (best takes or a montage).",
             "image",
         ),
         (
@@ -798,6 +768,45 @@ pub(crate) fn first_non_empty_setting(state: &AppState, keys: &[&str]) -> Result
     Ok(None)
 }
 
+/// Remember a card (e.g. a map) a tool showed in a chat, so reloading the chat redraws it.
+pub(crate) fn add_session_card(state: &AppState, session_id: &str, kind: &str, payload: &Value) {
+    let _ = with_db(state, |db| add_session_card_conn(db, session_id, kind, payload));
+}
+
+fn add_session_card_conn(db: &Connection, session_id: &str, kind: &str, payload: &Value) -> Result<(), String> {
+    db.execute(
+        "INSERT INTO session_cards (session_id, kind, payload_json) VALUES (?1, ?2, ?3)",
+        params![session_id, kind, payload.to_string()],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// A session's cards, oldest first: (kind, payload, created_at).
+pub(crate) fn session_cards(state: &AppState, session_id: &str) -> Result<Vec<(String, Value, String)>, String> {
+    with_db(state, |db| session_cards_conn(db, session_id))
+}
+
+fn session_cards_conn(db: &Connection, session_id: &str) -> Result<Vec<(String, Value, String)>, String> {
+    let mut stmt = db
+        .prepare("SELECT kind, payload_json, created_at FROM session_cards WHERE session_id = ?1 ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (kind, json, created_at) = row.map_err(|e| e.to_string())?;
+        // A row that no longer parses is skipped rather than failing the whole reload.
+        if let Ok(payload) = serde_json::from_str(&json) {
+            out.push((kind, payload, created_at));
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn add_feed_item(
     state: &AppState,
     kind: &str,
@@ -1002,47 +1011,98 @@ pub(crate) fn sanitize_tool_pairs(history: &mut Vec<HistoryMessage>) {
 
 /// Load the full structured history for a session, including hidden tool-round turns.
 /// Legacy rows (content_json empty) are wrapped as a single text block so they still replay.
-pub(crate) fn load_history_structured(
+/// Build a `HistoryMessage` from a stored `messages` row.
+fn history_message_from_row(role: String, content: String, content_json: &str) -> HistoryMessage {
+    let blocks: Vec<Value> = if content_json.trim().is_empty() {
+        // Legacy row — treat as a single text block. Skip if the text is empty (shouldn't
+        // happen, but some older rows with tool output placeholders could be blank).
+        if content.is_empty() {
+            Vec::new()
+        } else {
+            vec![serde_json::json!({"type": "text", "text": content})]
+        }
+    } else {
+        serde_json::from_str(content_json)
+            .unwrap_or_else(|_| vec![serde_json::json!({"type": "text", "text": content})])
+    };
+    HistoryMessage { role, blocks }
+}
+
+/// The newest `limit` messages of a session with id greater than `after_id`, oldest first,
+/// each with its row id. `after_id` is the session's compaction point (0 = from the start).
+pub(crate) fn load_history_rows(
     state: &AppState,
     session_id: &str,
+    after_id: i64,
     limit: usize,
-) -> Result<Vec<HistoryMessage>, String> {
-    with_db(state, |db| {
-        let mut stmt = db
-            .prepare(
-                "SELECT role, content, content_json FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![session_id, limit as i64], |row| {
-                let role: String = row.get(0)?;
-                let content: String = row.get(1)?;
-                let content_json: String = row.get(2)?;
-                Ok((role, content, content_json))
-            })
-            .map_err(|e| e.to_string())?;
+) -> Result<Vec<(i64, HistoryMessage)>, String> {
+    with_db(state, |db| load_history_rows_conn(db, session_id, after_id, limit))
+}
 
-        let mut items: Vec<HistoryMessage> = Vec::new();
-        for row in rows {
-            let (role, content, content_json) = row.map_err(|e| e.to_string())?;
-            let blocks: Vec<Value> = if content_json.trim().is_empty() {
-                // Legacy row — treat as a single text block. Skip if the text is empty (shouldn't
-                // happen, but some older rows with tool output placeholders could be blank).
-                if content.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![serde_json::json!({"type": "text", "text": content})]
-                }
-            } else {
-                serde_json::from_str(&content_json).unwrap_or_else(|_| {
-                    vec![serde_json::json!({"type": "text", "text": content})]
-                })
-            };
-            items.push(HistoryMessage { role, blocks });
-        }
-        items.reverse();
-        Ok(items)
-    })
+fn load_history_rows_conn(
+    db: &Connection,
+    session_id: &str,
+    after_id: i64,
+    limit: usize,
+) -> Result<Vec<(i64, HistoryMessage)>, String> {
+    let mut stmt = db
+        .prepare(
+            "SELECT id, role, content, content_json FROM messages \
+             WHERE session_id = ?1 AND id > ?2 ORDER BY id DESC LIMIT ?3",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id, after_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (id, role, content, content_json) = row.map_err(|e| e.to_string())?;
+        items.push((id, history_message_from_row(role, content, &content_json)));
+    }
+    items.reverse();
+    Ok(items)
+}
+
+/// A session's compaction state: (summary of older messages, id of the last message the
+/// summary covers). ("", 0) when the session has never been compacted.
+pub(crate) fn get_context_summary(state: &AppState, session_id: &str) -> Result<(String, i64), String> {
+    with_db(state, |db| get_context_summary_conn(db, session_id))
+}
+
+fn get_context_summary_conn(db: &Connection, session_id: &str) -> Result<(String, i64), String> {
+    db.query_row(
+        "SELECT context_summary, summary_upto_id FROM sessions WHERE id = ?1",
+        params![session_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )
+    .optional()
+    .map(|r| r.unwrap_or_default())
+    .map_err(|e| e.to_string())
+}
+
+pub(crate) fn set_context_summary(
+    state: &AppState,
+    session_id: &str,
+    summary: &str,
+    upto_id: i64,
+) -> Result<(), String> {
+    with_db(state, |db| set_context_summary_conn(db, session_id, summary, upto_id))
+}
+
+fn set_context_summary_conn(db: &Connection, session_id: &str, summary: &str, upto_id: i64) -> Result<(), String> {
+    db.execute(
+        "UPDATE sessions SET context_summary = ?1, summary_upto_id = ?2 WHERE id = ?3",
+        params![summary, upto_id, session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1176,6 +1236,45 @@ mod tests {
         init_db(&conn).unwrap();
         let version = get_schema_version(&conn).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn compaction_state_round_trips_and_history_loads_after_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO sessions (id) VALUES ('s1')", []).unwrap();
+        conn.execute("INSERT INTO sessions (id) VALUES ('other')", []).unwrap();
+        for i in 1..=6 {
+            let blocks = serde_json::to_string(&vec![json!({"type": "text", "text": format!("m{}", i)})]).unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, content_json) VALUES ('s1', ?1, ?2, ?3)",
+                params![if i % 2 == 1 { "user" } else { "assistant" }, format!("m{}", i), blocks],
+            )
+            .unwrap();
+        }
+        conn.execute("INSERT INTO messages (session_id, role, content) VALUES ('other', 'user', 'x')", []).unwrap();
+
+        // Never compacted: empty summary, everything loads, oldest first, with row ids.
+        assert_eq!(get_context_summary_conn(&conn, "s1").unwrap(), (String::new(), 0));
+        let all = load_history_rows_conn(&conn, "s1", 0, 100).unwrap();
+        assert_eq!(all.len(), 6);
+        assert_eq!(all[0].1.plain_text(), "m1");
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
+
+        // The limit keeps the newest rows.
+        let newest = load_history_rows_conn(&conn, "s1", 0, 2).unwrap();
+        assert_eq!(newest.iter().map(|(_, m)| m.plain_text()).collect::<Vec<_>>(), vec!["m5", "m6"]);
+
+        // After compacting through the 4th message only later ones load.
+        let upto = all[3].0;
+        set_context_summary_conn(&conn, "s1", "they talked", upto).unwrap();
+        assert_eq!(get_context_summary_conn(&conn, "s1").unwrap(), ("they talked".to_string(), upto));
+        let rest = load_history_rows_conn(&conn, "s1", upto, 100).unwrap();
+        assert_eq!(rest.iter().map(|(_, m)| m.plain_text()).collect::<Vec<_>>(), vec!["m5", "m6"]);
+
+        // Other sessions are unaffected; unknown sessions read as never compacted.
+        assert_eq!(get_context_summary_conn(&conn, "other").unwrap(), (String::new(), 0));
+        assert_eq!(get_context_summary_conn(&conn, "nope").unwrap(), (String::new(), 0));
     }
 
     #[test]
@@ -1334,9 +1433,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v7_database_gains_task_project_path_and_agent_id_on_migrate() {
+    fn legacy_v7_database_gains_task_project_path_on_migrate() {
         let conn = Connection::open_in_memory().unwrap();
-        // Simulate a DB at schema v7: tasks table without the two new columns.
+        // Simulate a DB at schema v7: tasks table without project_path.
         conn.execute_batch(
             "CREATE TABLE tasks (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1352,36 +1451,15 @@ mod tests {
              PRAGMA user_version = 7;",
         )
         .unwrap();
-        conn.execute("INSERT INTO tasks (name) VALUES ('pre-existing')", [])
-            .unwrap();
+        conn.execute("INSERT INTO tasks (name) VALUES ('pre-existing')", []).unwrap();
 
         run_migrations(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
-
-        // Existing rows default to empty (default behavior); new values persist.
-        let (pp, aid): (String, String) = conn
-            .query_row(
-                "SELECT project_path, agent_id FROM tasks WHERE name = 'pre-existing'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+        let pp: String = conn
+            .query_row("SELECT project_path FROM tasks WHERE name = 'pre-existing'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(pp, "");
-        assert_eq!(aid, "");
-        conn.execute(
-            "INSERT INTO tasks (name, project_path, agent_id) VALUES ('scoped', '/tmp/proj', 'default-research-agent')",
-            [],
-        )
-        .unwrap();
-        let (pp, aid): (String, String) = conn
-            .query_row(
-                "SELECT project_path, agent_id FROM tasks WHERE name = 'scoped'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(pp, "/tmp/proj");
-        assert_eq!(aid, "default-research-agent");
+        conn.execute("INSERT INTO tasks (name, project_path) VALUES ('scoped', '/tmp/proj')", []).unwrap();
     }
 
     #[test]
@@ -1414,42 +1492,156 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v6_database_gains_video_plans_on_migrate() {
+    fn session_cards_round_trip_in_order_per_session() {
         let conn = Connection::open_in_memory().unwrap();
-        // Simulate a DB at schema v6 (no video_plans table yet). A real v6 DB has a
-        // tasks table (the v8 migration ALTERs it), so create a minimal one here.
+        init_db(&conn).unwrap();
+        add_session_card_conn(&conn, "s1", "map-places", &json!({"query": "tacos", "results": [{"name": "A"}]})).unwrap();
+        add_session_card_conn(&conn, "s2", "map-route", &json!({"from": "x"})).unwrap();
+        add_session_card_conn(&conn, "s1", "map-route", &json!({"from": "Balboa Park", "to": "Zoo"})).unwrap();
+        conn.execute("INSERT INTO session_cards (session_id, kind, payload_json) VALUES ('s1', 'map-places', 'not json')", []).unwrap();
+        let cards = session_cards_conn(&conn, "s1").unwrap();
+        assert_eq!(cards.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), vec!["map-places", "map-route"]);
+        assert_eq!(cards[0].1["results"][0]["name"], "A");
+        assert_eq!(cards[1].1["to"], "Zoo");
+        assert!(session_cards_conn(&conn, "nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn leftover_tables_agent_id_and_phone_settings_are_dropped() {
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-             CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
-             PRAGMA user_version = 6;",
+            "CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT '', skill TEXT NOT NULL DEFAULT '');
+             CREATE TABLE agents (agent_id TEXT PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE memory_profile (id INTEGER PRIMARY KEY);
+             CREATE TABLE entities (id INTEGER PRIMARY KEY);
+             CREATE TABLE relationships (id INTEGER PRIMARY KEY, from_entity_id INTEGER REFERENCES entities(id));
+             CREATE TABLE episodes (id INTEGER PRIMARY KEY);
+             CREATE TABLE episode_entities (episode_id INTEGER, entity_id INTEGER);
+             CREATE TABLE embeddings (id INTEGER PRIMARY KEY);
+             CREATE TABLE app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             INSERT INTO tasks (name, agent_id, skill) VALUES ('Daily Email Triage', 'old-agent', 'triage');
+             INSERT INTO app_config (key, value) VALUES ('mobile/server_token', 'secret'), ('mobile/server_enabled', '0'), ('mobile/server_port', '8737'), ('user/name', 'kept');
+             PRAGMA user_version = 14;",
         )
         .unwrap();
-        assert!(conn
-            .query_row(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='video_plans'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .unwrap()
-            .is_none());
         run_migrations(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
-        // Now it exists, is usable, and enforces path uniqueness (upsert target).
-        conn.execute(
-            "INSERT INTO video_plans (path, plan_json, updated_at) VALUES ('/tmp/a.mp4', '{}', '2026-01-01T00:00:00Z')",
-            [],
+        for t in ["agents", "memory_profile", "entities", "relationships", "episodes", "episode_entities", "embeddings"] {
+            assert!(!table_exists(&conn, t).unwrap(), "{} should be gone", t);
+        }
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('tasks') ORDER BY cid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(cols, vec!["id", "name", "skill"]);
+        let (name, skill): (String, String) =
+            conn.query_row("SELECT name, skill FROM tasks", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((name.as_str(), skill.as_str()), ("Daily Email Triage", "triage"));
+        let keys: Vec<String> = conn
+            .prepare("SELECT key FROM app_config")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(keys, vec!["user/name"]);
+
+        // A fresh database never creates them.
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        assert!(!table_exists(&fresh, "agents").unwrap() && !table_exists(&fresh, "memory_profile").unwrap());
+    }
+
+    #[test]
+    fn maps_migration_drops_only_the_mapbox_token() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             INSERT INTO app_config (key, value) VALUES ('maps/mapbox_api_key', 'pk.revoked'), ('user/location', 'San Diego, CA'), ('user/location_coords', '-117.1,32.7');
+             PRAGMA user_version = 13;",
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO video_plans (path, plan_json, updated_at) VALUES ('/tmp/a.mp4', '{}', '2026-01-02T00:00:00Z') \
-             ON CONFLICT(path) DO UPDATE SET plan_json = excluded.plan_json, updated_at = excluded.updated_at",
-            [],
+        run_migrations(&conn).unwrap();
+        let keys: Vec<String> = conn
+            .prepare("SELECT key FROM app_config ORDER BY key")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(keys, vec!["user/location".to_string(), "user/location_coords".to_string()]);
+    }
+
+    #[test]
+    fn feed_removal_migration_drops_the_ai_feed_tables_but_not_activity() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_feeds (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE ai_feed_items (id INTEGER PRIMARY KEY, feed_id INTEGER NOT NULL, title TEXT NOT NULL);
+             CREATE TABLE feed_items (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL);
+             INSERT INTO ai_feeds VALUES (1, 'AI News');
+             INSERT INTO ai_feed_items VALUES (1, 1, 'x');
+             INSERT INTO feed_items VALUES (1, 'system', 'kept');
+             PRAGMA user_version = 12;",
         )
         .unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM video_plans", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
+        run_migrations(&conn).unwrap();
+        assert!(!table_exists(&conn, "ai_feeds").unwrap());
+        assert!(!table_exists(&conn, "ai_feed_items").unwrap());
+        let kept: i64 = conn.query_row("SELECT COUNT(*) FROM feed_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 1);
+
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        assert!(!table_exists(&fresh, "ai_feeds").unwrap());
+        assert!(table_exists(&fresh, "feed_items").unwrap());
+    }
+
+    #[test]
+    fn video_removal_migration_drops_its_state_and_keeps_the_transcription_switch() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A v11 database from before the video editor was removed.
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, context_summary TEXT NOT NULL DEFAULT '', summary_upto_id INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
+             CREATE TABLE app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             CREATE TABLE tools (tool_id TEXT PRIMARY KEY, name TEXT, enabled INTEGER NOT NULL DEFAULT 1);
+             CREATE TABLE video_plans (path TEXT PRIMARY KEY, plan_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+             INSERT INTO video_plans VALUES ('/tmp/a.mp4', '{}', 'x');
+             INSERT INTO tools (tool_id, name) VALUES ('edit_video', 'Edit Video'), ('compile_videos', 'Compile'), ('run_command', 'Run');
+             INSERT INTO app_config (key, value) VALUES ('video/local_transcription', '1'), ('video/hw_encode', '0'), ('llm/provider', 'minimax');
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+        run_migrations(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(!table_exists(&conn, "video_plans").unwrap());
+        let tools: Vec<String> = conn
+            .prepare("SELECT tool_id FROM tools ORDER BY tool_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(tools, vec!["run_command".to_string()]);
+        let setting = |k: &str| -> Option<String> {
+            conn.query_row("SELECT value FROM app_config WHERE key = ?1", params![k], |r| r.get(0)).optional().unwrap()
+        };
+        assert_eq!(setting("voice/local_transcription").as_deref(), Some("1"));
+        assert_eq!(setting("video/local_transcription"), None);
+        assert_eq!(setting("video/hw_encode"), None);
+        assert_eq!(setting("llm/provider").as_deref(), Some("minimax"));
+
+        // A fresh database never has the video state at all.
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        assert!(!table_exists(&fresh, "video_plans").unwrap());
+        assert_eq!(
+            fresh.query_row("SELECT COUNT(*) FROM tools WHERE tool_id LIKE '%video%' OR tool_id = 'generate_shorts'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0
+        );
     }
 }

@@ -1,10 +1,11 @@
 import { registerTileRenderer } from "./registry.js";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml, field, projectLabel, renderMarkdown, threadLabel } from "./utils.js";
-import { focusTile, addTile, getChatTileBySessionId, saveLayout } from "./tilesys.js";
+import { addTile, saveLayout } from "./tilesys.js";
 import { icon, ravenLogo } from "./icons.js";
+import { isDarkTheme } from "./theme.js";
 
 // Refresh the sidebar chat-history list after session-mutating actions. Imported
 // lazily-at-call (module-level import is fine — only *invoked* at runtime, so the
@@ -13,62 +14,6 @@ import { icon, ravenLogo } from "./icons.js";
 import { refreshSessionList, openModelPopover } from "./sidebar.js";
 function bumpSessionList() {
   try { refreshSessionList(); } catch {}
-}
-
-export async function openFeedItemInChat(item) {
-  const title = item.title || "";
-  const url = item.url || "";
-  const sourceName = item.sourceName ?? item.source_name ?? "";
-  const summary = item.summary || "";
-
-  let seed = `I'm reading this item from my feed and want to dive deeper. Give me a richer overview, the key context, and why it matters — then I'll ask follow-ups.\n\n`;
-  seed += `Title: ${title}\n`;
-  if (sourceName) seed += `Source: ${sourceName}\n`;
-  if (url) seed += `URL: ${url}\n`;
-  if (summary) seed += `Summary: ${summary}\n`;
-
-  try {
-    const session = await invoke("create_session", { req: { projectPath: "" } });
-    const sid = field(session, "id", "id");
-    await addChatTile(sid, "");
-    const tile = getChatTileBySessionId(sid);
-    if (!tile) return;
-    focusTile(tile.id);
-    const input = tile.el.querySelector(`[data-chat-input="${tile.id}"]`);
-    const sendBtn = tile.el.querySelector(`[data-chat-send="${tile.id}"]`);
-    if (input && sendBtn) {
-      input.value = seed;
-      autoResize(input);
-      sendBtn.click();
-    }
-  } catch (e) {
-    console.error("Failed to open feed item in chat:", e);
-  }
-}
-
-// Open a fresh chat tile seeded with a web-search query and auto-send, so the user can
-// keep digging into a search result conversationally.
-export async function openQueryInChat(query) {
-  const q = String(query || "").trim();
-  if (!q) return;
-  const seed = `I searched the web for: "${q}". Give me a richer, well-sourced overview and the key links, then I'll ask follow-ups.`;
-  try {
-    const session = await invoke("create_session", { req: { projectPath: "" } });
-    const sid = field(session, "id", "id");
-    await addChatTile(sid, "");
-    const tile = getChatTileBySessionId(sid);
-    if (!tile) return;
-    focusTile(tile.id);
-    const input = tile.el.querySelector(`[data-chat-input="${tile.id}"]`);
-    const sendBtn = tile.el.querySelector(`[data-chat-send="${tile.id}"]`);
-    if (input && sendBtn) {
-      input.value = seed;
-      autoResize(input);
-      sendBtn.click();
-    }
-  } catch (e) {
-    console.error("Failed to open query in chat:", e);
-  }
 }
 
 // ========== CHAT TILE ==========
@@ -504,7 +449,8 @@ export function renderChatTile(tileObj, body) {
     for (const file of files) {
       if (!file.type || !file.type.startsWith("image/")) continue;
       if (file.size > MAX_IMAGE_BYTES) {
-        addTurn(chatLog, "muninn", `That image is too large (${(file.size / 1048576).toFixed(1)}MB). Max is 10MB.`);
+        const chatLog = tileObj.el.querySelector(`[data-chat-stream="${tileObj.id}"]`);
+        if (chatLog) addTurn(chatLog, "muninn", `That image is too large (${(file.size / 1048576).toFixed(1)}MB). Max is 10MB.`);
         continue;
       }
       try { tileObj.pendingAttachments.push(await fileToAttachment(file)); } catch { /* skip unreadable */ }
@@ -923,6 +869,119 @@ export function maybeAutoSpeak(tileObj, text) {
   if (text && text.trim()) void playTts(null, text);
 }
 
+/// The PDF a create_pdf tool result describes ("Saved a 2-page PDF (40 KB) to /x/y.pdf ..."),
+/// so reloaded chats can rebuild the same card the live `pdf-created` event showed.
+export function pdfFromToolOutput(output) {
+  const m = /^Saved an? (\d+)-page PDF \((\d+) KB\) to (.+?\.pdf)(?: \(in the Content library\))?\./i.exec(output || "");
+  return m ? { pages: Number(m[1]), kb: Number(m[2]), path: m[3] } : null;
+}
+
+/// A chat turn showing a PDF in an inline viewer, with a button to open it in Preview.
+export function addPdfCard(chatLog, { path, pages, kb }) {
+  const name = String(path || "").split("/").pop() || "document.pdf";
+  const meta = [pages ? `${pages} page${pages === 1 ? "" : "s"}` : "", kb ? `${kb} KB` : ""].filter(Boolean).join(" · ");
+  const el = document.createElement("div");
+  el.className = "turn pdf-turn";
+  el.innerHTML = `
+    <div class="turn-header">
+      <span class="turn-label muninn">Muninn</span>
+      <span class="turn-time">${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+    </div>
+    <div class="turn-body">
+      <div class="pdf-card">
+        <div class="pdf-card-bar">
+          <span class="pdf-card-name" title="${escapeHtml(path)}">📄 ${escapeHtml(name)}</span>
+          <span class="muted text-xs">${escapeHtml(meta)}</span>
+          <span class="pdf-card-spacer"></span>
+          <button class="form-btn" data-pdf-open>Open in App</button>
+        </div>
+        <iframe class="pdf-frame" title="${escapeHtml(name)}"></iframe>
+      </div>
+    </div>
+  `;
+  // Set via the property (not markup) so the path never needs attribute escaping.
+  el.querySelector("iframe").src = convertFileSrc(path);
+  el.querySelector("[data-pdf-open]").addEventListener("click", async () => {
+    try { await invoke("open_pdf", { path }); } catch (e) { console.error("open_pdf", e); }
+  });
+  chatLog.appendChild(el);
+  chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
+  return el;
+}
+
+const fmtMapDistance = (m) => (m < 1000 ? `${Math.round(m)}m` : `${(m / 1000).toFixed(1)}km`);
+
+/// A map card for a search_places / search_nearby (`map-places`) or get_directions
+/// (`map-route`) result: the details, an Apple Maps image (rendered by the muninn-maps
+/// helper in the current light/dark theme) and an Open in Apple Maps button. Used for the
+/// live tool event and again when a reloaded chat redraws its saved cards.
+export function addMapCard(chatLog, kind, payload) {
+  let bodyHtml;
+  let snapshotReq = null;
+  if (kind === "map-route") {
+    const { from, to, from_point, to_point, mode, distance_km, duration_min, polyline, steps, note } = payload;
+    const distText = distance_km < 1 ? `${Math.round(distance_km * 1000)}m` : `${Number(distance_km).toFixed(1)}km`;
+    const durText = duration_min < 60 ? `${Math.round(duration_min)} min` : `${Math.floor(duration_min / 60)}h ${Math.round(duration_min % 60)}m`;
+    const markers = [
+      from_point && { ...from_point, label: "A", color: "green" },
+      to_point && { ...to_point, label: "B", color: "red" },
+    ].filter(Boolean);
+    if (markers.length) snapshotReq = { markers, route: polyline || [] };
+    bodyHtml = `
+      <div class="map-title">${escapeHtml(from)} \u2192 ${escapeHtml(to)}</div>
+      <div class="map-summary">${escapeHtml(mode || "driving")} \u00b7 ${distText} \u00b7 ${durText}</div>
+      ${note ? `<div class="muted text-xs">${escapeHtml(note)}</div>` : ""}
+      ${steps && steps.length > 0 ? `<details class="map-steps"><summary>Directions (${steps.length} steps)</summary>${steps.map(s => `<div class="map-step">${escapeHtml(s.instruction)} (${fmtMapDistance(s.distance)})</div>`).join("")}</details>` : ""}`;
+  } else {
+    const places = payload.results || [];
+    if (places.length) snapshotReq = { markers: places.map((r, i) => ({ lat: r.lat, lon: r.lon, label: String(i + 1) })) };
+    bodyHtml = `
+      <div class="map-title">${escapeHtml(payload.query)}</div>
+      <div class="map-results">
+        ${places.map((r, i) => {
+          const extra = [r.category, r.distance_m != null ? fmtMapDistance(r.distance_m) : "", r.phone].filter(Boolean).join(" · ");
+          return `<div class="map-result">${i + 1}. <strong>${escapeHtml(r.name)}</strong>${r.address && !String(r.name).includes(r.address) ? `<span class="muted"> — ${escapeHtml(r.address)}</span>` : ""}${extra ? `<div class="muted text-xs">${escapeHtml(extra)}</div>` : ""}</div>`;
+        }).join("")}
+      </div>`;
+  }
+
+  const el = document.createElement("div");
+  el.className = "turn";
+  el.innerHTML = `
+    <div class="turn-body">
+      ${bodyHtml}
+      <div class="map-image-wrap"><div class="map-image-loading">Loading map…</div></div>
+      <button class="form-btn map-open-btn" data-map-open>Open in Apple Maps</button>
+    </div>
+  `;
+  const wrap = el.querySelector(".map-image-wrap");
+  if (snapshotReq) {
+    invoke("map_snapshot", { req: { ...snapshotReq, dark: isDarkTheme(), width: 640, height: 320 } })
+      .then((src) => {
+        const img = document.createElement("img");
+        img.className = "map-image";
+        img.alt = "Map";
+        img.src = src;
+        wrap.replaceChildren(img);
+      })
+      .catch((e) => {
+        console.warn("map_snapshot", e);
+        wrap.remove();
+      });
+  } else {
+    wrap.remove();
+  }
+  const openBtn = el.querySelector("[data-map-open]");
+  if (payload.maps_url) {
+    openBtn.addEventListener("click", () => invoke("open_in_maps", { url: payload.maps_url }).catch((e) => console.error("open_in_maps", e)));
+  } else {
+    openBtn.remove();
+  }
+  chatLog.appendChild(el);
+  chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
+  return el;
+}
+
 export function addTurn(chatLog, role, text, images = []) {
   const turn = document.createElement("div");
   turn.className = `turn ${role}`;
@@ -1174,6 +1233,8 @@ export async function loadMessagesForTile(tileObj) {
   try {
     const messages = await invoke("get_messages", { sessionId: stream.sessionId });
     const logs = await invoke("get_tool_logs", { sessionId: stream.sessionId });
+    // Map cards are saved with the chat; older chats (or a failed lookup) just have none.
+    const cards = await invoke("get_session_cards", { sessionId: stream.sessionId }).catch(() => []);
 
     const timeline = [];
     for (const msg of messages) {
@@ -1198,6 +1259,14 @@ export async function loadMessagesForTile(tileObj) {
         output: log.output
       });
     }
+    for (const card of cards) {
+      timeline.push({
+        type: "card",
+        createdAt: field(card, "createdAt", "created_at") || "",
+        kind: card.kind,
+        payload: card.payload,
+      });
+    }
     timeline.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
     chatLog.innerHTML = "";
@@ -1205,8 +1274,12 @@ export async function loadMessagesForTile(tileObj) {
       showChatWelcome(chatLog);
     } else {
       for (const item of timeline) {
-        if (item.type === "tool") {
+        if (item.type === "card") {
+          addMapCard(chatLog, item.kind, item.payload || {});
+        } else if (item.type === "tool") {
           addToolCard(chatLog, item.kind, "", item.status);
+          const pdf = item.status === "ok" ? pdfFromToolOutput(item.output) : null;
+          if (pdf) addPdfCard(chatLog, pdf);
         } else {
           const role = item.role === "user" ? "you" : "muninn";
           addTurn(chatLog, role, item.content, item.images || []);
@@ -1291,7 +1364,7 @@ export function parseSlashCommand(text) {
 
 export const CONTEXT_WINDOW = 1000000;
 
-export function updateContextBar(tileId, tokens) {
+export function updateContextBar(tileId, tokens, cachedPct = 0) {
   const ring = document.querySelector(`[data-context-bar="${tileId}"]`);
   const fill = document.querySelector(`[data-context-fill="${tileId}"]`);
   if (!ring || !fill) return;
@@ -1302,7 +1375,8 @@ export function updateContextBar(tileId, tokens) {
 
   const used = tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : `${tokens}`;
   const max = `${(CONTEXT_WINDOW / 1000).toFixed(0)}k`;
-  ring.title = `Context: ${used} / ${max} tokens (${pct.toFixed(0)}%)`;
+  const cached = cachedPct > 0 ? ` · ${cachedPct}% of the last request served from cache` : "";
+  ring.title = `Context: ${used} / ${max} tokens (${pct.toFixed(0)}%)${cached}`;
   ring.hidden = tokens <= 0;
 }
 

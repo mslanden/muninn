@@ -1,6 +1,6 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getTileRenderer } from "./registry.js";
-import { workspace, tiles, chatStreams, tileMaps, ui } from "./state.js";
+import { workspace, tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml } from "./utils.js";
 import { addChatTile } from "./chat.js";
 import { updateSidebar } from "./sidebar.js";
@@ -12,17 +12,13 @@ export { updateSidebar };
 // ==================== TILE MANAGEMENT ====================
 export const TILE_TYPES = [
   { type: "chat",       label: "Chat",       dot: "green" },
-  { type: "feeds",      label: "Feeds",      dot: "amber" },
-  { type: "web",        label: "Web",        dot: "blue"  },
   { type: "tasks",      label: "Tasks",      dot: "blue"  },
   { type: "skills",     label: "Skills",     dot: "blue"  },
   { type: "library",    label: "Library",    dot: "purple" },
   { type: "memory",     label: "Memory",     dot: "purple" },
   { type: "content",    label: "Content",    dot: "off"   },
-  { type: "studio",     label: "Studio",     dot: "green" },
   // Still renderable (Settings sub-pages / restored layouts) but not in Apps nav.
   { type: "logs",       label: "Activity",   dot: "amber" },
-  { type: "tools",      label: "Tools",      dot: "purple" },
 ];
 
 export function updateWorkspaceGrid() {
@@ -86,7 +82,6 @@ export function addTile(type, opts = {}) {
     el: tile,
     chatId: opts.chatId || null,
     projectPath: opts.projectPath || "",
-    webUrl: opts.webUrl || "",
     autoVoice: !!opts.autoVoice
   };
   tiles.push(tileObj);
@@ -116,14 +111,6 @@ export function removeTile(tileId) {
   // Clean up chat streaming state
   if (tile.type === "chat") {
     delete chatStreams[tileId];
-  }
-
-  // Clean up Mapbox GL map instances
-  if (tileMaps[tileId]) {
-    for (const m of tileMaps[tileId]) {
-      try { m.remove(); } catch {}
-    }
-    delete tileMaps[tileId];
   }
 
   if (ui.focusedTileId === tileId) {
@@ -305,7 +292,6 @@ export function popOutTile(tileId) {
   const params = new URLSearchParams();
   params.set("tile", tile.type);
   if (tile.chatId) params.set("chatId", tile.chatId);
-  if (tile.webUrl) params.set("url", tile.webUrl);
 
   const label = `popout-${tile.type}-${Date.now()}`;
   const popoutUrl = `${window.location.origin}${window.location.pathname}?${params.toString()}`;
@@ -336,8 +322,7 @@ export function getPopoutParams() {
   const params = new URLSearchParams(window.location.search);
   return {
     type: params.get("tile"),
-    chatId: params.get("chatId") || "",
-    url: params.get("url") || ""
+    chatId: params.get("chatId") || ""
   };
 }
 
@@ -347,7 +332,6 @@ export function saveLayout() {
     type: t.type,
     chatId: t.chatId,
     projectPath: t.projectPath || "",
-    webUrl: t.webUrl || "",
     autoVoice: !!t.autoVoice
   }));
   localStorage.setItem("muninn.layout", JSON.stringify(layout));

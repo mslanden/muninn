@@ -7,8 +7,6 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <link href="https://api.mapbox.com/mapbox-gl-js/v3.9.4/mapbox-gl.css" rel="stylesheet" />
-    <script src="https://api.mapbox.com/mapbox-gl-js/v3.9.4/mapbox-gl.js"></script>
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
@@ -23,10 +21,11 @@
       <aside class="sidebar">
         <div class="sidebar-panel-wrap">
           <div id="sidebar-panels" class="sidebar-panels">
-            <!-- Primary nav, then chats; apps live in the footer rail -->
+            <!-- Primary nav, then chats -->
             <div class="sidebar-panel" data-panel="chat">
               <nav class="sidebar-main-nav" aria-label="Main">
                 <button class="nav-main-item" id="new-chat-btn" title="New chat"></button>
+                <button class="nav-main-item" id="nav-tasks" title="Tasks"></button>
                 <button class="nav-main-item" id="nav-library" title="Library"></button>
                 <button class="nav-main-item" id="nav-connections" title="Connections"></button>
                 <button class="nav-main-item" id="nav-settings" title="Settings"></button>
@@ -39,9 +38,6 @@
               </div>
             </div>
           </div>
-
-          <!-- App launcher rail: one icon per app tile type -->
-          <div class="sidebar-footer" id="sidebar-apps-rail"></div>
         </div>
       </aside>
 

@@ -1,21 +1,18 @@
 // Entry point: wires sidebar buttons and boots the window.
 // Feature modules are imported for their side effect of registering tile renderers.
 import "./theme.js";
-import "./web.js";
 import "./chat.js";
-import "./feeds.js";
 import "./logs.js";
 import "./tasks.js";
-import "./toolspanel.js";
 import "./skills.js";
 import "./memory.js";
 import "./content.js";
-import "./studio.js";
 import "./library.js";
 import { openSettingsModal, closeSettingsModal, isSettingsModalOpen } from "./settings.js";
 import { openConnections, closeConnections, isConnectionsOpen } from "./connections.js";
 
 import { invoke } from "@tauri-apps/api/core";
+import { getTileRenderer } from "./registry.js";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { workspace, newChatBtn, navSettingsBtn, ui } from "./state.js";
 import { addTile, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav, replaceSingleTileIfAlone, makeDragSource, openTileForType } from "./tilesys.js";
@@ -66,6 +63,12 @@ document.addEventListener("click", (e) => {
   openConnections();
 });
 
+// Library and Tasks open (or focus) their tile; both can also be dragged into the grid.
+const navTasks = document.getElementById("nav-tasks");
+if (navTasks) {
+  navTasks.addEventListener("click", () => openTileForType("tasks"));
+  makeDragSource(navTasks, { type: "tasks" });
+}
 const navLibrary = document.getElementById("nav-library");
 if (navLibrary) {
   navLibrary.addEventListener("click", () => openTileForType("library"));
@@ -74,7 +77,7 @@ if (navLibrary) {
 
 // ==================== BOOT ====================
 async function bootPopout() {
-  const { type, chatId, url } = getPopoutParams();
+  const { type, chatId } = getPopoutParams();
 
   // Hide sidebar, make workspace full width
   const sidebar = document.querySelector(".sidebar");
@@ -87,7 +90,6 @@ async function bootPopout() {
 
   await setupEventListeners();
   try { ui.loadedSettings = await invoke("get_app_settings"); } catch { ui.loadedSettings = {}; }
-  ui.mapboxToken = ui.loadedSettings["maps/mapbox_api_key"] || null;
 
   try { ui.cachedSkills = await invoke("list_skills"); } catch {}
 
@@ -95,8 +97,6 @@ async function bootPopout() {
     await addChatTile(chatId);
   } else if (type === "settings") {
     addTile("settings");
-  } else if (type === "web") {
-    addTile("web", { webUrl: url || "" });
   } else {
     addTile(type);
   }
@@ -123,7 +123,6 @@ async function bootMain() {
   setupTileKeyboardNav();
 
   try { ui.loadedSettings = await invoke("get_app_settings"); } catch { ui.loadedSettings = {}; }
-  ui.mapboxToken = ui.loadedSettings["maps/mapbox_api_key"] || null;
   updateModelChips();
 
   try { ui.cachedSkills = await invoke("list_skills"); } catch {}
@@ -137,7 +136,10 @@ async function bootMain() {
         continue; // settings is a modal now — don't restore old settings tiles
       } else {
         // Layouts saved before agents became skills still name the old tile type.
-        addTile(item.type === "agents" ? "skills" : item.type, { webUrl: item.webUrl || "" });
+        const type = item.type === "agents" ? "skills" : item.type;
+        // Skip tiles whose feature has since been removed (e.g. the old Studio tile).
+        if (!getTileRenderer(type)) continue;
+        addTile(type);
       }
     }
   } else {

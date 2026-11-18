@@ -1,12 +1,12 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { tiles, chatStreams, tileMaps, ui } from "./state.js";
+import { tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml, renderMarkdown } from "./utils.js";
 import { getTilesByType, getChatTileBySessionId } from "./tilesys.js";
-import { playTts, maybeAutoSpeak, updateModelChips, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn } from "./chat.js";
+import { playTts, maybeAutoSpeak, updateModelChips, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn, addPdfCard, addMapCard } from "./chat.js";
 import { renderTasksTile } from "./tasks.js";
 import { renderContentTile } from "./content.js";
-import { isDarkTheme, applyTheme } from "./theme.js";
+import { applyTheme } from "./theme.js";
 import { renderSettingsTile, refreshSettingsModalIfOpen } from "./settings.js";
 import { onSkillsChanged } from "./skills.js";
 import { refreshConnections } from "./connections.js";
@@ -115,14 +115,35 @@ export async function setupEventListeners() {
   });
 
   await listen("chat-usage", (event) => {
-    const { session_id, input_tokens, output_tokens } = event.payload;
+    const { session_id, input_tokens, output_tokens, cached_tokens } = event.payload;
     const tile = getChatTileBySessionId(session_id);
     if (!tile) return;
     const stream = chatStreams[tile.id];
     if (!stream) return;
     const total = input_tokens + output_tokens;
     stream.contextTokens = total;
-    updateContextBar(tile.id, total);
+    // Share of this request the provider served from its prompt cache (0 = none reported).
+    const cachedPct = input_tokens > 0 ? Math.round(((cached_tokens || 0) / input_tokens) * 100) : 0;
+    updateContextBar(tile.id, total, cachedPct);
+  });
+
+  // The older part of a long chat was summarized so the model keeps the thread without the
+  // full history. Messages stay in the chat; only what is sent to the model changed.
+  await listen("context-compacted", (event) => {
+    const { session_id, messages, ok } = event.payload;
+    if (!ok || !messages) return;
+    tiles
+      .filter(t => t.type === "chat" && chatStreams[t.id]?.sessionId === session_id)
+      .forEach(t => {
+        const chatLog = t.el.querySelector(`[data-chat-stream="${t.id}"]`);
+        if (chatLog) {
+          addTurn(
+            chatLog,
+            "muninn",
+            `🗜️ Summarized ${Number(messages)} earlier messages to free up context. Nothing was deleted — the model now works from a summary of them.`
+          );
+        }
+      });
   });
 
   await listen("tool-start", (event) => {
@@ -188,123 +209,23 @@ export async function setupEventListeners() {
       });
   });
 
-  await listen("map-places", (event) => {
-    const { session_id, query, results } = event.payload;
-    const tile = getChatTileBySessionId(session_id);
-    if (!tile) return;
-    const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
-    if (!chatLog) return;
-
-    const mapId = "map-" + Date.now();
-    const el = document.createElement("div");
-    el.className = "turn";
-    el.innerHTML = `
-      <div class="turn-body">
-        <div class="map-title">Places: ${escapeHtml(query)}</div>
-        <div id="${mapId}" class="map-container"></div>
-        <div class="map-results">
-          ${results.map((r, i) => `<div class="map-result">${i + 1}. <strong>${escapeHtml(r.name)}</strong></div>`).join("")}
-        </div>
-      </div>
-    `;
-    chatLog.appendChild(el);
-    chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
-
-    if (!ui.mapboxToken) return;
-    setTimeout(() => {
-      const isDark = isDarkTheme();
-      const style = isDark ? "mapbox://styles/mapbox/dark-v11" : "mapbox://styles/mapbox/streets-v12";
-      const map = new mapboxgl.Map({
-        container: mapId,
-        style,
-        center: [results[0]?.lon || -117, results[0]?.lat || 34],
-        zoom: 13,
-        accessToken: ui.mapboxToken,
-        attributionControl: false,
-      });
-      const bounds = new mapboxgl.LngLatBounds();
-      results.forEach(r => {
-        const lon = parseFloat(r.lon), lat = parseFloat(r.lat);
-        if (lat === 0 && lon === 0) return;
-        new mapboxgl.Marker()
-          .setLngLat([lon, lat])
-          .setPopup(new mapboxgl.Popup({ offset: 25 }).setText(r.name))
-          .addTo(map);
-        bounds.extend([lon, lat]);
-      });
-      if (!bounds.isEmpty() && results.length > 1) {
-        map.fitBounds(bounds, { padding: 30 });
+  // Map results (search_places / search_nearby / get_directions). The card is drawn by
+  // chat.js, which also redraws saved cards when a chat is reloaded.
+  for (const kind of ["map-places", "map-route"]) {
+    await listen(kind, (event) => {
+      const tile = getChatTileBySessionId(event.payload.session_id);
+      if (!tile) return;
+      const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
+      if (!chatLog) return;
+      const stream = chatStreams[tile.id];
+      if (stream && stream.bubble) {
+        stream.bubble.innerHTML = renderMarkdown(stream.text);
+        stream.bubble = null;
+        stream.text = "";
       }
-      if (tile) { (tileMaps[tile.id] = tileMaps[tile.id] || []).push(map); }
-    }, 100);
-  });
-
-  await listen("map-route", (event) => {
-    const { session_id, from, to, distance_km, duration_min, geometry, steps } = event.payload;
-    const tile = getChatTileBySessionId(session_id);
-    if (!tile) return;
-    const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
-    if (!chatLog) return;
-
-    const mapId = "map-" + Date.now();
-    const distText = distance_km < 1 ? `${Math.round(distance_km * 1000)}m` : `${distance_km.toFixed(1)}km`;
-    const durText = duration_min < 60 ? `${Math.round(duration_min)} min` : `${Math.floor(duration_min / 60)}h ${Math.round(duration_min % 60)}m`;
-
-    const el = document.createElement("div");
-    el.className = "turn";
-    el.innerHTML = `
-      <div class="turn-body">
-        <div class="map-title">${escapeHtml(from)} \u2192 ${escapeHtml(to)}</div>
-        <div class="map-summary">${distText} \u00b7 ${durText}</div>
-        <div id="${mapId}" class="map-container"></div>
-        ${steps && steps.length > 0 ? `<details class="map-steps"><summary>Directions (${steps.length} steps)</summary>${steps.map(s => `<div class="map-step">${escapeHtml(s.instruction)} (${s.distance}m)</div>`).join("")}</details>` : ""}
-      </div>
-    `;
-    chatLog.appendChild(el);
-    chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
-
-    if (!ui.mapboxToken || !geometry || geometry.length === 0) return;
-    setTimeout(() => {
-      const isDark = isDarkTheme();
-      const style = isDark ? "mapbox://styles/mapbox/dark-v11" : "mapbox://styles/mapbox/streets-v12";
-      // geometry is already [lon, lat] from Mapbox Directions API
-      const map = new mapboxgl.Map({
-        container: mapId,
-        style,
-        center: geometry[0],
-        zoom: 13,
-        accessToken: ui.mapboxToken,
-        attributionControl: false,
-      });
-      map.on("load", () => {
-        map.addSource("route", {
-          type: "geojson",
-          data: { type: "Feature", geometry: { type: "LineString", coordinates: geometry } },
-        });
-        map.addLayer({
-          id: "route",
-          type: "line",
-          source: "route",
-          layout: { "line-join": "round", "line-cap": "round" },
-          paint: { "line-color": "#4A90D9", "line-width": 4 },
-        });
-        // Fit bounds to route
-        const bounds = new mapboxgl.LngLatBounds();
-        geometry.forEach(c => bounds.extend(c));
-        map.fitBounds(bounds, { padding: 30 });
-      });
-      // Start and end markers
-      new mapboxgl.Marker({ color: "#22c55e" })
-        .setLngLat(geometry[0])
-        .setPopup(new mapboxgl.Popup({ offset: 25 }).setText(from))
-        .addTo(map);
-      new mapboxgl.Marker({ color: "#ef4444" })
-        .setLngLat(geometry[geometry.length - 1])
-        .setPopup(new mapboxgl.Popup({ offset: 25 }).setText(to))
-        .addTo(map);
-      if (tile) { (tileMaps[tile.id] = tileMaps[tile.id] || []).push(map); }
-    }, 100);
-  });
+      addMapCard(chatLog, kind, event.payload);
+    });
+  }
 
   await listen("memory-changed", () => {
     // The model (or the Memory tile) saved/edited/deleted a note — refresh open tiles
@@ -499,6 +420,23 @@ export async function setupEventListeners() {
     `;
     chatLog.appendChild(el);
     chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
+  });
+
+  // create_pdf finished: show the document inline in the chat that asked for it.
+  await listen("pdf-created", (event) => {
+    const { session_id, path, pages, bytes } = event.payload;
+    const tile = getChatTileBySessionId(session_id);
+    if (!tile) return;
+    const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
+    if (!chatLog) return;
+    const stream = chatStreams[tile.id];
+    // Finalize any open text bubble so later tokens start below the PDF.
+    if (stream && stream.bubble) {
+      stream.bubble.innerHTML = renderMarkdown(stream.text);
+      stream.bubble = null;
+      stream.text = "";
+    }
+    addPdfCard(chatLog, { path, pages, kb: Math.round((bytes || 0) / 1024) });
   });
 
   await listen("screen-captured", (event) => {

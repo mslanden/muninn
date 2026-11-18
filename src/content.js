@@ -84,7 +84,7 @@ export function renderContentTile(tileObj, body) {
       let thumbHtml;
       if (kind === "image") {
         const src = convertFileSrc(path);
-        thumbHtml = `<img class="content-thumb" src="${src}" loading="lazy" />`;
+        thumbHtml = `<img class="content-thumb" src="${escapeHtml(src)}" loading="lazy" />`;
       } else {
         thumbHtml = `<div class="content-icon">${KIND_ICONS[kind] || KIND_ICONS.file}</div>`;
       }
@@ -92,7 +92,7 @@ export function renderContentTile(tileObj, body) {
       row.innerHTML = `
         ${thumbHtml}
         <div class="content-meta">
-          <strong>${name} <span class="content-badge content-badge--${kind}">${kind}</span></strong>
+          <strong>${escapeHtml(name)} <span class="content-badge content-badge--${kind}">${kind}</span></strong>
           <span class="muted">${formatFileSize(size)} · ${formatModifiedAt(modifiedAt)}</span>
         </div>
         <button class="task-action-btn danger">Delete</button>
@@ -168,6 +168,12 @@ export function showContentPreview(item) {
     video.controls = true;
     video.src = convertFileSrc(path);
     previewBody.appendChild(video);
+  } else if (kind === "pdf") {
+    const frame = document.createElement("iframe");
+    frame.className = "content-preview-pdf";
+    frame.title = name;
+    frame.src = convertFileSrc(path);
+    previewBody.appendChild(frame);
   } else if (kind === "text") {
     const pre = document.createElement("pre");
     pre.textContent = "Loading...";

@@ -4,11 +4,9 @@ import { enable as enableAutostart, disable as disableAutostart, isEnabled as is
 import { ui, navSettingsBtn } from "./state.js";
 import { updateModelChips } from "./chat.js";
 import { applyTheme, THEMES } from "./theme.js";
-import { field, escapeHtml } from "./utils.js";
+import { field } from "./utils.js";
 import { icon } from "./icons.js";
-import qrcode from "qrcode-generator";
 import { renderLogsTile } from "./logs.js";
-import { renderToolsTile } from "./toolspanel.js";
 
 // ========== SETTINGS TILE ==========
 export function renderSettingsTile(tileObj, body) {
@@ -19,7 +17,6 @@ export function renderSettingsTile(tileObj, body) {
         <button type="button" class="settings-tab" data-s-tab="voice">Voice &amp; Media</button>
         <button type="button" class="settings-tab" data-s-tab="ui">UI</button>
         <button type="button" class="settings-tab" data-s-tab="system">System</button>
-        <button type="button" class="settings-tab" data-s-tab="remote">Remote</button>
         <button type="button" class="settings-tab" data-s-tab="activity">Activity</button>
       </nav>
       <div class="settings-main">
@@ -105,18 +102,6 @@ export function renderSettingsTile(tileObj, body) {
             </div>
           </div></div>
 
-          <div class="settings-page" data-s-page="keys"><div class="settings-section">
-            <div class="settings-group">
-              <h3>Service keys</h3>
-              <p class="settings-hint">Model-provider keys live under Main → Model. These cover everything else.</p>
-              <input class="mb-2" type="password" placeholder="Groq API key (voice transcription)" data-s-groq="${tileObj.id}" />
-              <input class="mb-2" type="password" placeholder="Web search API key" data-s-search="${tileObj.id}" />
-              <input class="mb-2" type="password" placeholder="Together AI key (images)" data-s-together="${tileObj.id}" />
-              <input class="mb-2" type="password" placeholder="Mapbox API key (maps)" data-s-mapbox="${tileObj.id}" />
-              <input class="mb-2" type="password" placeholder="Fish Audio API key (TTS)" data-s-fishaudio="${tileObj.id}" />
-            </div>
-          </div></div>
-
           <div class="settings-page" data-s-page="voice"><div class="settings-section">
             <div class="settings-group">
               <h3>Voice</h3>
@@ -133,6 +118,7 @@ export function renderSettingsTile(tileObj, body) {
                 <button class="form-btn" data-s-tts-preview="${tileObj.id}" title="Preview voice">▶</button>
               </div>
               <span class="muted text-xs" data-s-tts-status="${tileObj.id}"></span>
+              <input class="mt-2" type="password" placeholder="Fish Audio API key (for Fish Audio voices)" data-s-fishaudio="${tileObj.id}" />
               <div class="form-row mt-2">
                 <select class="grow" data-s-sttprov="${tileObj.id}">
                   <option value="auto">Automatic (Groq → OpenAI)</option>
@@ -144,7 +130,7 @@ export function renderSettingsTile(tileObj, body) {
               <label class="checkbox-inline mt-2">
                 <input type="checkbox" data-s-localtranscribe="${tileObj.id}" /> On-device transcription (Apple Speech)
               </label>
-              <span class="muted text-xs">Voice input and video analysis transcribe on your Mac — no key, audio never leaves the device. Falls back to cloud whisper.</span>
+              <span class="muted text-xs">Voice input is transcribed on your Mac — no key, audio never leaves the device. Falls back to cloud whisper.</span>
             </div>
             <div class="settings-group">
               <h3>Images</h3>
@@ -159,13 +145,6 @@ export function renderSettingsTile(tileObj, body) {
                 <button class="form-btn" data-s-fetch-img-models="${tileObj.id}">Fetch</button>
               </div>
               <span class="muted text-xs" data-s-img-status="${tileObj.id}"></span>
-            </div>
-            <div class="settings-group">
-              <h3>Video</h3>
-              <label class="checkbox-inline">
-                <input type="checkbox" data-s-hwencode="${tileObj.id}" /> Hardware video encoding (VideoToolbox)
-              </label>
-              <span class="muted text-xs">Faster renders on the Mac's hardware encoder; falls back to software automatically.</span>
             </div>
           </div></div>
 
@@ -209,56 +188,11 @@ export function renderSettingsTile(tileObj, body) {
             </div>
           </div></div>
 
-          <div class="settings-page" data-s-page="remote"><div class="settings-section">
-            <div class="settings-group">
-              <h3>Remote access (phone)</h3>
-              <p class="settings-hint">Run a local server to chat with Muninn from your phone on the same Wi-Fi.</p>
-              <div class="form-row mb-2 items-center">
-                <button class="form-btn" data-s-mobile-toggle="${tileObj.id}">Enable</button>
-                <span class="muted text-xs" data-s-mobile-state="${tileObj.id}"></span>
-              </div>
-              <div class="form-row mb-1 items-center">
-                <input class="grow" type="number" min="1" max="65535" step="1" placeholder="8737" data-s-mobile-port="${tileObj.id}" />
-                <span class="muted text-xs nowrap">applies on next start</span>
-              </div>
-              <span class="muted text-xs text-danger" data-s-mobile-error="${tileObj.id}"></span>
-              <div class="mobile-pairing mt-3" data-s-mobile-pairing="${tileObj.id}" style="display:none;">
-                <div class="mobile-qr" data-s-mobile-qr="${tileObj.id}"></div>
-                <div class="mobile-urls" data-s-mobile-urls="${tileObj.id}"></div>
-                <div class="form-row mt-2">
-                  <button class="form-btn danger" data-s-mobile-regen="${tileObj.id}">Regenerate token</button>
-                </div>
-                <p class="settings-hint mt-2">Works on your Wi-Fi. For access from anywhere, install Tailscale on both devices — the URL then works over it too.</p>
-              </div>
-              <p class="settings-hint mt-2 text-danger">Anyone with this URL can chat and run commands as Muninn. Keep it private.</p>
-            </div>
-          </div></div>
-
-          <div class="settings-page" data-s-page="mcp"><div class="settings-section">
-            <div class="settings-group">
-              <h3>MCP Servers</h3>
-              <p class="settings-hint">Connect Model Context Protocol servers — their tools become available to Muninn in chat and agent runs. One JSON entry per server.</p>
-              <textarea rows="6" spellcheck="false" placeholder='[{"name": "github", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "..."}}]' data-s-mcp="${tileObj.id}"></textarea>
-              <div class="form-row mt-2">
-                <button class="form-btn" data-s-mcp-reload="${tileObj.id}">Reload Servers</button>
-              </div>
-              <div class="muted text-xs" data-s-mcp-status="${tileObj.id}" style="white-space:pre-line;"></div>
-            </div>
-          </div></div>
-
           <div class="settings-page" data-s-page="activity"><div class="settings-section">
             <div class="settings-group">
               <h3>Activity log</h3>
               <p class="settings-hint">Tool runs, messages, and background events.</p>
               <div class="settings-embed" data-s-activity-host="${tileObj.id}"></div>
-            </div>
-          </div></div>
-
-          <div class="settings-page" data-s-page="tools"><div class="settings-section">
-            <div class="settings-group">
-              <h3>Tool access</h3>
-              <p class="settings-hint">Enable or disable tools the assistant can call.</p>
-              <div class="settings-embed" data-s-tools-host="${tileObj.id}"></div>
             </div>
           </div></div>
 
@@ -271,10 +205,9 @@ export function renderSettingsTile(tileObj, body) {
     </div>
   `;
 
-  // Section switching — Activity / Tools hosts are filled lazily on first visit.
+  // Section switching — the Activity host is filled lazily on first visit.
   const tabsEl = body.querySelector(`[data-s-tabs="${tileObj.id}"]`);
   let activityMounted = false;
-  let toolsMounted = false;
   tabsEl.querySelectorAll(".settings-tab").forEach((tab) => {
     tab.addEventListener("click", () => {
       const id = tab.dataset.sTab;
@@ -286,11 +219,6 @@ export function renderSettingsTile(tileObj, body) {
         const host = body.querySelector(`[data-s-activity-host="${tileObj.id}"]`);
         renderLogsTile({ id: `settings-logs-${tileObj.id}`, el: tileObj.el }, host);
         activityMounted = true;
-      }
-      if (id === "tools" && !toolsMounted) {
-        const host = body.querySelector(`[data-s-tools-host="${tileObj.id}"]`);
-        renderToolsTile({ id: `settings-tools-${tileObj.id}`, el: tileObj.el }, host);
-        toolsMounted = true;
       }
     });
   });
@@ -306,10 +234,6 @@ export function renderSettingsTile(tileObj, body) {
   const modelDatalist = body.querySelector(`[data-s-model-list="${tileObj.id}"]`);
   const modelStatusEl = body.querySelector(`[data-s-model-status="${tileObj.id}"]`);
   const maxTokensInput = body.querySelector(`[data-s-maxtokens="${tileObj.id}"]`);
-  const groqInput = body.querySelector(`[data-s-groq="${tileObj.id}"]`);
-  const searchInput = body.querySelector(`[data-s-search="${tileObj.id}"]`);
-  const togetherInput = body.querySelector(`[data-s-together="${tileObj.id}"]`);
-  const mapboxInput = body.querySelector(`[data-s-mapbox="${tileObj.id}"]`);
   const imgProvSelect = body.querySelector(`[data-s-imgprov="${tileObj.id}"]`);
   const imgModelSelect = body.querySelector(`[data-s-imgmodel="${tileObj.id}"]`);
   const wsInput = body.querySelector(`[data-s-workspace="${tileObj.id}"]`);
@@ -327,158 +251,10 @@ export function renderSettingsTile(tileObj, body) {
   const keyFallbackInput = body.querySelector(`[data-s-keyfallback="${tileObj.id}"]`);
   const autoVerifyInput = body.querySelector(`[data-s-autoverify="${tileObj.id}"]`);
   const localTranscribeInput = body.querySelector(`[data-s-localtranscribe="${tileObj.id}"]`);
-  const hwEncodeInput = body.querySelector(`[data-s-hwencode="${tileObj.id}"]`);
   const approvalTimeoutInput = body.querySelector(`[data-s-approvaltimeout="${tileObj.id}"]`);
-  const mobileToggleBtn = body.querySelector(`[data-s-mobile-toggle="${tileObj.id}"]`);
-  const mobileStateEl = body.querySelector(`[data-s-mobile-state="${tileObj.id}"]`);
-  const mobilePortInput = body.querySelector(`[data-s-mobile-port="${tileObj.id}"]`);
-  const mobileErrorEl = body.querySelector(`[data-s-mobile-error="${tileObj.id}"]`);
-  const mobilePairingEl = body.querySelector(`[data-s-mobile-pairing="${tileObj.id}"]`);
-  const mobileQrEl = body.querySelector(`[data-s-mobile-qr="${tileObj.id}"]`);
-  const mobileUrlsEl = body.querySelector(`[data-s-mobile-urls="${tileObj.id}"]`);
-  const mobileRegenBtn = body.querySelector(`[data-s-mobile-regen="${tileObj.id}"]`);
-  const mcpInput = body.querySelector(`[data-s-mcp="${tileObj.id}"]`);
-  const mcpStatusEl = body.querySelector(`[data-s-mcp-status="${tileObj.id}"]`);
   const themeSelect = body.querySelector(`[data-s-theme="${tileObj.id}"]`);
   const statusEl = body.querySelector(`[data-s-status="${tileObj.id}"]`);
   const imgStatusEl = body.querySelector(`[data-s-img-status="${tileObj.id}"]`);
-
-  function renderMcpStatus(servers) {
-    if (!servers.length) {
-      mcpStatusEl.textContent = "No servers configured";
-      return;
-    }
-    mcpStatusEl.textContent = servers
-      .map(s => s.connected
-        ? `✓ ${s.name}: ${s.toolCount} tool${s.toolCount === 1 ? "" : "s"}`
-        : `✗ ${s.name}: ${s.error || "not connected"}`)
-      .join("\n");
-  }
-
-  async function refreshMcpStatus(reload = false) {
-    if (!(mcpInput.value || "").trim()) { mcpStatusEl.textContent = ""; return; }
-    mcpStatusEl.textContent = reload ? "Reloading servers…" : "Checking servers…";
-    try {
-      renderMcpStatus(await invoke(reload ? "reload_mcp_servers" : "get_mcp_status"));
-    } catch (e) {
-      mcpStatusEl.textContent = String(e);
-    }
-  }
-
-  // ---------- Remote access (phone) ----------
-  // Build the pairing URL ourselves from status fields rather than trusting arbitrary strings.
-  function mobileUrl(ip, port, token) {
-    return `http://${ip}:${port}/?token=${encodeURIComponent(token)}`;
-  }
-
-  function renderMobileStatus(status) {
-    const running = !!(status && status.running);
-    mobileToggleBtn.textContent = running ? "Disable" : "Enable";
-    mobileToggleBtn.classList.toggle("danger", running);
-    const port = status && status.port ? status.port : 8737;
-    if (running) {
-      mobileStateEl.textContent = `Running on port ${port}`;
-    } else {
-      mobileStateEl.textContent = "Off";
-    }
-    // Don't clobber a port the user is editing; only set placeholder-backing value when empty.
-    if (!mobilePortInput.value && status && status.port) mobilePortInput.value = status.port;
-
-    if (!running) {
-      mobilePairingEl.style.display = "none";
-      mobileQrEl.innerHTML = "";
-      mobileUrlsEl.innerHTML = "";
-      return;
-    }
-
-    const token = (status && status.token) || "";
-    const ips = Array.isArray(status && status.lan_ips) ? status.lan_ips : [];
-    // Build our own URL list from status fields.
-    const urls = ips.map(ip => mobileUrl(ip, port, token));
-
-    mobilePairingEl.style.display = "block";
-
-    // QR of the first LAN URL. The SVG is generated from our own data.
-    mobileQrEl.innerHTML = "";
-    if (urls.length) {
-      const qr = qrcode(0, "M");
-      qr.addData(urls[0]);
-      qr.make();
-      mobileQrEl.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2 });
-    }
-
-    // URL rows: selectable text + copy button each.
-    mobileUrlsEl.innerHTML = urls.map((url, i) => `
-      <div class="mobile-url-row">
-        <span class="mobile-url-text" data-s-mobile-url="${tileObj.id}-${i}">${escapeHtml(url)}</span>
-        <button class="form-btn" data-s-mobile-copy="${tileObj.id}-${i}">Copy</button>
-      </div>
-    `).join("");
-    urls.forEach((url, i) => {
-      const btn = mobileUrlsEl.querySelector(`[data-s-mobile-copy="${tileObj.id}-${i}"]`);
-      if (btn) btn.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(url);
-          btn.textContent = "Copied";
-          setTimeout(() => { btn.textContent = "Copy"; }, 1500);
-        } catch {}
-      });
-    });
-  }
-
-  async function refreshMobileStatus() {
-    try {
-      renderMobileStatus(await invoke("get_mobile_server_status"));
-    } catch (e) {
-      mobileErrorEl.textContent = String(e);
-    }
-  }
-
-  mobileToggleBtn.addEventListener("click", async () => {
-    mobileErrorEl.textContent = "";
-    let status;
-    try { status = await invoke("get_mobile_server_status"); } catch {}
-    const running = !!(status && status.running);
-    mobileToggleBtn.disabled = true;
-    try {
-      if (running) {
-        await invoke("stop_mobile_server");
-      } else {
-        // Persist the port first if the user changed it.
-        const portRaw = mobilePortInput.value.trim();
-        if (portRaw && /^\d+$/.test(portRaw)) {
-          await invoke("set_app_settings", { req: { settings: { "mobile/server_port": portRaw } } });
-        }
-        const addr = await invoke("start_mobile_server");
-        mobileStateEl.textContent = `Started on ${addr}`;
-      }
-    } catch (e) {
-      mobileErrorEl.textContent = String(e);
-    } finally {
-      mobileToggleBtn.disabled = false;
-      await refreshMobileStatus();
-    }
-  });
-
-  mobileRegenBtn.addEventListener("click", async () => {
-    // window.confirm() is a silent no-op in the Tauri webview — use the dialog plugin.
-    let yes = false;
-    try {
-      const { ask } = await import("@tauri-apps/plugin-dialog");
-      yes = await ask("This will disconnect the phone until you re-scan.", {
-        title: "Regenerate pairing token",
-        kind: "warning",
-      });
-    } catch (err) { console.error("ask dialog failed:", err); }
-    if (!yes) return;
-    mobileErrorEl.textContent = "";
-    try {
-      await invoke("regenerate_mobile_token");
-    } catch (e) {
-      mobileErrorEl.textContent = String(e);
-    }
-    await refreshMobileStatus();
-  });
 
   function ensureOption(select, value) {
     if (!value) return;
@@ -574,16 +350,8 @@ export function renderSettingsTile(tileObj, body) {
     keyFallbackInput.checked = s["llm/key_fallback"] !== "0"; // default ON when unset
     updateProviderHint();
 
-    groqInput.value = "";
-    searchInput.value = "";
-    togetherInput.value = "";
-    mapboxInput.value = "";
-    groqInput.placeholder = s["llm/groq_api_key"] ? "Groq key (saved)" : "Groq API key (voice transcription)";
-    searchInput.placeholder = s["search/brave_api_key"] ? "Search key (saved)" : "Web search key";
-    togetherInput.placeholder = s["imagegen/together_api_key"] ? "Together key (saved)" : "Together AI key";
-    mapboxInput.placeholder = s["maps/mapbox_api_key"] ? "Mapbox key (saved)" : "Mapbox API key (maps)";
     fishaudioInput.value = "";
-    fishaudioInput.placeholder = s["tts/fishaudio_api_key"] ? "Fish Audio key (saved)" : "Fish Audio API key";
+    fishaudioInput.placeholder = s["tts/fishaudio_api_key"] ? "Fish Audio key (saved — type to replace)" : "Fish Audio API key (for Fish Audio voices)";
     voiceidInput.value = s["tts/voice_id"] || "";
     ttsProvSelect.value = s["tts/provider"] || "minimax";
     ttsModelInput.value = s["tts/model"] || "";
@@ -600,13 +368,8 @@ export function renderSettingsTile(tileObj, body) {
     notifyInput.checked = s["notifications/enabled"] !== "false";
     qaShortcutInput.value = s["quickask/shortcut"] || "cmd+shift+space";
     autoVerifyInput.checked = s["safety/auto_verify"] === "1";
-    localTranscribeInput.checked = s["video/local_transcription"] === "1";
-    hwEncodeInput.checked = s["video/hw_encode"] !== "0"; // default ON when unset
+    localTranscribeInput.checked = s["voice/local_transcription"] === "1";
     approvalTimeoutInput.value = s["safety/approval_timeout_secs"] || "";
-    mobilePortInput.value = s["mobile/server_port"] || "";
-    refreshMobileStatus();
-    mcpInput.value = s["mcp/servers"] || "";
-    refreshMcpStatus();
 
     themeSelect.value = localStorage.getItem("muninn-theme") || "dark";
 
@@ -647,20 +410,12 @@ export function renderSettingsTile(tileObj, body) {
     }
     // Generic provider key → the selected provider's key setting (only when entered).
     if (provKeyInput.value.trim()) updates[providerKeyName(providerSelect.value)] = provKeyInput.value.trim();
-    if (groqInput.value.trim()) updates["llm/groq_api_key"] = groqInput.value.trim();
-    if (searchInput.value.trim()) updates["search/brave_api_key"] = searchInput.value.trim();
-    if (togetherInput.value.trim()) updates["imagegen/together_api_key"] = togetherInput.value.trim();
     if (fishaudioInput.value.trim()) updates["tts/fishaudio_api_key"] = fishaudioInput.value.trim();
-    if (mapboxInput.value.trim()) {
-      updates["maps/mapbox_api_key"] = mapboxInput.value.trim();
-      ui.mapboxToken = mapboxInput.value.trim();
-    }
     updates["tts/voice_id"] = voiceidInput.value.trim();
     updates["notifications/enabled"] = notifyInput.checked ? "true" : "false";
     updates["quickask/shortcut"] = qaShortcutInput.value.trim();
     updates["safety/auto_verify"] = autoVerifyInput.checked ? "1" : "0";
-    updates["video/local_transcription"] = localTranscribeInput.checked ? "1" : "0";
-    updates["video/hw_encode"] = hwEncodeInput.checked ? "1" : "0";
+    updates["voice/local_transcription"] = localTranscribeInput.checked ? "1" : "0";
     // Approval timeout: blank falls back to the Rust default (120); otherwise clamp to [15, 3600].
     const approvalRaw = approvalTimeoutInput.value.trim();
     if (approvalRaw === "") {
@@ -674,42 +429,27 @@ export function renderSettingsTile(tileObj, body) {
       return;
     }
 
-    const mcpJson = mcpInput.value.trim();
-    if (mcpJson) {
-      try {
-        JSON.parse(mcpJson);
-        updates["mcp/servers"] = mcpJson;
-      } catch {
-        statusEl.textContent = "MCP servers JSON is invalid — not saved";
-        setTimeout(() => { statusEl.textContent = ""; }, 3000);
-        return;
-      }
-    } else {
-      updates["mcp/servers"] = "";
-    }
-
     await invoke("set_app_settings", { req: { settings: updates } });
-    // Restart MCP connections so config edits (changed args/env) take effect.
-    if (mcpJson !== (ui.loadedSettings["mcp/servers"] || "")) refreshMcpStatus(true);
-    // Geocode location if changed and Mapbox key available
+    // Look the location up on Apple Maps only when it hasn't been yet: it changed, or an
+    // earlier lookup failed. Saving anything else in Settings doesn't touch it.
     const loc = locationInput.value.trim();
-    const token = ui.mapboxToken || updates["maps/mapbox_api_key"];
-    if (loc && token) {
+    let statusMs = 2000;
+    if (loc && ui.loadedSettings["user/location_coords_for"] !== loc) {
       try {
         await invoke("geocode_user_location", { location: loc });
+        ui.loadedSettings["user/location_coords_for"] = loc;
         statusEl.textContent = "Saved (location set ✓)";
       } catch (e) {
-        console.warn("Location geocoding failed:", e);
-        statusEl.textContent = "Saved (location failed: " + e + ")";
+        console.warn("Location lookup failed:", e);
+        statusEl.textContent = `Saved — but couldn't find "${loc}" on Apple Maps (${e}). Map searches won't be centered on you until it's found.`;
+        statusMs = 8000;
       }
-    } else if (loc && !token) {
-      statusEl.textContent = "Saved (add Mapbox key for location)";
     } else {
       statusEl.textContent = "Saved";
     }
     ui.loadedSettings = { ...ui.loadedSettings, ...updates };
     updateModelChips();
-    setTimeout(() => { statusEl.textContent = ""; }, 2000);
+    setTimeout(() => { statusEl.textContent = ""; }, statusMs);
     await loadS();
   });
 
@@ -869,9 +609,6 @@ export function renderSettingsTile(tileObj, body) {
       setTimeout(() => { statusEl.textContent = ""; }, 2000);
     } catch (e) { statusEl.textContent = String(e); }
   });
-
-  // MCP reload
-  body.querySelector(`[data-s-mcp-reload="${tileObj.id}"]`).addEventListener("click", () => refreshMcpStatus(true));
 
   // Theme
   themeSelect.addEventListener("change", () => {

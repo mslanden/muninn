@@ -127,14 +127,6 @@ pub struct MessageRecord {
     pub created_at: String,
 }
 
-/// Generated social-media copy for one platform (Studio tile).
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlatformCopy {
-    pub platform: String,
-    pub variants: Vec<String>,
-}
-
 #[derive(Serialize)]
 pub struct ToolLogRecord {
     pub kind: String,
@@ -179,15 +171,6 @@ pub struct ProjectRecord {
     pub agents_md: String,
     pub created_at: String,
     pub last_opened_at: String,
-}
-
-#[derive(Serialize)]
-pub struct ToolConfigRecord {
-    pub tool_id: String,
-    pub name: String,
-    pub description: String,
-    pub icon_name: String,
-    pub enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -295,6 +278,9 @@ pub struct ChatUsageEvent {
     pub session_id: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// How many of `input_tokens` the provider served from its prompt cache this round
+    /// (0 when the provider reports no cache usage).
+    pub cached_tokens: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -561,87 +547,3 @@ pub struct RunningProcess {
     pub child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiFeedRecord {
-    pub id: i64,
-    pub name: String,
-    pub topics: Vec<String>,
-    pub refresh_interval_mins: i64,
-    pub schedule_config: String,
-    pub last_refreshed_at: String,
-    pub created_at: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiFeedItemRecord {
-    pub id: i64,
-    pub feed_id: i64,
-    pub title: String,
-    pub summary: String,
-    pub url: String,
-    pub source_name: String,
-    pub image_url: String,
-    pub is_read: bool,
-    pub created_at: String,
-    pub article: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiWebSearchRequest {
-    pub query: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiWebSource {
-    pub title: String,
-    pub url: String,
-    pub snippet: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiWebSearchResult {
-    pub answer: String,
-    pub sources: Vec<AiWebSource>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiFeedRefreshResult {
-    pub items_added: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiFeedCreateRequest {
-    pub name: String,
-    pub topics: Vec<String>,
-    pub refresh_interval_mins: Option<i64>,
-    pub schedule_config: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiFeedUpdateRequest {
-    pub id: i64,
-    pub name: String,
-    pub topics: Vec<String>,
-    pub refresh_interval_mins: Option<i64>,
-    pub schedule_config: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiFeedIdRequest {
-    pub id: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiFeedItemIdRequest {
-    pub id: i64,
-}

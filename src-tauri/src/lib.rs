@@ -1,24 +1,26 @@
 mod audio;
+mod browser;
 mod calendar;
 mod commands;
 mod config_tools;
+mod context;
 mod db;
-mod feeds;
 mod interactive;
 mod llm;
 mod mail;
 mod mcp;
 mod memory;
-mod mobile;
 mod models;
 mod notify_user;
+mod procs;
 mod scheduler;
 mod screen;
+mod sidecar;
 mod skills;
-mod search;
+mod speech;
+mod maps;
 mod todos;
 mod tools;
-mod video;
 
 use models::RunningProcess;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -52,6 +54,9 @@ pub struct AppState {
     /// (media_type, base64). Drained per tool call by the chat loop. Side-channel because the
     /// tool dispatch returns plain text — see `tools::execute_agent_tool`.
     pub captured_images: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// Long-running shell processes (dev servers, watchers) the agent started with
+    /// `run_command` `background: true`. Stopped on quit and when their chat is deleted.
+    pub bg_processes: procs::ProcessRegistry,
     /// Folder of model-managed memory notes (`app_data_dir()/memory`). See memory.rs.
     pub memory_dir: PathBuf,
     /// Folder of skills (`app_data_dir()/skills/<name>/SKILL.md`). See skills.rs.
@@ -147,6 +152,12 @@ pub fn run() {
                 .build()
                 .map_err(|e| e.to_string())?;
 
+            // Background processes the agent started are mirrored to this ledger. If the
+            // previous run ended without stopping them (crash, SIGKILL, power loss), stop
+            // them now rather than leave dev servers holding ports forever.
+            let bg_ledger = data_dir.join("bg-processes.json");
+            let leftover_processes = procs::reap_orphans(&bg_ledger);
+
             app.manage(AppState {
                 workspace_root: Mutex::new(workspace_root),
                 workspace_root_canon: Mutex::new(workspace_root_canon),
@@ -159,9 +170,55 @@ pub fn run() {
                 pending_questions: Mutex::new(HashMap::new()),
                 mcp: mcp::McpManager::default(),
                 captured_images: Mutex::new(HashMap::new()),
+                bg_processes: procs::ProcessRegistry::with_ledger(bg_ledger),
                 memory_dir: data_dir.join("memory"),
                 skills_dir: data_dir.join("skills"),
             });
+
+            if !leftover_processes.is_empty() {
+                let state: tauri::State<'_, AppState> = app.state();
+                db::add_feed_item(
+                    &state,
+                    "system",
+                    "Stopped leftover background processes",
+                    &format!(
+                        "Muninn did not shut down cleanly last time. Stopped {} process(es) it had left running: {}",
+                        leftover_processes.len(),
+                        leftover_processes.join("; ")
+                    ),
+                    "robot",
+                    "",
+                );
+            }
+
+            // A termination signal (`kill`, logout, shutdown, an installer replacing the app)
+            // ends the process without running the tray's Quit handler, so stop the
+            // agent's background processes here too.
+            #[cfg(unix)]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+                        signal(SignalKind::terminate()),
+                        signal(SignalKind::interrupt()),
+                        signal(SignalKind::hangup()),
+                    ) else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = int.recv() => {}
+                        _ = hup.recv() => {}
+                    }
+                    handle.state::<AppState>().bg_processes.kill_all();
+                    handle.exit(0);
+                    // A termination signal must always end the process, even if the
+                    // event loop is slow to wind down.
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    std::process::exit(0);
+                });
+            }
 
             // Plugins
             app.handle().plugin(tauri_plugin_autostart::init(
@@ -217,7 +274,11 @@ pub fn run() {
                             let _ = w.set_focus();
                         }
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        // Don't leave agent-started dev servers running after the app is gone.
+                        app.state::<AppState>().bg_processes.kill_all();
+                        app.exit(0)
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -252,22 +313,6 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 scheduler::run_scheduler(scheduler_handle).await;
             });
-
-            // Auto-start the mobile companion server if the user left it enabled. Never crash
-            // boot on failure — log and continue.
-            {
-                let state: tauri::State<'_, AppState> = app.state();
-                let enabled = db::get_app_setting_value(&state, "mobile/server_enabled")
-                    .ok()
-                    .flatten()
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-                if enabled {
-                    if let Err(e) = mobile::start(app.handle().clone()) {
-                        eprintln!("[Mobile] autostart failed: {}", e);
-                    }
-                }
-            }
 
             // Watch the content directory for changes
             let watcher_handle = app.handle().clone();
@@ -310,7 +355,7 @@ pub fn run() {
             commands::get_messages,
             commands::export_session_markdown,
             commands::get_tool_logs,
-            commands::get_tools,
+            commands::get_session_cards,
             commands::set_tool_enabled,
             commands::get_feed_items,
             commands::mark_feed_item_read,
@@ -371,39 +416,11 @@ pub fn run() {
             commands::import_content_files,
             commands::read_content_text,
             commands::open_content_file,
+            commands::open_pdf,
             commands::read_image_base64,
-            commands::get_ai_feeds,
-            commands::create_ai_feed,
-            commands::delete_ai_feed,
-            commands::update_ai_feed,
-            commands::get_ai_feed_items,
-            commands::mark_ai_feed_item_read,
-            commands::generate_feed_item_image,
-            commands::generate_post_copy,
-            commands::writing_assist,
-            commands::generate_doc_html,
-            commands::open_html,
-            commands::generate_carousel,
-            commands::studio_save_png,
-            commands::studio_generate_image,
-            commands::video_probe,
-            commands::video_thumbnails,
-            commands::video_filter_presets,
-            commands::video_analyze,
-            commands::video_plan_edit,
-            commands::video_render,
-            commands::video_generate_shorts,
-            commands::video_cancel_shorts,
-            commands::video_compile,
-            commands::video_cancel_compile,
-            commands::video_export_subtitles,
-            commands::video_cancel_render,
-            commands::video_save_plan,
-            commands::video_load_plan,
-            commands::generate_feed_article,
-            commands::refresh_ai_feed,
-            commands::ai_web_search,
             commands::geocode_user_location,
+            commands::map_snapshot,
+            commands::open_in_maps,
             commands::get_session_todos,
             commands::answer_user_question,
             commands::cancel_user_question,
@@ -413,19 +430,27 @@ pub fn run() {
             commands::list_deferred_commands,
             commands::approve_deferred_command,
             commands::dismiss_deferred_command,
-            commands::start_mobile_server,
-            commands::stop_mobile_server,
-            commands::get_mobile_server_status,
-            commands::regenerate_mobile_token
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
             match event {
                 // Closing the window only hides it (see on_window_event), so keep
-                // the process alive for the tray/background agent.
-                tauri::RunEvent::ExitRequested { api, .. } => {
-                    api.prevent_exit();
+                // the process alive for the tray/background agent. That applies to exits
+                // the system asks for (`code` is None, e.g. the last window closing) —
+                // not to deliberate ones: `AppHandle::exit` (tray Quit, the signal
+                // handler) arrives here with `Some(code)`, and preventing it as well
+                // meant those could never actually exit the app.
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    if code.is_none() {
+                        api.prevent_exit();
+                    }
+                }
+                // The app really is exiting (tray Quit, a signal): last chance to stop
+                // the agent's background processes. Harmless if already done.
+                tauri::RunEvent::Exit => {
+                    use tauri::Manager;
+                    app.state::<AppState>().bg_processes.kill_all();
                 }
                 // macOS: clicking the Dock icon while no window is visible fires
                 // Reopen — bring the main window back instead of doing nothing.

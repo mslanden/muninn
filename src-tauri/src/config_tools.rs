@@ -79,6 +79,18 @@ pub(crate) fn setting_schema() -> &'static [SettingDef] {
             gated: false,
         },
         SettingDef {
+            key: "llm/context_budget_tokens",
+            description: "How much conversation (in tokens) is sent to the model before older messages are summarized and old tool output is cleared. Lower it for models with a small context window or to cut cost. Empty resets to the default (300000).",
+            kind: Int { min: 16_000, max: 2_000_000, allow_empty: true },
+            gated: false,
+        },
+        SettingDef {
+            key: "llm/auto_compact",
+            description: "Summarize the older part of a long conversation instead of silently dropping it once the context budget is reached (default on).",
+            kind: Bool01,
+            gated: false,
+        },
+        SettingDef {
             key: "llm/custom_base_url",
             description: "Base URL for the 'custom' OpenAI-compatible provider (e.g. http://localhost:11434/v1). Only used when llm/provider is 'custom'.",
             kind: Text,
@@ -139,14 +151,8 @@ pub(crate) fn setting_schema() -> &'static [SettingDef] {
             gated: false,
         },
         SettingDef {
-            key: "video/local_transcription",
-            description: "1 = try on-device transcription first for video work, falling back to cloud whisper on failure.",
-            kind: Bool01,
-            gated: false,
-        },
-        SettingDef {
-            key: "video/hw_encode",
-            description: "1 = use hardware (VideoToolbox) encoding for video renders.",
+            key: "voice/local_transcription",
+            description: "1 = transcribe voice input on-device (Apple Speech) first, falling back to cloud whisper on failure.",
             kind: Bool01,
             gated: false,
         },
@@ -190,12 +196,6 @@ pub(crate) fn setting_schema() -> &'static [SettingDef] {
             key: "safety/approval_timeout_secs",
             description: "Seconds to wait for the user to answer a dangerous-command approval prompt (15-3600). Empty resets to the default (120).",
             kind: Int { min: 15, max: 3600, allow_empty: true },
-            gated: true,
-        },
-        SettingDef {
-            key: "mobile/server_port",
-            description: "Port for the opt-in mobile companion server (1024-65535). Takes effect the next time the mobile server is started.",
-            kind: Int { min: 1024, max: 65535, allow_empty: true },
             gated: true,
         },
     ];
@@ -439,7 +439,6 @@ pub(crate) async fn set_setting_tool(
     let _ = app.emit("settings-updated", serde_json::json!({ "key": key }));
 
     let restart_note = match key {
-        "mobile/server_port" => " Takes effect the next time the mobile server starts.",
         "quickask/shortcut" => " May need an app restart to re-register the shortcut.",
         _ => "",
     };
@@ -563,10 +562,9 @@ mod tests {
     }
 
     #[test]
-    fn safety_and_server_keys_are_gated() {
+    fn safety_keys_are_gated() {
         assert!(def("safety/auto_verify").gated);
         assert!(def("safety/approval_timeout_secs").gated);
-        assert!(def("mobile/server_port").gated);
         assert!(!def("llm/model").gated);
         assert!(!def("user/name").gated);
     }
@@ -600,7 +598,7 @@ mod tests {
     fn bool_encodings_match_settings_ui() {
         // The Settings UI writes "1"/"0" for these...
         assert_eq!(validate_setting_value(def("safety/auto_verify"), "true").unwrap(), "1");
-        assert_eq!(validate_setting_value(def("video/hw_encode"), "off").unwrap(), "0");
+        assert_eq!(validate_setting_value(def("voice/local_transcription"), "off").unwrap(), "0");
         // ...but "true"/"false" for notifications.
         assert_eq!(validate_setting_value(def("notifications/enabled"), "1").unwrap(), "true");
         assert_eq!(validate_setting_value(def("notifications/enabled"), "no").unwrap(), "false");
