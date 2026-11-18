@@ -353,6 +353,7 @@ pub fn delete_session(state: State<AppState>, session_id: String) -> Result<bool
     crate::todos::clear_for_session(&state, &session_id);
     crate::interactive::cancel_question(&state, &session_id);
     state.bg_processes.kill_session(&session_id);
+    state.loaded_toolsets.clear(&session_id);
 
     with_db(&state, |db| {
         db.execute("DELETE FROM session_cards WHERE session_id = ?1", params![session_id.as_str()])
