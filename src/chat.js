@@ -5,6 +5,7 @@ import { tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml, field, projectLabel, renderMarkdown, threadLabel } from "./utils.js";
 import { addTile, saveLayout } from "./tilesys.js";
 import { icon, ravenLogo } from "./icons.js";
+import { isDarkTheme } from "./theme.js";
 
 // Refresh the sidebar chat-history list after session-mutating actions. Imported
 // lazily-at-call (module-level import is fine — only *invoked* at runtime, so the
@@ -908,6 +909,79 @@ export function addPdfCard(chatLog, { path, pages, kb }) {
   return el;
 }
 
+const fmtMapDistance = (m) => (m < 1000 ? `${Math.round(m)}m` : `${(m / 1000).toFixed(1)}km`);
+
+/// A map card for a search_places / search_nearby (`map-places`) or get_directions
+/// (`map-route`) result: the details, an Apple Maps image (rendered by the muninn-maps
+/// helper in the current light/dark theme) and an Open in Apple Maps button. Used for the
+/// live tool event and again when a reloaded chat redraws its saved cards.
+export function addMapCard(chatLog, kind, payload) {
+  let bodyHtml;
+  let snapshotReq = null;
+  if (kind === "map-route") {
+    const { from, to, from_point, to_point, mode, distance_km, duration_min, polyline, steps, note } = payload;
+    const distText = distance_km < 1 ? `${Math.round(distance_km * 1000)}m` : `${Number(distance_km).toFixed(1)}km`;
+    const durText = duration_min < 60 ? `${Math.round(duration_min)} min` : `${Math.floor(duration_min / 60)}h ${Math.round(duration_min % 60)}m`;
+    const markers = [
+      from_point && { ...from_point, label: "A", color: "green" },
+      to_point && { ...to_point, label: "B", color: "red" },
+    ].filter(Boolean);
+    if (markers.length) snapshotReq = { markers, route: polyline || [] };
+    bodyHtml = `
+      <div class="map-title">${escapeHtml(from)} \u2192 ${escapeHtml(to)}</div>
+      <div class="map-summary">${escapeHtml(mode || "driving")} \u00b7 ${distText} \u00b7 ${durText}</div>
+      ${note ? `<div class="muted text-xs">${escapeHtml(note)}</div>` : ""}
+      ${steps && steps.length > 0 ? `<details class="map-steps"><summary>Directions (${steps.length} steps)</summary>${steps.map(s => `<div class="map-step">${escapeHtml(s.instruction)} (${fmtMapDistance(s.distance)})</div>`).join("")}</details>` : ""}`;
+  } else {
+    const places = payload.results || [];
+    if (places.length) snapshotReq = { markers: places.map((r, i) => ({ lat: r.lat, lon: r.lon, label: String(i + 1) })) };
+    bodyHtml = `
+      <div class="map-title">${escapeHtml(payload.query)}</div>
+      <div class="map-results">
+        ${places.map((r, i) => {
+          const extra = [r.category, r.distance_m != null ? fmtMapDistance(r.distance_m) : "", r.phone].filter(Boolean).join(" · ");
+          return `<div class="map-result">${i + 1}. <strong>${escapeHtml(r.name)}</strong>${r.address && !String(r.name).includes(r.address) ? `<span class="muted"> — ${escapeHtml(r.address)}</span>` : ""}${extra ? `<div class="muted text-xs">${escapeHtml(extra)}</div>` : ""}</div>`;
+        }).join("")}
+      </div>`;
+  }
+
+  const el = document.createElement("div");
+  el.className = "turn";
+  el.innerHTML = `
+    <div class="turn-body">
+      ${bodyHtml}
+      <div class="map-image-wrap"><div class="map-image-loading">Loading map…</div></div>
+      <button class="form-btn map-open-btn" data-map-open>Open in Apple Maps</button>
+    </div>
+  `;
+  const wrap = el.querySelector(".map-image-wrap");
+  if (snapshotReq) {
+    invoke("map_snapshot", { req: { ...snapshotReq, dark: isDarkTheme(), width: 640, height: 320 } })
+      .then((src) => {
+        const img = document.createElement("img");
+        img.className = "map-image";
+        img.alt = "Map";
+        img.src = src;
+        wrap.replaceChildren(img);
+      })
+      .catch((e) => {
+        console.warn("map_snapshot", e);
+        wrap.remove();
+      });
+  } else {
+    wrap.remove();
+  }
+  const openBtn = el.querySelector("[data-map-open]");
+  if (payload.maps_url) {
+    openBtn.addEventListener("click", () => invoke("open_in_maps", { url: payload.maps_url }).catch((e) => console.error("open_in_maps", e)));
+  } else {
+    openBtn.remove();
+  }
+  chatLog.appendChild(el);
+  chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
+  return el;
+}
+
 export function addTurn(chatLog, role, text, images = []) {
   const turn = document.createElement("div");
   turn.className = `turn ${role}`;
@@ -1159,6 +1233,8 @@ export async function loadMessagesForTile(tileObj) {
   try {
     const messages = await invoke("get_messages", { sessionId: stream.sessionId });
     const logs = await invoke("get_tool_logs", { sessionId: stream.sessionId });
+    // Map cards are saved with the chat; older chats (or a failed lookup) just have none.
+    const cards = await invoke("get_session_cards", { sessionId: stream.sessionId }).catch(() => []);
 
     const timeline = [];
     for (const msg of messages) {
@@ -1183,6 +1259,14 @@ export async function loadMessagesForTile(tileObj) {
         output: log.output
       });
     }
+    for (const card of cards) {
+      timeline.push({
+        type: "card",
+        createdAt: field(card, "createdAt", "created_at") || "",
+        kind: card.kind,
+        payload: card.payload,
+      });
+    }
     timeline.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
     chatLog.innerHTML = "";
@@ -1190,7 +1274,9 @@ export async function loadMessagesForTile(tileObj) {
       showChatWelcome(chatLog);
     } else {
       for (const item of timeline) {
-        if (item.type === "tool") {
+        if (item.type === "card") {
+          addMapCard(chatLog, item.kind, item.payload || {});
+        } else if (item.type === "tool") {
           addToolCard(chatLog, item.kind, "", item.status);
           const pdf = item.status === "ok" ? pdfFromToolOutput(item.output) : null;
           if (pdf) addPdfCard(chatLog, pdf);

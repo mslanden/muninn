@@ -355,6 +355,7 @@ pub fn run() {
             commands::get_messages,
             commands::export_session_markdown,
             commands::get_tool_logs,
+            commands::get_session_cards,
             commands::set_tool_enabled,
             commands::get_feed_items,
             commands::mark_feed_item_read,

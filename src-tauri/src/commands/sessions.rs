@@ -137,6 +137,22 @@ pub fn export_session_markdown(state: State<AppState>, session_id: String) -> Re
     })
 }
 
+#[derive(serde::Serialize)]
+pub struct SessionCard {
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub created_at: String,
+}
+
+/// Cards tools showed in this chat (maps), oldest first, so a reloaded chat redraws them.
+#[tauri::command]
+pub fn get_session_cards(state: State<AppState>, session_id: String) -> Result<Vec<SessionCard>, String> {
+    Ok(crate::db::session_cards(&state, &session_id)?
+        .into_iter()
+        .map(|(kind, payload, created_at)| SessionCard { kind, payload, created_at })
+        .collect())
+}
+
 #[tauri::command]
 pub fn get_tool_logs(state: State<AppState>, session_id: String) -> Result<Vec<ToolLogRecord>, String> {
     with_db(&state, |db| {
@@ -339,6 +355,8 @@ pub fn delete_session(state: State<AppState>, session_id: String) -> Result<bool
     state.bg_processes.kill_session(&session_id);
 
     with_db(&state, |db| {
+        db.execute("DELETE FROM session_cards WHERE session_id = ?1", params![session_id.as_str()])
+            .map_err(|e| e.to_string())?;
         db.execute("DELETE FROM tool_logs WHERE session_id = ?1", params![session_id.as_str()])
             .map_err(|e| e.to_string())?;
         db.execute("DELETE FROM messages WHERE session_id = ?1", params![session_id.as_str()])

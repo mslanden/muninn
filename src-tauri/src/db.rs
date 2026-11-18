@@ -409,6 +409,16 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- Cards a tool showed in a chat (maps), so a reloaded chat can draw them again.
+        CREATE TABLE IF NOT EXISTS session_cards (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_cards_session ON session_cards(session_id, id);
+
         CREATE TABLE IF NOT EXISTS projects (
           path TEXT PRIMARY KEY,
           name TEXT NOT NULL DEFAULT '',
@@ -756,6 +766,45 @@ pub(crate) fn first_non_empty_setting(state: &AppState, keys: &[&str]) -> Result
         }
     }
     Ok(None)
+}
+
+/// Remember a card (e.g. a map) a tool showed in a chat, so reloading the chat redraws it.
+pub(crate) fn add_session_card(state: &AppState, session_id: &str, kind: &str, payload: &Value) {
+    let _ = with_db(state, |db| add_session_card_conn(db, session_id, kind, payload));
+}
+
+fn add_session_card_conn(db: &Connection, session_id: &str, kind: &str, payload: &Value) -> Result<(), String> {
+    db.execute(
+        "INSERT INTO session_cards (session_id, kind, payload_json) VALUES (?1, ?2, ?3)",
+        params![session_id, kind, payload.to_string()],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// A session's cards, oldest first: (kind, payload, created_at).
+pub(crate) fn session_cards(state: &AppState, session_id: &str) -> Result<Vec<(String, Value, String)>, String> {
+    with_db(state, |db| session_cards_conn(db, session_id))
+}
+
+fn session_cards_conn(db: &Connection, session_id: &str) -> Result<Vec<(String, Value, String)>, String> {
+    let mut stmt = db
+        .prepare("SELECT kind, payload_json, created_at FROM session_cards WHERE session_id = ?1 ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (kind, json, created_at) = row.map_err(|e| e.to_string())?;
+        // A row that no longer parses is skipped rather than failing the whole reload.
+        if let Ok(payload) = serde_json::from_str(&json) {
+            out.push((kind, payload, created_at));
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn add_feed_item(
@@ -1440,6 +1489,21 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(tools, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn session_cards_round_trip_in_order_per_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        add_session_card_conn(&conn, "s1", "map-places", &json!({"query": "tacos", "results": [{"name": "A"}]})).unwrap();
+        add_session_card_conn(&conn, "s2", "map-route", &json!({"from": "x"})).unwrap();
+        add_session_card_conn(&conn, "s1", "map-route", &json!({"from": "Balboa Park", "to": "Zoo"})).unwrap();
+        conn.execute("INSERT INTO session_cards (session_id, kind, payload_json) VALUES ('s1', 'map-places', 'not json')", []).unwrap();
+        let cards = session_cards_conn(&conn, "s1").unwrap();
+        assert_eq!(cards.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), vec!["map-places", "map-route"]);
+        assert_eq!(cards[0].1["results"][0]["name"], "A");
+        assert_eq!(cards[1].1["to"], "Zoo");
+        assert!(session_cards_conn(&conn, "nope").unwrap().is_empty());
     }
 
     #[test]

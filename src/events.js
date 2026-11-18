@@ -3,10 +3,10 @@ import { listen } from "@tauri-apps/api/event";
 import { tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml, renderMarkdown } from "./utils.js";
 import { getTilesByType, getChatTileBySessionId } from "./tilesys.js";
-import { playTts, maybeAutoSpeak, updateModelChips, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn, addPdfCard } from "./chat.js";
+import { playTts, maybeAutoSpeak, updateModelChips, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn, addPdfCard, addMapCard } from "./chat.js";
 import { renderTasksTile } from "./tasks.js";
 import { renderContentTile } from "./content.js";
-import { isDarkTheme, applyTheme } from "./theme.js";
+import { applyTheme } from "./theme.js";
 import { renderSettingsTile, refreshSettingsModalIfOpen } from "./settings.js";
 import { onSkillsChanged } from "./skills.js";
 import { refreshConnections } from "./connections.js";
@@ -209,94 +209,23 @@ export async function setupEventListeners() {
       });
   });
 
-  // Map results (search_places / search_nearby / get_directions): a card with an Apple
-  // Maps image rendered by the muninn-maps helper, the details, and an Open in Maps button.
-  function addMapCard(session_id, buildBody, snapshotReq, mapsUrl) {
-    const tile = getChatTileBySessionId(session_id);
-    if (!tile) return;
-    const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
-    if (!chatLog) return;
-    const stream = chatStreams[tile.id];
-    if (stream && stream.bubble) {
-      stream.bubble.innerHTML = renderMarkdown(stream.text);
-      stream.bubble = null;
-      stream.text = "";
-    }
-    const el = document.createElement("div");
-    el.className = "turn";
-    el.innerHTML = `
-      <div class="turn-body">
-        ${buildBody()}
-        <div class="map-image-wrap"><div class="map-image-loading">Loading map…</div></div>
-        <button class="form-btn map-open-btn" data-map-open>Open in Apple Maps</button>
-      </div>
-    `;
-    const wrap = el.querySelector(".map-image-wrap");
-    if (snapshotReq) {
-      invoke("map_snapshot", { req: { ...snapshotReq, dark: isDarkTheme(), width: 640, height: 320 } })
-        .then((src) => {
-          const img = document.createElement("img");
-          img.className = "map-image";
-          img.alt = "Map";
-          img.src = src;
-          wrap.replaceChildren(img);
-        })
-        .catch((e) => {
-          console.warn("map_snapshot", e);
-          wrap.remove();
-        });
-    } else {
-      wrap.remove();
-    }
-    const openBtn = el.querySelector("[data-map-open]");
-    if (mapsUrl) {
-      openBtn.addEventListener("click", () => invoke("open_in_maps", { url: mapsUrl }).catch((e) => console.error("open_in_maps", e)));
-    } else {
-      openBtn.remove();
-    }
-    chatLog.appendChild(el);
-    chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
+  // Map results (search_places / search_nearby / get_directions). The card is drawn by
+  // chat.js, which also redraws saved cards when a chat is reloaded.
+  for (const kind of ["map-places", "map-route"]) {
+    await listen(kind, (event) => {
+      const tile = getChatTileBySessionId(event.payload.session_id);
+      if (!tile) return;
+      const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
+      if (!chatLog) return;
+      const stream = chatStreams[tile.id];
+      if (stream && stream.bubble) {
+        stream.bubble.innerHTML = renderMarkdown(stream.text);
+        stream.bubble = null;
+        stream.text = "";
+      }
+      addMapCard(chatLog, kind, event.payload);
+    });
   }
-
-  const fmtDist = (m) => (m < 1000 ? `${Math.round(m)}m` : `${(m / 1000).toFixed(1)}km`);
-
-  await listen("map-places", (event) => {
-    const { session_id, query, results, maps_url } = event.payload;
-    const places = results || [];
-    addMapCard(
-      session_id,
-      () => `
-        <div class="map-title">${escapeHtml(query)}</div>
-        <div class="map-results">
-          ${places.map((r, i) => {
-            const extra = [r.category, r.distance_m != null ? fmtDist(r.distance_m) : "", r.phone].filter(Boolean).join(" · ");
-            return `<div class="map-result">${i + 1}. <strong>${escapeHtml(r.name)}</strong>${r.address && !String(r.name).includes(r.address) ? `<span class="muted"> — ${escapeHtml(r.address)}</span>` : ""}${extra ? `<div class="muted text-xs">${escapeHtml(extra)}</div>` : ""}</div>`;
-          }).join("")}
-        </div>`,
-      places.length ? { markers: places.map((r, i) => ({ lat: r.lat, lon: r.lon, label: String(i + 1) })) } : null,
-      maps_url,
-    );
-  });
-
-  await listen("map-route", (event) => {
-    const { session_id, from, to, from_point, to_point, mode, distance_km, duration_min, polyline, steps, note, maps_url } = event.payload;
-    const distText = distance_km < 1 ? `${Math.round(distance_km * 1000)}m` : `${distance_km.toFixed(1)}km`;
-    const durText = duration_min < 60 ? `${Math.round(duration_min)} min` : `${Math.floor(duration_min / 60)}h ${Math.round(duration_min % 60)}m`;
-    const markers = [
-      from_point && { ...from_point, label: "A", color: "green" },
-      to_point && { ...to_point, label: "B", color: "red" },
-    ].filter(Boolean);
-    addMapCard(
-      session_id,
-      () => `
-        <div class="map-title">${escapeHtml(from)} \u2192 ${escapeHtml(to)}</div>
-        <div class="map-summary">${escapeHtml(mode || "driving")} \u00b7 ${distText} \u00b7 ${durText}</div>
-        ${note ? `<div class="muted text-xs">${escapeHtml(note)}</div>` : ""}
-        ${steps && steps.length > 0 ? `<details class="map-steps"><summary>Directions (${steps.length} steps)</summary>${steps.map(s => `<div class="map-step">${escapeHtml(s.instruction)} (${fmtDist(s.distance)})</div>`).join("")}</details>` : ""}`,
-      markers.length ? { markers, route: polyline || [] } : null,
-      maps_url,
-    );
-  });
 
   await listen("memory-changed", () => {
     // The model (or the Memory tile) saved/edited/deleted a note — refresh open tiles

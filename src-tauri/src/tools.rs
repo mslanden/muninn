@@ -1181,9 +1181,26 @@ fn places_text(places: &[crate::maps::Place]) -> String {
     out
 }
 
-/// Show places in the chat that ran the tool (chat.js renders an Apple Maps image).
-fn emit_places(app: &AppHandle, session_id: &str, title: &str, places: &[crate::maps::Place], center: Option<&crate::maps::LatLon>, query: &str) {
-    let _ = app.emit(
+/// Show a map card in the chat that ran the tool (chat.js draws it with an Apple Maps
+/// image) and save it with the chat, so reloading the chat draws it again.
+fn show_map_card(app: &AppHandle, state: &AppState, session_id: &str, kind: &str, payload: serde_json::Value) {
+    crate::db::add_session_card(state, session_id, kind, &payload);
+    let _ = app.emit(kind, payload);
+}
+
+fn emit_places(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+    title: &str,
+    places: &[crate::maps::Place],
+    center: Option<&crate::maps::LatLon>,
+    query: &str,
+) {
+    show_map_card(
+        app,
+        state,
+        session_id,
         "map-places",
         serde_json::json!({
             "session_id": session_id,
@@ -1209,7 +1226,7 @@ pub(crate) async fn search_places_impl(
         return Ok(format!("No places found for '{}'.", query));
     }
     let center = places.first().map(|p| crate::maps::LatLon { lat: p.lat, lon: p.lon });
-    emit_places(app, session_id, query, &places, center.as_ref(), query);
+    emit_places(app, state, session_id, query, &places, center.as_ref(), query);
     Ok(places_text(&places))
 }
 
@@ -1252,7 +1269,7 @@ pub(crate) async fn search_nearby_impl(
             .partial_cmp(&b.distance_m.unwrap_or(f64::MAX))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    emit_places(app, session_id, &format!("Nearby: {}", what), &places, Some(&center), &what);
+    emit_places(app, state, session_id, &format!("Nearby: {}", what), &places, Some(&center), &what);
     Ok(places_text(&places))
 }
 
@@ -1268,7 +1285,10 @@ pub(crate) async fn get_directions_impl(
 ) -> Result<String, String> {
     let route = crate::maps::directions(from, to, mode.unwrap_or("driving"), saved_location(state).as_ref()).await?;
 
-    let _ = app.emit(
+    show_map_card(
+        app,
+        state,
+        session_id,
         "map-route",
         serde_json::json!({
             "session_id": session_id,
