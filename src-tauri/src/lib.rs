@@ -20,6 +20,7 @@ mod skills;
 mod speech;
 mod maps;
 mod todos;
+mod toolsets;
 mod tools;
 
 use models::RunningProcess;
@@ -57,6 +58,8 @@ pub struct AppState {
     /// Long-running shell processes (dev servers, watchers) the agent started with
     /// `run_command` `background: true`. Stopped on quit and when their chat is deleted.
     pub bg_processes: procs::ProcessRegistry,
+    /// Tool groups each chat has loaded (see toolsets.rs).
+    pub loaded_toolsets: toolsets::LoadedToolsets,
     /// Folder of model-managed memory notes (`app_data_dir()/memory`). See memory.rs.
     pub memory_dir: PathBuf,
     /// Folder of skills (`app_data_dir()/skills/<name>/SKILL.md`). See skills.rs.
@@ -171,6 +174,7 @@ pub fn run() {
                 mcp: mcp::McpManager::default(),
                 captured_images: Mutex::new(HashMap::new()),
                 bg_processes: procs::ProcessRegistry::with_ledger(bg_ledger),
+                loaded_toolsets: toolsets::LoadedToolsets::default(),
                 memory_dir: data_dir.join("memory"),
                 skills_dir: data_dir.join("skills"),
             });

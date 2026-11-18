@@ -1878,6 +1878,16 @@ pub(crate) async fn execute_agent_tool(
     // Alias mapping first, then check enabled
     let tool_name = canonical_tool_name(tool_name);
 
+    // load_tools isn't a switchable tool: it loads groups of enabled tools (toolsets.rs).
+    if tool_name == crate::toolsets::LOAD_TOOL {
+        let groups: Vec<String> = match arguments.get("groups").or_else(|| arguments.get("group")) {
+            Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            Some(Value::String(s)) => s.split(',').map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect(),
+            _ => Vec::new(),
+        };
+        return crate::toolsets::load(&state.loaded_toolsets, session_id, &groups, enabled);
+    }
+
     let is_enabled = enabled.contains(tool_name)
         || (tool_name == "search_nearby" && enabled.contains("search_places"));
     if !is_enabled {
@@ -3154,6 +3164,7 @@ pub(crate) fn canonical_tool_name(name: &str) -> &str {
         "append" | "append_to_file" => "append_file",
         "screenshot" | "screen_capture" | "take_screenshot" => "capture_screen",
         "screenshot_page" | "capture_url" | "preview_page" | "screenshot_url" => "capture_page",
+        "load_tool" | "enable_tools" | "load_toolset" | "load_group" => "load_tools",
         "pdf" | "make_pdf" | "html_to_pdf" | "print_pdf" | "export_pdf" => "create_pdf",
         "processes" | "background_process" | "background_processes" => "process",
         "launch_app" | "open_application" | "activate_app" => "open_app",

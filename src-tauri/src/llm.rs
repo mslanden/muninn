@@ -823,91 +823,10 @@ Home directory: {home}\n\
 Proactively use your tools — don't describe what you *could* do, just do it."
     );
 
-    // Add capability descriptions based on enabled tools
+    // Tools: the core is described by its own schemas; other groups load on demand and
+    // bring their guidance with them (see toolsets.rs).
     let enabled = enabled_tool_ids(state).unwrap_or_default();
-    let mut caps = Vec::new();
-    if enabled.contains("run_command") {
-        caps.push("Run shell commands (run_command)");
-    }
-    if enabled.contains("read_file") {
-        caps.push("Read files (read_file)");
-    }
-    if enabled.contains("write_file") {
-        caps.push("Write/create files (write_file)");
-    }
-    if enabled.contains("edit_file") {
-        caps.push("Edit part of a file by exact-string replacement (edit_file)");
-    }
-    if enabled.contains("append_file") {
-        caps.push("Append or prepend content to a file (append_file)");
-    }
-    if enabled.contains("capture_screen") {
-        caps.push("Take a screenshot of the screen, or of one app's window in the background without focusing it (capture_screen)");
-    }
-    if enabled.contains("capture_page") {
-        caps.push("Check a web page or local dev server in a headless browser — screenshot, console errors and page text, nothing shown on screen (capture_page)");
-    }
-    if enabled.contains("process") {
-        caps.push("Start long-running processes like dev servers with run_command background: true, then read their output or stop them (process)");
-    }
-    if enabled.contains("create_pdf") {
-        caps.push("Create PDF documents — reports, letters, slides — by writing HTML that is rendered to PDF (create_pdf)");
-    }
-    if enabled.contains("open_app") {
-        caps.push("Launch/focus a macOS app, optionally opening a URL (open_app)");
-    }
-    if enabled.contains("list_files") {
-        caps.push("List directory contents (list_files)");
-    }
-    if enabled.contains("search_files") {
-        caps.push("Search for text in files (search_files)");
-    }
-    if enabled.contains("web_search") {
-        caps.push("Search the web (web_search)");
-    }
-    if enabled.contains("web_fetch") {
-        caps.push("Fetch web page content (web_fetch)");
-    }
-    if enabled.contains("generate_image") {
-        caps.push("Generate images from text descriptions (generate_image) — images display automatically in the chat after generation, do NOT say you can't show images");
-    }
-    if enabled.contains("search_places") {
-        caps.push("Show a specific named place on the map (search_places) — Use this to locate and display a KNOWN place by name, like 'Arriba's Mexican Grill' or 'LAX airport'. This is a pin-drop tool, not a discovery tool. For discovering new places use search_nearby, for reviews/recommendations use web_search.");
-        caps.push("Browse nearby places by CATEGORY (search_nearby) — PREFERRED tool for 'find X near me' or 'what restaurants are around here' queries. Describe the kind of place in plain words: 'restaurant', 'mexican restaurant', 'coffee', 'gas station', 'grocery store', 'pharmacy', 'hotel', 'bar', 'gym', 'parking', 'pizza'. Always try search_nearby FIRST for general food/service discovery. Falls back to user's saved location automatically. For reviews, ratings, or 'best of' recommendations, combine with web_search for richer results.");
-    }
-    if enabled.contains("get_directions") {
-        caps.push("Get directions between locations — maps display automatically, ALWAYS use the tool instead of text-only directions. Driving, walking and cycling give a full route; transit gives travel time only. Cycling and transit work only where Apple Maps covers them — fall back to driving or walking if they fail. (get_directions)");
-    }
-    if enabled.contains("list_inbox") {
-        caps.push("Read the user's Apple Mail inbox (list_inbox) — recent messages, optionally unread-only.");
-    }
-    if enabled.contains("search_mail") {
-        caps.push("Search mail by subject or sender (search_mail) — subject+sender only, not body content.");
-    }
-    if enabled.contains("read_mail") {
-        caps.push("Read the full body of a specific message by Message-ID (read_mail).");
-    }
-    if enabled.contains("compose_draft") {
-        caps.push("Draft a new email (compose_draft) — saved to Drafts unsent for the user to review/send.");
-    }
-    if enabled.contains("reply_draft") {
-        caps.push("Draft a reply to a message (reply_draft) — saved to Drafts unsent.");
-    }
-    if enabled.contains("create_event") {
-        caps.push("Add an event to Apple Calendar (create_event).");
-    }
-    if enabled.contains("write_todos") {
-        caps.push("Maintain a plan / checklist for this turn (write_todos) — rewrite the full list each call.");
-    }
-    if enabled.contains("ask_user") && interactive {
-        caps.push("Ask the user a clarifying question and wait for their answer (ask_user).");
-    }
-    if !caps.is_empty() {
-        prompt.push_str("\n\nAvailable tools:\n");
-        for cap in &caps {
-            prompt.push_str(&format!("- {}\n", cap));
-        }
-    }
+    prompt.push_str(&crate::toolsets::prompt_section(&enabled));
 
     // Mode-dependent framing. In interactive mode the agent can ask the user
     // questions; in non-interactive (scheduled) mode it cannot and must make
@@ -919,75 +838,6 @@ This is a scheduled or background run — there is no user present to answer \
 questions. Make your best decision with the context you already have. If the \
 request is genuinely ambiguous, note the assumption you made in your output \
 rather than stalling.",
-        );
-    }
-
-    // Email tools need a short section too — explain the workflow and the read-only boundary.
-    // Keep in sync with build_project_system_prompt.
-    let any_mail_tool = ["list_inbox", "search_mail", "read_mail", "compose_draft", "reply_draft"]
-        .iter()
-        .any(|t| enabled.contains(*t));
-    if any_mail_tool {
-        prompt.push_str(
-            "\n\n## Email (Apple Mail)\n\
-You can read the user's email through Apple Mail on this Mac, across all \
-configured accounts (iCloud, Gmail, work IMAP, etc.). Writing is DRAFT-ONLY: \
-compose_draft and reply_draft save an unsent message to Drafts for the user \
-to review and send — you can NEVER send, delete, mark read, or otherwise \
-modify mail. After drafting, tell the user a draft is ready in Mail; do not \
-imply it was sent.\n\n\
-Typical flow: use list_inbox for \"what's new\" questions, search_mail when \
-the user names a person or topic, then read_mail on a specific message id \
-to quote or summarize content. The `id` returned by list/search is an \
-opaque handle — treat it as a black box and pass it verbatim to read_mail. \
-Handles are session-local to Mail.app (if Mail restarts, they become stale \
-and you need to re-list to get fresh ones; read_mail returns a clear error \
-when that happens).\n\n\
-Dates are ISO-8601 local time (YYYY-MM-DDTHH:MM:SS). For \"today's mail\" \
-or \"emails from last week\", push the date range into the `since` / `until` \
-parameters rather than listing everything and filtering mentally — Mail \
-handles the filter server-side, which is both faster and lets you see \
-matches further back than the recent-N limit. Use today's date from the \
-system prompt as your anchor. `until` is exclusive, so for \"today only\" \
-set `since` to today and `until` to tomorrow.\n\n\
-search_mail matches Subject + From only, not body. If the user asks \
-something that needs body content (\"what did Bob say about the budget?\"), \
-narrow with search_mail first, then read_mail each candidate.\n\n\
-First use of any mail tool will trigger a one-time macOS permission prompt \
-(\"Muninn wants to control Mail\"). If it fails with an authorization \
-error, tell the user to grant Automation access in System Settings.",
-        );
-    }
-
-    // Tasks need more context than a single bullet — append a dedicated section
-    // whenever any task tool is enabled. Keep this in sync with
-    // build_project_system_prompt.
-    let any_task_tool = ["create_task", "list_tasks", "update_task", "delete_task", "run_task"]
-        .iter()
-        .any(|t| enabled.contains(*t));
-    if any_task_tool {
-        prompt.push_str(
-            "\n\n## Scheduled automations (tasks)\n\
-Tasks are scheduled LLM runs — when a task fires, the scheduler starts a fresh \
-Muninn session and sends the task's `description` as the user message. You then \
-have your full toolset and act autonomously; no human is in the loop.\n\n\
-Write `description` as a direct instruction to future-you, imperative voice \
-(\"Summarize the top 5 HN posts and save to notes/hn.md\"), not as a memo \
-(\"HN summary\"). Be specific enough that future-you can act without clarification.\n\n\
-Tasks are automations, not to-dos. Don't create one for \"remind me to call mom\" \
-(that's a reminder). Do create one for recurring work the user wants Muninn to \
-handle on its own — daily digests, periodic checks, cron-style jobs. Schedule \
-strings: 'every 30m', 'daily at 09:00', 'every monday at 10:00', 'hourly'; \
-omit schedule for a one-shot delayed run. Call list_tasks before edit/delete \
-to get the id.\n\n\
-run_task fires a task immediately, regardless of its schedule. A task with no \
-schedule and no next_run is manual/chain-only: it never fires on its own — it \
-runs only via run_task or when chained from another task's chain_next. A failed \
-one-shot (errored run with no schedule to rejoin) gets status 'failed'; re-fire \
-it with run_task after fixing the cause.\n\n\
-Set `project_path` (an existing absolute folder) on a task to scope its run's \
-file/shell tools to that project; without it the task runs in the default \
-workspace root.",
         );
     }
 
@@ -1099,88 +949,13 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     );
 
     let enabled = enabled_tool_ids(state).unwrap_or_default();
-    let mut caps = Vec::new();
-    if enabled.contains("run_command") { caps.push("Run shell commands (run_command)"); }
-    if enabled.contains("read_file") { caps.push("Read files (read_file)"); }
-    if enabled.contains("write_file") { caps.push("Write/create files (write_file)"); }
-    if enabled.contains("edit_file") { caps.push("Edit part of a file by exact-string replacement (edit_file)"); }
-    if enabled.contains("append_file") { caps.push("Append or prepend content to a file (append_file)"); }
-    if enabled.contains("capture_screen") { caps.push("Take a screenshot of the screen, or of one app's window in the background without focusing it (capture_screen)"); }
-    if enabled.contains("capture_page") { caps.push("Check a web page or local dev server in a headless browser — screenshot, console errors and page text, nothing shown on screen (capture_page)"); }
-    if enabled.contains("process") { caps.push("Start long-running processes like dev servers with run_command background: true, then read their output or stop them (process)"); }
-    if enabled.contains("create_pdf") { caps.push("Create PDF documents — reports, letters, slides — by writing HTML that is rendered to PDF (create_pdf)"); }
-    if enabled.contains("open_app") { caps.push("Launch/focus a macOS app, optionally opening a URL (open_app)"); }
-    if enabled.contains("list_files") { caps.push("List directory contents (list_files)"); }
-    if enabled.contains("search_files") { caps.push("Search for text in files (search_files)"); }
-    if enabled.contains("web_search") { caps.push("Search the web (web_search)"); }
-    if enabled.contains("web_fetch") { caps.push("Fetch web page content (web_fetch)"); }
-    if enabled.contains("list_inbox") { caps.push("Read the user's Apple Mail inbox (list_inbox)"); }
-    if enabled.contains("search_mail") { caps.push("Search mail by subject or sender (search_mail)"); }
-    if enabled.contains("read_mail") { caps.push("Read a message by Message-ID (read_mail)"); }
-    if enabled.contains("compose_draft") { caps.push("Draft a new email, unsent (compose_draft)"); }
-    if enabled.contains("reply_draft") { caps.push("Draft a reply, unsent (reply_draft)"); }
-    if enabled.contains("create_event") { caps.push("Add an Apple Calendar event (create_event)"); }
-    if enabled.contains("write_todos") { caps.push("Maintain a checklist plan (write_todos)"); }
-    if enabled.contains("ask_user") && interactive { caps.push("Ask the user a clarifying question (ask_user)"); }
-    if !caps.is_empty() {
-        prompt.push_str("\n\nAvailable tools:\n");
-        for cap in &caps {
-            prompt.push_str(&format!("- {}\n", cap));
-        }
-    }
+    prompt.push_str(&crate::toolsets::prompt_section(&enabled));
 
     if !interactive {
         prompt.push_str(
             "\n\n## Autonomous mode\nScheduled/background run — no user present. \
 Make your best decision with the context you have and note any assumptions \
 in your output.",
-        );
-    }
-
-    // Keep this block in sync with build_system_prompt_with_context.
-    let any_mail_tool = ["list_inbox", "search_mail", "read_mail", "compose_draft", "reply_draft"]
-        .iter()
-        .any(|t| enabled.contains(*t));
-    if any_mail_tool {
-        prompt.push_str(
-            "\n\n## Email (Apple Mail)\n\
-Read + draft-only access to the user's Apple Mail across all configured accounts. \
-Reading: list_inbox for recent mail, search_mail for a person/topic (Subject+From \
-only, not body), read_mail with the opaque handle from list/search (handles are \
-session-local — re-list if Mail restarted). Writing is DRAFT-ONLY: compose_draft \
-and reply_draft save unsent messages to Drafts for the user to review and send — \
-you can never send, delete, or modify mail. Don't imply a draft was sent. First \
-call may trigger a macOS Automation prompt.",
-        );
-    }
-
-    // Keep this block in sync with build_system_prompt_with_context.
-    let any_task_tool = ["create_task", "list_tasks", "update_task", "delete_task", "run_task"]
-        .iter()
-        .any(|t| enabled.contains(*t));
-    if any_task_tool {
-        prompt.push_str(
-            "\n\n## Scheduled automations (tasks)\n\
-Tasks are scheduled LLM runs — when a task fires, the scheduler starts a fresh \
-Muninn session and sends the task's `description` as the user message. You then \
-have your full toolset and act autonomously; no human is in the loop.\n\n\
-Write `description` as a direct instruction to future-you, imperative voice \
-(\"Summarize the top 5 HN posts and save to notes/hn.md\"), not as a memo \
-(\"HN summary\"). Be specific enough that future-you can act without clarification.\n\n\
-Tasks are automations, not to-dos. Don't create one for \"remind me to call mom\" \
-(that's a reminder). Do create one for recurring work the user wants Muninn to \
-handle on its own — daily digests, periodic checks, cron-style jobs. Schedule \
-strings: 'every 30m', 'daily at 09:00', 'every monday at 10:00', 'hourly'; \
-omit schedule for a one-shot delayed run. Call list_tasks before edit/delete \
-to get the id.\n\n\
-run_task fires a task immediately, regardless of its schedule. A task with no \
-schedule and no next_run is manual/chain-only: it never fires on its own — it \
-runs only via run_task or when chained from another task's chain_next. A failed \
-one-shot (errored run with no schedule to rejoin) gets status 'failed'; re-fire \
-it with run_task after fixing the cause.\n\n\
-Set `project_path` (an existing absolute folder) on a task to scope its run's \
-file/shell tools to that project; without it the task runs in the default \
-workspace root.",
         );
     }
 
@@ -1916,6 +1691,13 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
             }),
         ));
     }
+    if enabled.contains(crate::toolsets::LOAD_TOOL) {
+        defs.push((
+            crate::toolsets::LOAD_TOOL,
+            "Load a group of tools listed under \"More tools\" in your instructions (e.g. mail, maps, tasks) so you can use them. Returns the tools now available and how to use them well. Loaded groups stay available for the rest of this chat.",
+            crate::toolsets::load_tool_schema(),
+        ));
+    }
     defs
 }
 
@@ -2645,6 +2427,18 @@ async fn execute_and_log_tool_call(
         app, state, session_id, exec_tools, tool_name, args_json, scope, interactive,
     )
     .await;
+    // Calling a tool from a group that isn't loaded yet loads the group (its schemas go out
+    // from the next round) and appends the group's guidance to this result.
+    let loaded_note = crate::toolsets::note_used(
+        &state.loaded_toolsets,
+        session_id,
+        crate::tools::canonical_tool_name(tool_name),
+        exec_tools,
+    );
+    let result = match loaded_note {
+        Some(note) => result.map(|out| format!("{}\n\n{}", out, note)).map_err(|e| format!("{}\n\n{}", e, note)),
+        None => result,
+    };
     match result {
         Ok(output) => {
             log_tool(state, session_id, tool_name, args_text, &output, "ok");
@@ -2874,10 +2668,13 @@ async fn run_tool_loop(
     // Failover can swap these mid-turn, so the loop works on owned copies.
     let mut provider = provider.clone();
     let mut model = model.to_string();
-    let mut tools = provider.tools_json(exec_tools, interactive);
-    // Merge in tools from configured MCP servers (lazy-connects on first turn;
-    // resilient — a broken server contributes nothing rather than failing the turn).
-    tools.extend(provider.mcp_tools_json(&state.mcp.connected_tools(state).await));
+    // Schemas sent this round: the core tools plus any loaded groups (toolsets.rs), plus
+    // tools from configured MCP servers (lazy-connects on first turn; a broken server
+    // contributes nothing rather than failing the turn). Rebuilt when a group loads.
+    let mcp_defs = state.mcp.connected_tools(state).await;
+    let mut active = crate::toolsets::active_tools(&state.loaded_toolsets, session_id, exec_tools);
+    let mut tools = provider.tools_json(&active, interactive);
+    tools.extend(provider.mcp_tools_json(&mcp_defs));
     let mut messages = provider.initial_messages(system_prompt, history);
     let max_tokens = resolve_max_output_tokens(state);
     let context_budget = crate::context::budget_chars(state);
@@ -2918,6 +2715,14 @@ async fn run_tool_loop(
 
         // Keep the outgoing conversation inside the budget: drop stale tool images, and once
         // it nears the limit clear old tool output (see context.rs).
+        // A group loaded last round (load_tools, or one of its tools called by name): send
+        // its schemas from now on.
+        let now_active = crate::toolsets::active_tools(&state.loaded_toolsets, session_id, exec_tools);
+        if now_active != active {
+            active = now_active;
+            tools = provider.tools_json(&active, interactive);
+            tools.extend(provider.mcp_tools_json(&mcp_defs));
+        }
         crate::context::maintain(&mut messages, context_budget);
         let response = match send_round(
             state, session_id, &provider, &model, system_prompt, &mut messages, &tools, max_tokens,
@@ -2956,8 +2761,8 @@ async fn run_tool_loop(
                 fallback_tried = true;
                 provider = fb_provider;
                 model = fb_model;
-                tools = provider.tools_json(exec_tools, interactive);
-                tools.extend(provider.mcp_tools_json(&state.mcp.connected_tools(state).await));
+                tools = provider.tools_json(&active, interactive);
+                tools.extend(provider.mcp_tools_json(&mcp_defs));
                 messages = provider.initial_messages(system_prompt, history);
                 continue;
             }
@@ -3732,6 +3537,55 @@ mod tests {
         assert!(tokens < 3_000, "a 2 MB screenshot must not read as {} tokens", tokens);
     }
 
+    /// Every tool name `tool_defs` can emit, found from its `enabled.contains("…")` guards.
+    fn every_tool_name() -> HashSet<String> {
+        let src = include_str!("llm.rs");
+        let defs_src = &src[src.find("fn tool_defs(").unwrap()..];
+        let defs_src = &defs_src[..defs_src.find("\n}\n").unwrap()];
+        let mut names = HashSet::new();
+        for part in defs_src.split("enabled.contains(\"").skip(1) {
+            names.insert(part[..part.find('"').unwrap()].to_string());
+        }
+        names.insert(crate::toolsets::LOAD_TOOL.to_string());
+        names
+    }
+
+    /// Adding a tool means putting it in the core or a group, or it would always be sent.
+    #[test]
+    fn every_tool_is_core_or_in_a_group() {
+        let all = every_tool_name();
+        let defs = tool_defs(&all, true);
+        for (name, _, _) in &defs {
+            assert!(
+                crate::toolsets::CORE.contains(name) || crate::toolsets::toolset_of(name).is_some() || *name == crate::toolsets::LOAD_TOOL,
+                "tool `{}` is neither core nor in a toolset (toolsets.rs)",
+                name
+            );
+        }
+        // And every grouped tool really exists.
+        let names: HashSet<&str> = defs.iter().map(|d| d.0).collect();
+        for ts in crate::toolsets::TOOLSETS {
+            for t in ts.tools {
+                assert!(names.contains(t), "toolset {} names unknown tool {}", ts.id, t);
+            }
+        }
+    }
+
+    /// The point of the diet: a fresh chat sends far fewer schema characters.
+    #[test]
+    fn a_fresh_chat_sends_a_fraction_of_the_tool_schemas() {
+        let size = |enabled: &HashSet<String>| -> usize {
+            tool_defs(enabled, true).iter().map(|(n, d, s)| n.len() + d.len() + s.to_string().len()).sum()
+        };
+        let mut enabled = every_tool_name();
+        enabled.remove(crate::toolsets::LOAD_TOOL);
+        let everything = size(&enabled);
+        let loaded = crate::toolsets::LoadedToolsets::default();
+        let fresh = size(&crate::toolsets::active_tools(&loaded, "c", &enabled));
+        assert!(fresh * 2 < everything, "fresh chat sends {} of {} schema chars", fresh, everything);
+        println!("tool schema chars: all {} -> fresh chat {}", everything, fresh);
+    }
+
     #[test]
     fn repeated_identical_failures_get_a_stop_note() {
         let mut failed = HashMap::new();
@@ -3842,3 +3696,4 @@ mod tests {
     }
 
 }
+
