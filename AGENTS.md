@@ -63,7 +63,7 @@ The frontend is split into ES modules under `src/`:
 - [registry.js](src/registry.js) — the tile-renderer registry. Dependency-free on purpose: feature modules call `registerTileRenderer(type, fn)` at import time, and `tilesys.js` looks renderers up at render time. Putting this anywhere with imports recreates a circular-init (TDZ) crash at boot.
 - [tilesys.js](src/tilesys.js) — tile add/remove/focus, grid layout, sidebar, pop-out windows, layout persistence.
 - [utils.js](src/utils.js) — pure helpers (`escapeHtml`, `renderMarkdown`, formatters).
-- Feature modules, one per tile type: [chat.js](src/chat.js), [logs.js](src/logs.js), [tasks.js](src/tasks.js), [toolspanel.js](src/toolspanel.js), [agents.js](src/agents.js), [memory.js](src/memory.js), [content.js](src/content.js), [workspaces.js](src/workspaces.js), [settings.js](src/settings.js); plus [schedule.js](src/schedule.js) (shared schedule widget), [events.js](src/events.js) (all Tauri event listeners), [theme.js](src/theme.js).
+- Feature modules, one per tile type: [chat.js](src/chat.js), [logs.js](src/logs.js), [tasks.js](src/tasks.js), [agents.js](src/agents.js), [memory.js](src/memory.js), [content.js](src/content.js), [workspaces.js](src/workspaces.js), [settings.js](src/settings.js); plus [schedule.js](src/schedule.js) (shared schedule widget), [events.js](src/events.js) (all Tauri event listeners), [theme.js](src/theme.js).
 
 Panels are rendered as "tiles" (the `tiles` array in `state.js`) keyed by numeric `id` (tiles can set a `cleanup()` callback for teardown on close). Theme is handled via `data-theme` on `<html>` and persisted to `localStorage` under `muninn-theme`.
 

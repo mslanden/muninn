@@ -19,7 +19,6 @@ export const TILE_TYPES = [
   { type: "content",    label: "Content",    dot: "off"   },
   // Still renderable (Settings sub-pages / restored layouts) but not in Apps nav.
   { type: "logs",       label: "Activity",   dot: "amber" },
-  { type: "tools",      label: "Tools",      dot: "purple" },
 ];
 
 export function updateWorkspaceGrid() {

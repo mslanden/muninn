@@ -2200,30 +2200,6 @@ body.tile-dragging * { cursor: grabbing !important; }
   white-space: nowrap;
 }
 
-/* ========== TOOLS TILE ========== */
-.tools-search {
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-}
-
-.tools-list { padding: 6px; }
-
-.tool-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: var(--r-sm);
-  transition: background 200ms ease;
-  cursor: pointer;
-}
-
-.tool-item:hover { background: var(--overlay-light); }
-
-.tool-info { flex: 1; min-width: 0; }
-.tool-name { font-size: var(--fs-sm); font-weight: 500; }
-.tool-desc { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
 /* ========== TOGGLE SWITCH ========== */
 .toggle-switch {
   position: relative;

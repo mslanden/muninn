@@ -174,15 +174,6 @@ pub struct ProjectRecord {
 }
 
 #[derive(Serialize)]
-pub struct ToolConfigRecord {
-    pub tool_id: String,
-    pub name: String,
-    pub description: String,
-    pub icon_name: String,
-    pub enabled: bool,
-}
-
-#[derive(Serialize)]
 pub struct FeedRecord {
     pub id: i64,
     pub kind: String,

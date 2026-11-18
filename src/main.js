@@ -4,7 +4,6 @@ import "./theme.js";
 import "./chat.js";
 import "./logs.js";
 import "./tasks.js";
-import "./toolspanel.js";
 import "./skills.js";
 import "./memory.js";
 import "./content.js";

@@ -7,7 +7,6 @@ import { applyTheme, THEMES } from "./theme.js";
 import { field } from "./utils.js";
 import { icon } from "./icons.js";
 import { renderLogsTile } from "./logs.js";
-import { renderToolsTile } from "./toolspanel.js";
 
 // ========== SETTINGS TILE ==========
 export function renderSettingsTile(tileObj, body) {
@@ -103,17 +102,6 @@ export function renderSettingsTile(tileObj, body) {
             </div>
           </div></div>
 
-          <div class="settings-page" data-s-page="keys"><div class="settings-section">
-            <div class="settings-group">
-              <h3>Service keys</h3>
-              <p class="settings-hint">Model-provider keys live under Main → Model. These cover everything else.</p>
-              <input class="mb-2" type="password" placeholder="Groq API key (voice transcription)" data-s-groq="${tileObj.id}" />
-              <input class="mb-2" type="password" placeholder="Web search API key" data-s-search="${tileObj.id}" />
-              <input class="mb-2" type="password" placeholder="Together AI key (images)" data-s-together="${tileObj.id}" />
-              <input class="mb-2" type="password" placeholder="Fish Audio API key (TTS)" data-s-fishaudio="${tileObj.id}" />
-            </div>
-          </div></div>
-
           <div class="settings-page" data-s-page="voice"><div class="settings-section">
             <div class="settings-group">
               <h3>Voice</h3>
@@ -130,6 +118,7 @@ export function renderSettingsTile(tileObj, body) {
                 <button class="form-btn" data-s-tts-preview="${tileObj.id}" title="Preview voice">▶</button>
               </div>
               <span class="muted text-xs" data-s-tts-status="${tileObj.id}"></span>
+              <input class="mt-2" type="password" placeholder="Fish Audio API key (for Fish Audio voices)" data-s-fishaudio="${tileObj.id}" />
               <div class="form-row mt-2">
                 <select class="grow" data-s-sttprov="${tileObj.id}">
                   <option value="auto">Automatic (Groq → OpenAI)</option>
@@ -199,31 +188,11 @@ export function renderSettingsTile(tileObj, body) {
             </div>
           </div></div>
 
-          <div class="settings-page" data-s-page="mcp"><div class="settings-section">
-            <div class="settings-group">
-              <h3>MCP Servers</h3>
-              <p class="settings-hint">Connect Model Context Protocol servers — their tools become available to Muninn in chat and agent runs. One JSON entry per server.</p>
-              <textarea rows="6" spellcheck="false" placeholder='[{"name": "github", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": "..."}}]' data-s-mcp="${tileObj.id}"></textarea>
-              <div class="form-row mt-2">
-                <button class="form-btn" data-s-mcp-reload="${tileObj.id}">Reload Servers</button>
-              </div>
-              <div class="muted text-xs" data-s-mcp-status="${tileObj.id}" style="white-space:pre-line;"></div>
-            </div>
-          </div></div>
-
           <div class="settings-page" data-s-page="activity"><div class="settings-section">
             <div class="settings-group">
               <h3>Activity log</h3>
               <p class="settings-hint">Tool runs, messages, and background events.</p>
               <div class="settings-embed" data-s-activity-host="${tileObj.id}"></div>
-            </div>
-          </div></div>
-
-          <div class="settings-page" data-s-page="tools"><div class="settings-section">
-            <div class="settings-group">
-              <h3>Tool access</h3>
-              <p class="settings-hint">Enable or disable tools the assistant can call.</p>
-              <div class="settings-embed" data-s-tools-host="${tileObj.id}"></div>
             </div>
           </div></div>
 
@@ -236,10 +205,9 @@ export function renderSettingsTile(tileObj, body) {
     </div>
   `;
 
-  // Section switching — Activity / Tools hosts are filled lazily on first visit.
+  // Section switching — the Activity host is filled lazily on first visit.
   const tabsEl = body.querySelector(`[data-s-tabs="${tileObj.id}"]`);
   let activityMounted = false;
-  let toolsMounted = false;
   tabsEl.querySelectorAll(".settings-tab").forEach((tab) => {
     tab.addEventListener("click", () => {
       const id = tab.dataset.sTab;
@@ -251,11 +219,6 @@ export function renderSettingsTile(tileObj, body) {
         const host = body.querySelector(`[data-s-activity-host="${tileObj.id}"]`);
         renderLogsTile({ id: `settings-logs-${tileObj.id}`, el: tileObj.el }, host);
         activityMounted = true;
-      }
-      if (id === "tools" && !toolsMounted) {
-        const host = body.querySelector(`[data-s-tools-host="${tileObj.id}"]`);
-        renderToolsTile({ id: `settings-tools-${tileObj.id}`, el: tileObj.el }, host);
-        toolsMounted = true;
       }
     });
   });
@@ -271,9 +234,6 @@ export function renderSettingsTile(tileObj, body) {
   const modelDatalist = body.querySelector(`[data-s-model-list="${tileObj.id}"]`);
   const modelStatusEl = body.querySelector(`[data-s-model-status="${tileObj.id}"]`);
   const maxTokensInput = body.querySelector(`[data-s-maxtokens="${tileObj.id}"]`);
-  const groqInput = body.querySelector(`[data-s-groq="${tileObj.id}"]`);
-  const searchInput = body.querySelector(`[data-s-search="${tileObj.id}"]`);
-  const togetherInput = body.querySelector(`[data-s-together="${tileObj.id}"]`);
   const imgProvSelect = body.querySelector(`[data-s-imgprov="${tileObj.id}"]`);
   const imgModelSelect = body.querySelector(`[data-s-imgmodel="${tileObj.id}"]`);
   const wsInput = body.querySelector(`[data-s-workspace="${tileObj.id}"]`);
@@ -292,33 +252,9 @@ export function renderSettingsTile(tileObj, body) {
   const autoVerifyInput = body.querySelector(`[data-s-autoverify="${tileObj.id}"]`);
   const localTranscribeInput = body.querySelector(`[data-s-localtranscribe="${tileObj.id}"]`);
   const approvalTimeoutInput = body.querySelector(`[data-s-approvaltimeout="${tileObj.id}"]`);
-  const mcpInput = body.querySelector(`[data-s-mcp="${tileObj.id}"]`);
-  const mcpStatusEl = body.querySelector(`[data-s-mcp-status="${tileObj.id}"]`);
   const themeSelect = body.querySelector(`[data-s-theme="${tileObj.id}"]`);
   const statusEl = body.querySelector(`[data-s-status="${tileObj.id}"]`);
   const imgStatusEl = body.querySelector(`[data-s-img-status="${tileObj.id}"]`);
-
-  function renderMcpStatus(servers) {
-    if (!servers.length) {
-      mcpStatusEl.textContent = "No servers configured";
-      return;
-    }
-    mcpStatusEl.textContent = servers
-      .map(s => s.connected
-        ? `✓ ${s.name}: ${s.toolCount} tool${s.toolCount === 1 ? "" : "s"}`
-        : `✗ ${s.name}: ${s.error || "not connected"}`)
-      .join("\n");
-  }
-
-  async function refreshMcpStatus(reload = false) {
-    if (!(mcpInput.value || "").trim()) { mcpStatusEl.textContent = ""; return; }
-    mcpStatusEl.textContent = reload ? "Reloading servers…" : "Checking servers…";
-    try {
-      renderMcpStatus(await invoke(reload ? "reload_mcp_servers" : "get_mcp_status"));
-    } catch (e) {
-      mcpStatusEl.textContent = String(e);
-    }
-  }
 
   function ensureOption(select, value) {
     if (!value) return;
@@ -414,14 +350,8 @@ export function renderSettingsTile(tileObj, body) {
     keyFallbackInput.checked = s["llm/key_fallback"] !== "0"; // default ON when unset
     updateProviderHint();
 
-    groqInput.value = "";
-    searchInput.value = "";
-    togetherInput.value = "";
-    groqInput.placeholder = s["llm/groq_api_key"] ? "Groq key (saved)" : "Groq API key (voice transcription)";
-    searchInput.placeholder = s["search/brave_api_key"] ? "Search key (saved)" : "Web search key";
-    togetherInput.placeholder = s["imagegen/together_api_key"] ? "Together key (saved)" : "Together AI key";
     fishaudioInput.value = "";
-    fishaudioInput.placeholder = s["tts/fishaudio_api_key"] ? "Fish Audio key (saved)" : "Fish Audio API key";
+    fishaudioInput.placeholder = s["tts/fishaudio_api_key"] ? "Fish Audio key (saved — type to replace)" : "Fish Audio API key (for Fish Audio voices)";
     voiceidInput.value = s["tts/voice_id"] || "";
     ttsProvSelect.value = s["tts/provider"] || "minimax";
     ttsModelInput.value = s["tts/model"] || "";
@@ -440,8 +370,6 @@ export function renderSettingsTile(tileObj, body) {
     autoVerifyInput.checked = s["safety/auto_verify"] === "1";
     localTranscribeInput.checked = s["voice/local_transcription"] === "1";
     approvalTimeoutInput.value = s["safety/approval_timeout_secs"] || "";
-    mcpInput.value = s["mcp/servers"] || "";
-    refreshMcpStatus();
 
     themeSelect.value = localStorage.getItem("muninn-theme") || "dark";
 
@@ -482,9 +410,6 @@ export function renderSettingsTile(tileObj, body) {
     }
     // Generic provider key → the selected provider's key setting (only when entered).
     if (provKeyInput.value.trim()) updates[providerKeyName(providerSelect.value)] = provKeyInput.value.trim();
-    if (groqInput.value.trim()) updates["llm/groq_api_key"] = groqInput.value.trim();
-    if (searchInput.value.trim()) updates["search/brave_api_key"] = searchInput.value.trim();
-    if (togetherInput.value.trim()) updates["imagegen/together_api_key"] = togetherInput.value.trim();
     if (fishaudioInput.value.trim()) updates["tts/fishaudio_api_key"] = fishaudioInput.value.trim();
     updates["tts/voice_id"] = voiceidInput.value.trim();
     updates["notifications/enabled"] = notifyInput.checked ? "true" : "false";
@@ -504,23 +429,7 @@ export function renderSettingsTile(tileObj, body) {
       return;
     }
 
-    const mcpJson = mcpInput.value.trim();
-    if (mcpJson) {
-      try {
-        JSON.parse(mcpJson);
-        updates["mcp/servers"] = mcpJson;
-      } catch {
-        statusEl.textContent = "MCP servers JSON is invalid — not saved";
-        setTimeout(() => { statusEl.textContent = ""; }, 3000);
-        return;
-      }
-    } else {
-      updates["mcp/servers"] = "";
-    }
-
     await invoke("set_app_settings", { req: { settings: updates } });
-    // Restart MCP connections so config edits (changed args/env) take effect.
-    if (mcpJson !== (ui.loadedSettings["mcp/servers"] || "")) refreshMcpStatus(true);
     // Look the location up on Apple Maps only when it hasn't been yet: it changed, or an
     // earlier lookup failed. Saving anything else in Settings doesn't touch it.
     const loc = locationInput.value.trim();
@@ -700,9 +609,6 @@ export function renderSettingsTile(tileObj, body) {
       setTimeout(() => { statusEl.textContent = ""; }, 2000);
     } catch (e) { statusEl.textContent = String(e); }
   });
-
-  // MCP reload
-  body.querySelector(`[data-s-mcp-reload="${tileObj.id}"]`).addEventListener("click", () => refreshMcpStatus(true));
 
   // Theme
   themeSelect.addEventListener("change", () => {
