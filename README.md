@@ -11,7 +11,6 @@ Muninn is a macOS-first personal AI assistant built with Tauri 2 + Rust. It runs
 - **On-device transcription** — voice input transcribed by a Swift sidecar using Apple SpeechAnalyzer (macOS 26) or SFSpeechRecognizer, with cloud whisper (Groq/OpenAI) fallback
 - **Memory** — persistent memories with embedding-based retrieval injected into chat
 - **Voice** — microphone recording + transcription for voice input
-- **Mobile companion** — opt-in in-process HTTP/WS server with QR pairing and an embedded phone UI
 - **Safety boundaries** — workspace-scoped file access, dangerous-command detection with user approval prompts, and secret redaction for anything crossing into the webview
 
 ## Prerequisites

@@ -2143,7 +2143,7 @@ pub(crate) async fn execute_agent_tool(
                     .or_default()
                     .push((media_type.clone(), data.clone()));
             }
-            // Surface the screenshot to any open UI (desktop chat tile + paired phones) so the
+            // Surface the screenshot in the chat tile so the
             // user can see what the model was shown. The base64 may be a few MB — acceptable.
             let _ = app.emit(
                 "screen-captured",
@@ -2177,7 +2177,7 @@ pub(crate) async fn execute_agent_tool(
             let capture = crate::browser::capture_page(&url, width, height, wait_ms).await?;
             if let Some((media_type, data)) = capture.image {
                 // Nothing appeared on the user's screen, so show them in the chat what the
-                // model was shown (same event the desktop tile and paired phones render
+                // model was shown (the same event the chat tile renders
                 // for capture_screen).
                 let _ = app.emit(
                     "screen-captured",

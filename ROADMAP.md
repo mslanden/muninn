@@ -13,14 +13,13 @@ Everything below is live on `main`:
 - **Safety** — workspace scoping, dangerous-command detection with approval prompts, LLM auto-verify with deferred-command queue, secret redaction, `/goal` auto-continue loop
 - **Media Studio** — shipped 2026-06/07, removed 2026-11-17: the video editor (ffmpeg engine, 5 agent tools, face-scan sidecar) and then the whole Studio tile (social copy, carousels, writing assist, HTML docs). Replaced by the `create_pdf` agent tool; everything else is done in chat.
 - **Transcription** — voice input via on-device Swift sidecar (SpeechAnalyzer on macOS 26, SFSpeechRecognizer fallback), cloud whisper (Groq/OpenAI) fallback
-- **Mobile** — opt-in in-process HTTP/WS server, QR pairing, embedded phone UI, mobile image support
+- **Mobile companion** — shipped 2026-07, removed 2026-11-18 at the user's request (axum HTTP/WS server, QR pairing, embedded phone UI)
 - **Memory** — profile/entities/episodes with embedding retrieval + backfill
 
 ## Next up (candidates)
 
 Platform:
 
-- [ ] Native iOS companion app with push notifications (paid Apple Developer account + paired devices ready; would replace/augment the embedded mobile web UI)
 - [ ] Frontend test suite (none exists today; `npm run lint` / `prettier` are in place)
 
 ## Non-goals (decided)

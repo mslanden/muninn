@@ -198,12 +198,6 @@ pub(crate) fn setting_schema() -> &'static [SettingDef] {
             kind: Int { min: 15, max: 3600, allow_empty: true },
             gated: true,
         },
-        SettingDef {
-            key: "mobile/server_port",
-            description: "Port for the opt-in mobile companion server (1024-65535). Takes effect the next time the mobile server is started.",
-            kind: Int { min: 1024, max: 65535, allow_empty: true },
-            gated: true,
-        },
     ];
     SCHEMA
 }
@@ -445,7 +439,6 @@ pub(crate) async fn set_setting_tool(
     let _ = app.emit("settings-updated", serde_json::json!({ "key": key }));
 
     let restart_note = match key {
-        "mobile/server_port" => " Takes effect the next time the mobile server starts.",
         "quickask/shortcut" => " May need an app restart to re-register the shortcut.",
         _ => "",
     };
@@ -569,10 +562,9 @@ mod tests {
     }
 
     #[test]
-    fn safety_and_server_keys_are_gated() {
+    fn safety_keys_are_gated() {
         assert!(def("safety/auto_verify").gated);
         assert!(def("safety/approval_timeout_secs").gated);
-        assert!(def("mobile/server_port").gated);
         assert!(!def("llm/model").gated);
         assert!(!def("user/name").gated);
     }

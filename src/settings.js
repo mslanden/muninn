@@ -4,9 +4,8 @@ import { enable as enableAutostart, disable as disableAutostart, isEnabled as is
 import { ui, navSettingsBtn } from "./state.js";
 import { updateModelChips } from "./chat.js";
 import { applyTheme, THEMES } from "./theme.js";
-import { field, escapeHtml } from "./utils.js";
+import { field } from "./utils.js";
 import { icon } from "./icons.js";
-import qrcode from "qrcode-generator";
 import { renderLogsTile } from "./logs.js";
 import { renderToolsTile } from "./toolspanel.js";
 
@@ -19,7 +18,6 @@ export function renderSettingsTile(tileObj, body) {
         <button type="button" class="settings-tab" data-s-tab="voice">Voice &amp; Media</button>
         <button type="button" class="settings-tab" data-s-tab="ui">UI</button>
         <button type="button" class="settings-tab" data-s-tab="system">System</button>
-        <button type="button" class="settings-tab" data-s-tab="remote">Remote</button>
         <button type="button" class="settings-tab" data-s-tab="activity">Activity</button>
       </nav>
       <div class="settings-main">
@@ -201,31 +199,6 @@ export function renderSettingsTile(tileObj, body) {
             </div>
           </div></div>
 
-          <div class="settings-page" data-s-page="remote"><div class="settings-section">
-            <div class="settings-group">
-              <h3>Remote access (phone)</h3>
-              <p class="settings-hint">Run a local server to chat with Muninn from your phone on the same Wi-Fi.</p>
-              <div class="form-row mb-2 items-center">
-                <button class="form-btn" data-s-mobile-toggle="${tileObj.id}">Enable</button>
-                <span class="muted text-xs" data-s-mobile-state="${tileObj.id}"></span>
-              </div>
-              <div class="form-row mb-1 items-center">
-                <input class="grow" type="number" min="1" max="65535" step="1" placeholder="8737" data-s-mobile-port="${tileObj.id}" />
-                <span class="muted text-xs nowrap">applies on next start</span>
-              </div>
-              <span class="muted text-xs text-danger" data-s-mobile-error="${tileObj.id}"></span>
-              <div class="mobile-pairing mt-3" data-s-mobile-pairing="${tileObj.id}" style="display:none;">
-                <div class="mobile-qr" data-s-mobile-qr="${tileObj.id}"></div>
-                <div class="mobile-urls" data-s-mobile-urls="${tileObj.id}"></div>
-                <div class="form-row mt-2">
-                  <button class="form-btn danger" data-s-mobile-regen="${tileObj.id}">Regenerate token</button>
-                </div>
-                <p class="settings-hint mt-2">Works on your Wi-Fi. For access from anywhere, install Tailscale on both devices — the URL then works over it too.</p>
-              </div>
-              <p class="settings-hint mt-2 text-danger">Anyone with this URL can chat and run commands as Muninn. Keep it private.</p>
-            </div>
-          </div></div>
-
           <div class="settings-page" data-s-page="mcp"><div class="settings-section">
             <div class="settings-group">
               <h3>MCP Servers</h3>
@@ -319,14 +292,6 @@ export function renderSettingsTile(tileObj, body) {
   const autoVerifyInput = body.querySelector(`[data-s-autoverify="${tileObj.id}"]`);
   const localTranscribeInput = body.querySelector(`[data-s-localtranscribe="${tileObj.id}"]`);
   const approvalTimeoutInput = body.querySelector(`[data-s-approvaltimeout="${tileObj.id}"]`);
-  const mobileToggleBtn = body.querySelector(`[data-s-mobile-toggle="${tileObj.id}"]`);
-  const mobileStateEl = body.querySelector(`[data-s-mobile-state="${tileObj.id}"]`);
-  const mobilePortInput = body.querySelector(`[data-s-mobile-port="${tileObj.id}"]`);
-  const mobileErrorEl = body.querySelector(`[data-s-mobile-error="${tileObj.id}"]`);
-  const mobilePairingEl = body.querySelector(`[data-s-mobile-pairing="${tileObj.id}"]`);
-  const mobileQrEl = body.querySelector(`[data-s-mobile-qr="${tileObj.id}"]`);
-  const mobileUrlsEl = body.querySelector(`[data-s-mobile-urls="${tileObj.id}"]`);
-  const mobileRegenBtn = body.querySelector(`[data-s-mobile-regen="${tileObj.id}"]`);
   const mcpInput = body.querySelector(`[data-s-mcp="${tileObj.id}"]`);
   const mcpStatusEl = body.querySelector(`[data-s-mcp-status="${tileObj.id}"]`);
   const themeSelect = body.querySelector(`[data-s-theme="${tileObj.id}"]`);
@@ -354,121 +319,6 @@ export function renderSettingsTile(tileObj, body) {
       mcpStatusEl.textContent = String(e);
     }
   }
-
-  // ---------- Remote access (phone) ----------
-  // Build the pairing URL ourselves from status fields rather than trusting arbitrary strings.
-  function mobileUrl(ip, port, token) {
-    return `http://${ip}:${port}/?token=${encodeURIComponent(token)}`;
-  }
-
-  function renderMobileStatus(status) {
-    const running = !!(status && status.running);
-    mobileToggleBtn.textContent = running ? "Disable" : "Enable";
-    mobileToggleBtn.classList.toggle("danger", running);
-    const port = status && status.port ? status.port : 8737;
-    if (running) {
-      mobileStateEl.textContent = `Running on port ${port}`;
-    } else {
-      mobileStateEl.textContent = "Off";
-    }
-    // Don't clobber a port the user is editing; only set placeholder-backing value when empty.
-    if (!mobilePortInput.value && status && status.port) mobilePortInput.value = status.port;
-
-    if (!running) {
-      mobilePairingEl.style.display = "none";
-      mobileQrEl.innerHTML = "";
-      mobileUrlsEl.innerHTML = "";
-      return;
-    }
-
-    const token = (status && status.token) || "";
-    const ips = Array.isArray(status && status.lan_ips) ? status.lan_ips : [];
-    // Build our own URL list from status fields.
-    const urls = ips.map(ip => mobileUrl(ip, port, token));
-
-    mobilePairingEl.style.display = "block";
-
-    // QR of the first LAN URL. The SVG is generated from our own data.
-    mobileQrEl.innerHTML = "";
-    if (urls.length) {
-      const qr = qrcode(0, "M");
-      qr.addData(urls[0]);
-      qr.make();
-      mobileQrEl.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2 });
-    }
-
-    // URL rows: selectable text + copy button each.
-    mobileUrlsEl.innerHTML = urls.map((url, i) => `
-      <div class="mobile-url-row">
-        <span class="mobile-url-text" data-s-mobile-url="${tileObj.id}-${i}">${escapeHtml(url)}</span>
-        <button class="form-btn" data-s-mobile-copy="${tileObj.id}-${i}">Copy</button>
-      </div>
-    `).join("");
-    urls.forEach((url, i) => {
-      const btn = mobileUrlsEl.querySelector(`[data-s-mobile-copy="${tileObj.id}-${i}"]`);
-      if (btn) btn.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(url);
-          btn.textContent = "Copied";
-          setTimeout(() => { btn.textContent = "Copy"; }, 1500);
-        } catch {}
-      });
-    });
-  }
-
-  async function refreshMobileStatus() {
-    try {
-      renderMobileStatus(await invoke("get_mobile_server_status"));
-    } catch (e) {
-      mobileErrorEl.textContent = String(e);
-    }
-  }
-
-  mobileToggleBtn.addEventListener("click", async () => {
-    mobileErrorEl.textContent = "";
-    let status;
-    try { status = await invoke("get_mobile_server_status"); } catch {}
-    const running = !!(status && status.running);
-    mobileToggleBtn.disabled = true;
-    try {
-      if (running) {
-        await invoke("stop_mobile_server");
-      } else {
-        // Persist the port first if the user changed it.
-        const portRaw = mobilePortInput.value.trim();
-        if (portRaw && /^\d+$/.test(portRaw)) {
-          await invoke("set_app_settings", { req: { settings: { "mobile/server_port": portRaw } } });
-        }
-        const addr = await invoke("start_mobile_server");
-        mobileStateEl.textContent = `Started on ${addr}`;
-      }
-    } catch (e) {
-      mobileErrorEl.textContent = String(e);
-    } finally {
-      mobileToggleBtn.disabled = false;
-      await refreshMobileStatus();
-    }
-  });
-
-  mobileRegenBtn.addEventListener("click", async () => {
-    // window.confirm() is a silent no-op in the Tauri webview — use the dialog plugin.
-    let yes = false;
-    try {
-      const { ask } = await import("@tauri-apps/plugin-dialog");
-      yes = await ask("This will disconnect the phone until you re-scan.", {
-        title: "Regenerate pairing token",
-        kind: "warning",
-      });
-    } catch (err) { console.error("ask dialog failed:", err); }
-    if (!yes) return;
-    mobileErrorEl.textContent = "";
-    try {
-      await invoke("regenerate_mobile_token");
-    } catch (e) {
-      mobileErrorEl.textContent = String(e);
-    }
-    await refreshMobileStatus();
-  });
 
   function ensureOption(select, value) {
     if (!value) return;
@@ -590,8 +440,6 @@ export function renderSettingsTile(tileObj, body) {
     autoVerifyInput.checked = s["safety/auto_verify"] === "1";
     localTranscribeInput.checked = s["voice/local_transcription"] === "1";
     approvalTimeoutInput.value = s["safety/approval_timeout_secs"] || "";
-    mobilePortInput.value = s["mobile/server_port"] || "";
-    refreshMobileStatus();
     mcpInput.value = s["mcp/servers"] || "";
     refreshMcpStatus();
 

@@ -18,7 +18,6 @@ mod projects;
 mod voice;
 mod mcp;
 mod safety;
-mod mobile;
 
 pub use sessions::*;
 pub use toolconfig::*;
@@ -37,4 +36,3 @@ pub use projects::*;
 pub use voice::*;
 pub use mcp::*;
 pub use safety::*;
-pub use mobile::*;
