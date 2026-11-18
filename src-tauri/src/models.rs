@@ -127,14 +127,6 @@ pub struct MessageRecord {
     pub created_at: String,
 }
 
-/// Generated social-media copy for one platform (Studio tile).
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlatformCopy {
-    pub platform: String,
-    pub variants: Vec<String>,
-}
-
 #[derive(Serialize)]
 pub struct ToolLogRecord {
     pub kind: String,

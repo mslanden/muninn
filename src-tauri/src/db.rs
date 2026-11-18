@@ -535,6 +535,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
     for (tool_id, name, description, icon_name) in [
         ("capture_page", "Capture Page", "Screenshot a web page or local dev server in a headless browser, with its console output and text.", "image"),
         ("process", "Background Processes", "Read the output of, or stop, long-running processes started by Run Command.", "terminal"),
+        ("create_pdf", "Create PDF", "Render an HTML document to a PDF with a headless browser.", "file"),
     ] {
         conn.execute(
             r#"
@@ -562,6 +563,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
         ("open_app", "Open App", "Launch or focus a macOS app, optionally opening a URL in it.", "terminal"),
         ("capture_page", "Capture Page", "Screenshot a web page or local dev server in a headless browser, with its console output and text.", "image"),
         ("process", "Background Processes", "Read the output of, or stop, long-running processes started by Run Command.", "terminal"),
+        ("create_pdf", "Create PDF", "Render an HTML document to a PDF with a headless browser.", "file"),
         ("list_files", "List Files", "List files in a workspace directory.", "folder"),
         (
             "search_files",

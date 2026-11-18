@@ -731,6 +731,45 @@ pub(crate) fn validate_public_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `<title>` of an HTML document, if it has a non-empty one.
+fn html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let open = lower.find("<title")?;
+    let start = open + lower[open..].find('>')? + 1;
+    let end = start + lower[start..].find("</title")?;
+    let title = html.get(start..end)?.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then_some(title)
+}
+
+/// A safe `.pdf` file name from a title or requested name: letters, digits, `-`, `_`.
+fn pdf_file_name(name: &str) -> String {
+    let stem = name.trim().trim_end_matches(".pdf").trim_end_matches(".PDF");
+    let mut slug: String = stem
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '-' })
+        .collect();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    let slug: String = slug.trim_matches('-').chars().take(80).collect();
+    format!("{}.pdf", if slug.is_empty() { "document" } else { &slug })
+}
+
+/// `dir/name`, or `dir/stem-2.ext`, `-3`, ... — whichever doesn't exist yet.
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = Path::new(name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|s| s.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
+    (2..)
+        .map(|n| dir.join(format!("{}-{}{}", stem, n, ext)))
+        .find(|p| !p.exists())
+        .unwrap_or(candidate)
+}
+
 /// Extract the lowercased host of an http(s) URL, rejecting every other scheme.
 fn http_url_host(url: &str) -> Result<String, String> {
     let trimmed = url.trim();
@@ -1036,9 +1075,8 @@ pub(crate) async fn download_feed_image(state: &AppState, app: &AppHandle, url: 
     Ok(path.display().to_string())
 }
 
-/// Generate an image and return the saved file path. Shared by the agent tool
-/// (`generate_image_impl`, which emits events and returns a status string) and the Studio
-/// image command (which needs the actual path).
+/// Generate an image into the Content library and return the saved file path
+/// (`generate_image_impl` wraps it for the agent tool: events + a status string).
 pub(crate) async fn generate_image_to_path(
     app: &AppHandle,
     state: &AppState,
@@ -2488,6 +2526,58 @@ pub(crate) async fn execute_agent_tool(
             }
             Ok(capture.report)
         }
+        "create_pdf" => {
+            let html = arguments.get("html").and_then(Value::as_str).filter(|h| !h.trim().is_empty());
+            let target = arguments
+                .get("path")
+                .or_else(|| arguments.get("url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty());
+            let resolved_url;
+            let source = match (html, target) {
+                (Some(h), None) => crate::browser::PdfSource::Html(h),
+                (None, Some(t)) => {
+                    resolved_url = resolve_page_target(&effective_scope, t)?;
+                    crate::browser::PdfSource::Url(&resolved_url)
+                }
+                (Some(_), Some(_)) => return Err("pass either html or path/url, not both".to_string()),
+                (None, None) => {
+                    return Err("pass html (a complete HTML document) or the path/url of a page to print".to_string())
+                }
+            };
+            let wait_ms = arg_u64(arguments, "wait_ms").unwrap_or(1000).clamp(0, 20_000);
+            let title = html.and_then(html_title);
+            let (out, in_content) = match arguments.get("output_path").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()) {
+                Some(p) => {
+                    if !p.to_ascii_lowercase().ends_with(".pdf") {
+                        return Err("output_path must end in .pdf".to_string());
+                    }
+                    (resolve_within_workspace(&effective_scope.root, &effective_scope.root_canon, p, true)?, false)
+                }
+                None => {
+                    let name = arguments
+                        .get("filename")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or(title)
+                        .unwrap_or_else(|| "document".to_string());
+                    (unique_path(&content_dir(app)?, &pdf_file_name(&name)), true)
+                }
+            };
+            let pdf = crate::browser::print_pdf(source, &out, wait_ms).await?;
+            if in_content {
+                let _ = app.emit("content-changed", ());
+            }
+            Ok(format!(
+                "Saved a {}-page PDF ({} KB) to {}{}.{}",
+                pdf.pages,
+                pdf.bytes / 1024,
+                out.display(),
+                if in_content { " (in the Content library)" } else { "" },
+                pdf.blocked_note
+            ))
+        }
         "process" => {
             let action = arguments.get("action").and_then(Value::as_str).unwrap_or("list");
             let need_id = || {
@@ -3365,6 +3455,7 @@ pub(crate) fn canonical_tool_name(name: &str) -> &str {
         "append" | "append_to_file" => "append_file",
         "screenshot" | "screen_capture" | "take_screenshot" => "capture_screen",
         "screenshot_page" | "capture_url" | "preview_page" | "screenshot_url" => "capture_page",
+        "pdf" | "make_pdf" | "html_to_pdf" | "print_pdf" | "export_pdf" => "create_pdf",
         "processes" | "background_process" | "background_processes" => "process",
         "launch_app" | "open_application" | "activate_app" => "open_app",
         "ls" | "dir" => "list_files",
@@ -3514,6 +3605,26 @@ pub(crate) fn list_content_files(dir: &Path) -> Result<Vec<MediaItemRecord>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_names_titles_and_unique_paths() {
+        assert_eq!(pdf_file_name("Q3 Report: Sales / Ops"), "Q3-Report-Sales-Ops.pdf");
+        assert_eq!(pdf_file_name("invoice.pdf"), "invoice.pdf");
+        assert_eq!(pdf_file_name("../../etc/passwd"), "etc-passwd.pdf");
+        assert_eq!(pdf_file_name("   "), "document.pdf");
+        assert_eq!(html_title("<html><head><TITLE> My  Deck </TITLE>").as_deref(), Some("My Deck"));
+        assert_eq!(html_title("<p>no title</p>"), None);
+
+        let dir = std::env::temp_dir().join(format!("muninn-unique-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(unique_path(&dir, "a.pdf"), dir.join("a.pdf"));
+        std::fs::write(dir.join("a.pdf"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "a.pdf"), dir.join("a-2.pdf"));
+        std::fs::write(dir.join("a-2.pdf"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "a.pdf"), dir.join("a-3.pdf"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // ---- is_dangerous_command ----
 

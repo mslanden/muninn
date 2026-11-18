@@ -17,7 +17,6 @@ mod projects;
 mod voice;
 mod ai_feeds;
 mod mcp;
-mod studio;
 mod safety;
 mod mobile;
 
@@ -37,6 +36,5 @@ pub use projects::*;
 pub use voice::*;
 pub use ai_feeds::*;
 pub use mcp::*;
-pub use studio::*;
 pub use safety::*;
 pub use mobile::*;

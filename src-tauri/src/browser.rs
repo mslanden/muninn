@@ -67,32 +67,13 @@ pub async fn capture_page(url: &str, width: u32, height: u32, wait_ms: u64) -> R
         "No Chromium-based browser found. capture_page needs Google Chrome, Chromium, Brave or Microsoft Edge installed in /Applications.".to_string()
     })?;
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let work = std::env::temp_dir().join(format!("muninn-page-{}-{}", std::process::id(), nanos));
-    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
-    let proxy = GuardProxy::start().await?;
+    let work = new_work_dir("page")?;
+    let proxy = GuardProxy::start(None).await?;
     let result = run_capture(browser_name, &exe, &work, url, width, height, wait_ms, proxy.addr).await;
     let _ = std::fs::remove_dir_all(&work);
 
     let log = proxy.log();
-    // The browser may ask for the same blocked host more than once (retries, favicon).
-    let mut blocked: Vec<&String> = Vec::new();
-    for entry in &log.blocked {
-        if !blocked.contains(&entry) {
-            blocked.push(entry);
-        }
-    }
-    let blocked_note = if blocked.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nBlocked requests to private-network or internal addresses (only public hosts and this machine's loopback may be loaded): {}",
-            blocked.iter().map(|b| b.as_str()).collect::<Vec<_>>().join("; ")
-        )
-    };
+    let blocked_note = blocked_note(&log);
     // Behind the proxy, a refused connection to the page itself comes back as the proxy's
     // 502 (http) or a tunnel failure (https) — report it the way a direct load would.
     if let Some(target) = url_host_port(url) {
@@ -110,6 +91,167 @@ pub async fn capture_page(url: &str, width: u32, height: u32, wait_ms: u64) -> R
         }
         Err(e) => Err(format!("{}{}", e, blocked_note)),
     }
+}
+
+/// A fresh temp directory for one browser run (profile, outputs). The caller removes it.
+fn new_work_dir(kind: &str) -> Result<PathBuf, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("muninn-{}-{}-{}", kind, std::process::id(), nanos));
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    Ok(work)
+}
+
+/// The tool-result note listing hosts the guard refused (each once — the browser may ask for
+/// the same one more than once: retries, favicon). Empty when nothing was blocked.
+fn blocked_note(log: &ProxyLog) -> String {
+    let mut blocked: Vec<&String> = Vec::new();
+    for entry in &log.blocked {
+        if !blocked.contains(&entry) {
+            blocked.push(entry);
+        }
+    }
+    if blocked.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nBlocked requests to private-network or internal addresses (only public hosts and this machine's loopback may be loaded): {}",
+        blocked.iter().map(|b| b.as_str()).collect::<Vec<_>>().join("; ")
+    )
+}
+
+/// Headless Chromium with a throwaway profile, every request routed through the guard proxy
+/// and console logging on. Callers add their output flags and the URL.
+fn browser_command(exe: &Path, work: &Path, wait_ms: u64, proxy: SocketAddr) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("--headless=new")
+        .arg("--disable-gpu")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-extensions")
+        .arg("--hide-scrollbars")
+        .arg("--mute-audio")
+        .arg(format!("--user-data-dir={}", work.join("profile").display()))
+        .arg(format!("--virtual-time-budget={}", wait_ms))
+        // Every request — loopback included (`<-loopback>` removes Chrome's implicit
+        // bypass) — goes through the address guard; WebRTC may not open direct UDP.
+        .arg(format!("--proxy-server=http://{}", proxy))
+        .arg("--proxy-bypass-list=<-loopback>")
+        .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+        // Console messages and load failures are written to stderr with this on.
+        .arg("--enable-logging=stderr")
+        .arg("--v=0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd
+}
+
+// ---------------------------------------------------------------------------------------
+// PDF
+// ---------------------------------------------------------------------------------------
+
+/// Host the guard proxy answers itself with the document passed to `print_pdf` as HTML. An
+/// http origin (unlike file://) cannot load file:// URLs, so model-written HTML can't pull
+/// local files into the PDF.
+const DOC_HOST: &str = "muninn-document.localhost";
+
+/// What `print_pdf` renders: a complete HTML document, or a URL already vetted by
+/// `tools::resolve_page_target` (http(s) or a workspace file).
+pub enum PdfSource<'a> {
+    Html(&'a str),
+    Url(&'a str),
+}
+
+pub struct PdfOutput {
+    pub pages: usize,
+    pub bytes: u64,
+    /// Note about blocked requests (empty when none), for the tool result.
+    pub blocked_note: String,
+}
+
+/// Render `source` to a PDF at `out` with Chromium's print engine. Page size and margins come
+/// from the document's CSS (`@page { size: A4; margin: 16mm }`); browser headers/footers are
+/// off and backgrounds are printed.
+pub async fn print_pdf(source: PdfSource<'_>, out: &Path, wait_ms: u64) -> Result<PdfOutput, String> {
+    let (browser_name, exe) = find_browser().ok_or_else(|| {
+        "No Chromium-based browser found. create_pdf needs Google Chrome, Chromium, Brave or Microsoft Edge installed in /Applications.".to_string()
+    })?;
+    let (url, document) = match source {
+        PdfSource::Html(html) => (format!("http://{}/", DOC_HOST), Some(html.to_string())),
+        PdfSource::Url(url) => (url.to_string(), None),
+    };
+    let work = new_work_dir("pdf")?;
+    let proxy = GuardProxy::start(document).await?;
+    let tmp_pdf = work.join("out.pdf");
+    let mut cmd = browser_command(&exe, &work, wait_ms, proxy.addr);
+    cmd.arg(format!("--print-to-pdf={}", tmp_pdf.display()))
+        .arg("--no-pdf-header-footer")
+        .arg("--print-to-pdf-no-header")
+        .arg(&url);
+
+    let hard = Duration::from_millis(wait_ms + HARD_TIMEOUT_EXTRA_MS);
+    let result = match tokio::time::timeout(hard, cmd.output()).await {
+        Ok(Ok(output)) => {
+            let log = parse_browser_log(&String::from_utf8_lossy(&output.stderr));
+            match (log.load_failure, std::fs::read(&tmp_pdf)) {
+                (Some(failure), _) => Err(format!("Page failed to load: {}.", failure)),
+                (None, Ok(bytes)) if bytes.starts_with(b"%PDF") => {
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    std::fs::write(out, &bytes)
+                        .map_err(|e| format!("could not save the PDF to {}: {}", out.display(), e))
+                        .map(|_| (count_pdf_pages(&bytes), bytes.len() as u64))
+                }
+                _ => Err(format!("{} produced no PDF (exit status: {}).", browser_name, output.status)),
+            }
+        }
+        Ok(Err(e)) => Err(format!("failed to launch {}: {}", browser_name, e)),
+        // Dropping the future kills the browser (kill_on_drop).
+        Err(_) => Err(format!(
+            "{} did not finish rendering within {}s and was stopped — the page may never go idle; try a smaller wait_ms.",
+            browser_name,
+            hard.as_secs()
+        )),
+    };
+    let _ = std::fs::remove_dir_all(&work);
+
+    let log = proxy.log();
+    if let Some(target) = url_host_port(&url) {
+        if log.refused.iter().any(|r| r == &target) {
+            return Err(format!(
+                "Page failed to load: net::ERR_CONNECTION_REFUSED ({}).{}",
+                target, CONNECTION_REFUSED_HINT
+            ));
+        }
+    }
+    let note = blocked_note(&log);
+    match result {
+        Ok((pages, bytes)) => Ok(PdfOutput { pages, bytes, blocked_note: note }),
+        Err(e) => Err(format!("{}{}", e, note)),
+    }
+}
+
+/// Count page objects (`/Type /Page`, not `/Pages`) in a PDF Chromium wrote. Chromium does not
+/// compress its page tree, so a byte scan is enough.
+fn count_pdf_pages(pdf: &[u8]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while let Some(pos) = pdf[i..].windows(5).position(|w| w == b"/Type") {
+        let mut j = i + pos + 5;
+        while j < pdf.len() && pdf[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if pdf[j..].starts_with(b"/Page") && !pdf[j + 5..].starts_with(b"s") {
+            count += 1;
+        }
+        i = i + pos + 5;
+    }
+    count
 }
 
 const CONNECTION_REFUSED_HINT: &str = " Nothing is listening at that address — is the dev server running and ready? (process action \"output\" with wait_for shows its log.)";
@@ -204,16 +346,17 @@ struct GuardProxy {
 }
 
 impl GuardProxy {
-    async fn start() -> Result<Self, String> {
+    async fn start(document: Option<String>) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| format!("could not start the page-capture proxy: {}", e))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let log = Arc::new(Mutex::new(ProxyLog::default()));
         let task_log = log.clone();
+        let document = document.map(Arc::new);
         let task = tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
-                tokio::spawn(handle_proxy_conn(sock, task_log.clone()));
+                tokio::spawn(handle_proxy_conn(sock, task_log.clone(), document.clone()));
             }
         });
         Ok(Self { addr, log, task })
@@ -247,9 +390,14 @@ async fn resolve_allowed(host: &str, port: u16) -> Result<Vec<SocketAddr>, Strin
 }
 
 async fn respond(client: &mut TcpStream, status: &str, body: &str) {
+    respond_typed(client, status, "text/plain; charset=utf-8", body).await
+}
+
+async fn respond_typed(client: &mut TcpStream, status: &str, content_type: &str, body: &str) {
     let msg = format!(
-        "HTTP/1.1 {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         status,
+        content_type,
         body.len(),
         body
     );
@@ -260,7 +408,7 @@ async fn respond(client: &mut TcpStream, status: &str, body: &str) {
 /// Serve one proxied connection: a `CONNECT host:port` tunnel (https, websockets) or one
 /// absolute-form plain-http request, forwarded with `Connection: close` so every request
 /// opens a new connection and is checked on its own.
-async fn handle_proxy_conn(mut client: TcpStream, log: Arc<Mutex<ProxyLog>>) {
+async fn handle_proxy_conn(mut client: TcpStream, log: Arc<Mutex<ProxyLog>>, document: Option<Arc<String>>) {
     const MAX_HEAD: usize = 64 * 1024;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -306,6 +454,14 @@ async fn handle_proxy_conn(mut client: TcpStream, log: Arc<Mutex<ProxyLog>>) {
         }
     };
     let label = format!("{}:{}", host, port);
+
+    // The document being printed is served from memory; nothing else exists on that host.
+    if host == DOC_HOST {
+        return match (&document, is_connect, origin_form.as_str()) {
+            (Some(doc), false, "/") => respond_typed(&mut client, "200 OK", "text/html; charset=utf-8", doc).await,
+            _ => respond(&mut client, "404 Not Found", "not found").await,
+        };
+    }
 
     let addrs = match resolve_allowed(&host, port).await {
         Ok(a) => a,
@@ -365,32 +521,11 @@ async fn run_capture(
     proxy: SocketAddr,
 ) -> Result<PageCapture, String> {
     let shot = work.join("shot.png");
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("--headless=new")
-        .arg("--disable-gpu")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-extensions")
-        .arg("--hide-scrollbars")
-        .arg("--mute-audio")
-        .arg(format!("--user-data-dir={}", work.join("profile").display()))
-        .arg(format!("--window-size={},{}", width, height))
-        .arg(format!("--virtual-time-budget={}", wait_ms))
-        // Every request — loopback included (`<-loopback>` removes Chrome's implicit
-        // bypass) — goes through the address guard; WebRTC may not open direct UDP.
-        .arg(format!("--proxy-server=http://{}", proxy))
-        .arg("--proxy-bypass-list=<-loopback>")
-        .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
-        // Console messages and load failures are written to stderr with this on.
-        .arg("--enable-logging=stderr")
-        .arg("--v=0")
+    let mut cmd = browser_command(exe, work, wait_ms, proxy);
+    cmd.arg(format!("--window-size={},{}", width, height))
         .arg(format!("--screenshot={}", shot.display()))
         .arg("--dump-dom")
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .arg(url);
 
     let hard = Duration::from_millis(wait_ms + HARD_TIMEOUT_EXTRA_MS);
     let output = match tokio::time::timeout(hard, cmd.output()).await {
@@ -753,7 +888,7 @@ setTimeout(function(){ document.getElementById("p").textContent = "loaded late";
             }
         });
 
-        let proxy = GuardProxy::start().await.unwrap();
+        let proxy = GuardProxy::start(None).await.unwrap();
         let ok = proxy_request(
             proxy.addr,
             &format!("GET http://127.0.0.1:{}/page?q=1 HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Connection: keep-alive\r\n\r\n", origin_addr.port()),
@@ -778,6 +913,50 @@ setTimeout(function(){ document.getElementById("p").textContent = "loaded late";
         assert_eq!(log.blocked.len(), 3, "{:?}", log.blocked);
         assert!(log.blocked[0].starts_with("169.254.169.254:80"), "{:?}", log.blocked);
         assert_eq!(log.refused, vec![format!("127.0.0.1:{}", dead)]);
+    }
+
+    #[test]
+    fn counts_pdf_pages() {
+        let pdf = b"%PDF-1.4\n1 0 obj << /Type /Pages /Kids [2 0 R 3 0 R] /Count 2 >>\n2 0 obj << /Type /Page >>\n3 0 obj <</Type/Page/Parent 1 0 R>>\n4 0 obj << /Type /Catalog >>";
+        assert_eq!(count_pdf_pages(pdf), 2);
+        assert_eq!(count_pdf_pages(b"%PDF-1.4 nothing"), 0);
+        assert_eq!(count_pdf_pages(b"/Type"), 0);
+    }
+
+    /// Renders model-written HTML to a real PDF: page breaks, CSS page size, and the document
+    /// is served from an http origin, so it cannot pull in local files.
+    /// Needs a Chromium-based browser: `cargo test --lib browser -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn prints_html_to_pdf_end_to_end() {
+        let secret = std::env::temp_dir().join(format!("muninn-pdf-secret-{}.txt", std::process::id()));
+        std::fs::write(&secret, "TOP-SECRET-LOCAL-FILE").unwrap();
+        let html = format!(
+            r#"<!doctype html><html><head><title>Two Pages</title><style>
+@page {{ size: A4; margin: 0 }}
+body {{ margin: 0; font-family: sans-serif }}
+section {{ height: 297mm; background: #1e3a8a; color: white; padding: 20mm; box-sizing: border-box }}
+section + section {{ break-before: page; background: #fde68a; color: black }}
+</style></head><body>
+<section><h1>Page one</h1><iframe src="file://{}"></iframe></section>
+<section><h1>Page two</h1></section>
+</body></html>"#,
+            secret.display()
+        );
+        let out = std::env::temp_dir().join(format!("muninn-pdf-test-{}.pdf", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let pdf = print_pdf(PdfSource::Html(&html), &out, 500).await.unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(b"%PDF"));
+        assert_eq!(pdf.pages, 2);
+        assert_eq!(pdf.bytes, bytes.len() as u64);
+        // The local file never made it into the document.
+        assert!(!String::from_utf8_lossy(&bytes).contains("TOP-SECRET"));
+        let _ = std::fs::remove_file(&secret);
+        // Leave the PDF for a manual look when MUNINN_KEEP_PDF is set.
+        if std::env::var("MUNINN_KEEP_PDF").is_err() {
+            let _ = std::fs::remove_file(&out);
+        }
     }
 
     #[test]

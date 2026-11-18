@@ -822,252 +822,6 @@ pub(crate) async fn generate_feed_article_text(
     Ok(article)
 }
 
-/// Per-platform copywriting guidance baked into the social-copy prompt.
-fn platform_guidance(platform: &str) -> &'static str {
-    match platform.to_lowercase().replace(['/', ' '], "").as_str() {
-        "x" | "twitter" | "xtwitter" => "≤280 characters, punchy, a strong hook in the first words, 0–2 hashtags, no filler.",
-        "linkedin" => "Professional but human. A scroll-stopping first line, 2–4 short value-packed paragraphs, a clear takeaway, 0–3 hashtags.",
-        "instagram" => "An engaging caption with a hook and light emoji, a call-to-action, then 5–10 relevant hashtags on a new line.",
-        "tiktok" => "Very short, hook-driven caption in a trend-aware voice, 2–4 hashtags.",
-        "youtube" => "A compelling video title, then a 2–3 sentence description with searchable keywords. Keep Shorts snappy.",
-        _ => "Platform-appropriate copy with a strong hook and no generic filler.",
-    }
-}
-
-/// Pull a JSON array out of a model response, tolerating code fences / stray prose.
-fn extract_json_array(text: &str) -> Option<Vec<Value>> {
-    if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(text.trim()) {
-        return Some(a);
-    }
-    let start = text.find('[')?;
-    let end = text.rfind(']')?;
-    if end <= start {
-        return None;
-    }
-    serde_json::from_str::<Value>(&text[start..=end])
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-}
-
-/// Generate tailored social-media post copy (3 variants per platform) in one LLM call.
-/// Returns structured per-platform variants for the Studio tile.
-pub(crate) async fn generate_social_copy(
-    state: &AppState,
-    topic: &str,
-    platforms: &[String],
-    tone: Option<&str>,
-) -> Result<Vec<crate::models::PlatformCopy>, String> {
-    if platforms.is_empty() {
-        return Err("Select at least one platform.".to_string());
-    }
-    let cfg = resolve_llm_config(state)?;
-
-    // Shared brand voice (persisted in Settings via the Studio header) + the per-request tone.
-    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
-    let mut tone_line = String::new();
-    if !brand_voice.trim().is_empty() {
-        tone_line.push_str(&format!("Brand voice (apply to all copy): {}\n", brand_voice.trim()));
-    }
-    if let Some(t) = tone.map(str::trim).filter(|t| !t.is_empty()) {
-        tone_line.push_str(&format!("Tone for this batch: {}\n", t));
-    }
-    let mut platform_specs = String::new();
-    for p in platforms {
-        platform_specs.push_str(&format!("- {}: {}\n", p, platform_guidance(p)));
-    }
-
-    let prompt = format!(
-        "Write social media post copy about this topic.\n\nTopic: {topic}\n{tone_line}\n\
-        Generate copy for these platforms, each tailored to its norms:\n{platform_specs}\n\
-        For EACH platform write 3 distinct variants that take different angles or hooks.\n\n\
-        Return ONLY valid JSON — an array where each element is \
-        {{\"platform\": \"<platform name exactly as given above>\", \"variants\": [\"variant 1\", \"variant 2\", \"variant 3\"]}}. \
-        No markdown, no code fences, no commentary — output the JSON array and nothing else."
-    );
-    let system = "You are an expert social media copywriter. You tailor copy precisely to each platform's format and audience, write scroll-stopping hooks, and never use generic filler. You output strict JSON only.";
-
-    let text = complete_once(state, &cfg, system, &prompt, 4000, ONE_SHOT_LONG_SECS).await
-        .map_err(|e| format!("Copy generation failed: {e}"))?;
-
-    let parsed = extract_json_array(&text)
-        .ok_or_else(|| format!("Could not parse copy as JSON. Model said:\n{}", text.trim()))?;
-    let mut out = Vec::new();
-    for el in parsed {
-        let platform = el.get("platform").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let variants: Vec<String> = el
-            .get("variants")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect())
-            .unwrap_or_default();
-        if !platform.is_empty() && !variants.is_empty() {
-            out.push(crate::models::PlatformCopy { platform, variants });
-        }
-    }
-    if out.is_empty() {
-        return Err(format!("No usable copy was generated. Model said:\n{}", text.trim()));
-    }
-    Ok(out)
-}
-
-/// Writing-section assistant: apply `instruction` to `text` (or, when `text` is empty,
-/// treat the instruction as a "write this" request). Returns the revised/written prose,
-/// honoring the persisted brand voice. One-shot, non-streaming.
-pub(crate) async fn writing_assist(
-    state: &AppState,
-    text: &str,
-    instruction: &str,
-) -> Result<String, String> {
-    if instruction.trim().is_empty() {
-        return Err("Tell me what to do (e.g. improve, shorten, continue, or write…).".to_string());
-    }
-    let cfg = resolve_llm_config(state)?;
-
-    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
-    let voice_line = if brand_voice.trim().is_empty() {
-        String::new()
-    } else {
-        format!("Write in this brand voice: {}\n\n", brand_voice.trim())
-    };
-
-    let body_block = if text.trim().is_empty() {
-        "(No existing draft — produce the text from scratch per the instruction.)".to_string()
-    } else {
-        format!("Here is the current draft:\n\"\"\"\n{}\n\"\"\"", text.trim())
-    };
-
-    let prompt = format!(
-        "{voice_line}{body_block}\n\nInstruction: {instruction}\n\n\
-        Return ONLY the resulting text (Markdown is fine). No preamble, no explanation, no quotes around it."
-    );
-    let system = "You are a sharp, versatile writing assistant and editor. You improve clarity, flow, and impact while preserving the author's intent. You return only the requested text.";
-
-    let max_tokens = resolve_max_output_tokens(state);
-    let out = complete_once(state, &cfg, system, &prompt, max_tokens, ONE_SHOT_LONG_SECS).await
-        .map_err(|e| format!("Writing request failed: {e}"))?;
-    let out = out.trim().to_string();
-    if out.is_empty() {
-        return Err("Writing assistant returned empty text".to_string());
-    }
-    Ok(out)
-}
-
-/// Generate a social carousel/graphic as inline-styled HTML slides (one string per slide).
-/// Inline styles only — no `<style>` blocks (which would leak into the app) and no external
-/// resources — so the frontend can rasterize each slide with html2canvas reliably.
-pub(crate) async fn generate_carousel(
-    state: &AppState,
-    topic: &str,
-    slides: u32,
-    width: u32,
-    height: u32,
-) -> Result<Vec<String>, String> {
-    if topic.trim().is_empty() {
-        return Err("Describe what the graphic should say.".to_string());
-    }
-    let n = slides.clamp(1, 10);
-    let cfg = resolve_llm_config(state)?;
-    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
-    let voice_line = if brand_voice.trim().is_empty() {
-        String::new()
-    } else {
-        format!("Brand voice / visual style to reflect: {}\n", brand_voice.trim())
-    };
-
-    let prompt = format!(
-        "Design a {n}-slide social media {kind} about:\n{topic}\n\n{voice_line}\n\
-        Return ONLY a JSON array of {n} strings — each string is the HTML for one slide.\n\
-        STRICT requirements for every slide:\n\
-        - Use ONLY inline styles (the `style` attribute). NO <style> blocks, NO class names, NO <script>, NO external images or web fonts.\n\
-        - The outermost element MUST be a single <div> sized exactly `width:{width}px;height:{height}px` with `box-sizing:border-box;overflow:hidden;` a background (a solid color or CSS gradient) and generous padding.\n\
-        - Use only system-safe fonts: -apple-system, 'Helvetica Neue', Helvetica, Arial, Georgia, sans-serif.\n\
-        - Strong visual hierarchy: a big bold headline and supporting text; high contrast; lay out with inline flexbox (style=\"display:flex;flex-direction:column;justify-content:center;...\").\n\
-        - Slide 1 is a striking cover/hook. Keep text on each slide short and punchy.\n\
-        No commentary, no code fences — just the JSON array of HTML strings.",
-        kind = if n > 1 { "carousel" } else { "graphic" }
-    );
-    let system = "You are a world-class social media graphic designer who builds striking, self-contained, inline-styled HTML cards. You never use <style> blocks, classes, scripts, or external resources. You return only a JSON array of HTML strings.";
-
-    let max_tokens = resolve_max_output_tokens(state);
-    let text = complete_once(state, &cfg, system, &prompt, max_tokens, ONE_SHOT_LONG_SECS).await
-        .map_err(|e| format!("Carousel generation failed: {e}"))?;
-
-    let arr = extract_json_array(&text)
-        .ok_or_else(|| format!("Could not parse slides as JSON. Model said:\n{}", text.trim()))?;
-    let slides_html: Vec<String> = arr
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .filter(|s| !s.trim().is_empty())
-        .collect();
-    if slides_html.is_empty() {
-        return Err(format!("No usable slides were generated. Model said:\n{}", text.trim()));
-    }
-    Ok(slides_html)
-}
-
-/// Strip a leading/trailing Markdown code fence (```html … ```) the model may wrap output in.
-fn strip_code_fences(text: &str) -> String {
-    let t = text.trim();
-    if let Some(rest) = t.strip_prefix("```") {
-        // Drop the optional language tag on the first line, then the trailing fence.
-        let after_lang = rest.splitn(2, '\n').nth(1).unwrap_or("");
-        return after_lang.trim_end().trim_end_matches("```").trim().to_string();
-    }
-    t.to_string()
-}
-
-/// Generate a complete, self-contained HTML document (slide deck or print-ready doc) for the
-/// Studio Docs section. Honors the persisted brand voice. One-shot, non-streaming.
-pub(crate) async fn generate_doc_html(
-    state: &AppState,
-    doc_type: &str,
-    topic: &str,
-    slides: u32,
-) -> Result<String, String> {
-    if topic.trim().is_empty() {
-        return Err("Describe what the document should cover.".to_string());
-    }
-    let cfg = resolve_llm_config(state)?;
-    let brand_voice = get_app_setting_value(state, "studio/brand_voice").ok().flatten().unwrap_or_default();
-    let voice_line = if brand_voice.trim().is_empty() {
-        String::new()
-    } else {
-        format!("Brand voice / style to reflect: {}\n", brand_voice.trim())
-    };
-
-    let prompt = if doc_type == "slides" {
-        let n = slides.clamp(3, 20);
-        format!(
-            "Create a COMPLETE, self-contained HTML slide deck about:\n{topic}\n\n{voice_line}\n\
-            Produce about {n} slides. Requirements:\n\
-            - ONE html document with an embedded <style> block. NO external resources (no CDN links, no web fonts, no <script>).\n\
-            - Each slide is `<section class=\"slide\">…</section>`. First slide is a title slide.\n\
-            - Clean, modern, high-contrast design: large readable type, generous spacing, a consistent color theme, a subtle accent.\n\
-            - Include print CSS so each slide prints on its own landscape page: `@media print {{ .slide {{ page-break-after: always; }} }}` and size slides ~16:9.\n\
-            Return ONLY the HTML, starting with <!DOCTYPE html>. No commentary, no code fences."
-        )
-    } else {
-        format!(
-            "Create a COMPLETE, self-contained, print-ready HTML document about:\n{topic}\n\n{voice_line}\n\
-            Requirements:\n\
-            - ONE html file with an embedded <style> block. NO external resources (no CDN links, no web fonts, no <script>).\n\
-            - Clean typographic design: clear hierarchy of headings, readable body text, sensible margins, a title block.\n\
-            - Include print CSS with good page margins.\n\
-            Return ONLY the HTML, starting with <!DOCTYPE html>. No commentary, no code fences."
-        )
-    };
-    let system = "You are an expert document and presentation designer who writes clean, self-contained, print-ready HTML/CSS. You never use external resources or scripts. You return only the HTML.";
-
-    let max_tokens = resolve_max_output_tokens(state);
-    let text = complete_once(state, &cfg, system, &prompt, max_tokens, ONE_SHOT_LONG_SECS).await
-        .map_err(|e| format!("Doc generation failed: {e}"))?;
-
-    let html = strip_code_fences(&text);
-    if !html.to_lowercase().contains("<html") && !html.to_lowercase().contains("<!doctype") {
-        return Err(format!("Model did not return HTML. It said:\n{}", html.chars().take(400).collect::<String>()));
-    }
-    Ok(html)
-}
-
 /// Build the general (non-project) system prompt, including the memory index.
 pub(crate) fn build_system_prompt_with_context(
     state: &AppState,
@@ -1122,6 +876,9 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     }
     if enabled.contains("process") {
         caps.push("Start long-running processes like dev servers with run_command background: true, then read their output or stop them (process)");
+    }
+    if enabled.contains("create_pdf") {
+        caps.push("Create PDF documents — reports, letters, slides — by writing HTML that is rendered to PDF (create_pdf)");
     }
     if enabled.contains("open_app") {
         caps.push("Launch/focus a macOS app, optionally opening a URL (open_app)");
@@ -1378,6 +1135,7 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     if enabled.contains("capture_screen") { caps.push("Take a screenshot of the screen, or of one app's window in the background without focusing it (capture_screen)"); }
     if enabled.contains("capture_page") { caps.push("Check a web page or local dev server in a headless browser — screenshot, console errors and page text, nothing shown on screen (capture_page)"); }
     if enabled.contains("process") { caps.push("Start long-running processes like dev servers with run_command background: true, then read their output or stop them (process)"); }
+    if enabled.contains("create_pdf") { caps.push("Create PDF documents — reports, letters, slides — by writing HTML that is rendered to PDF (create_pdf)"); }
     if enabled.contains("open_app") { caps.push("Launch/focus a macOS app, optionally opening a URL (open_app)"); }
     if enabled.contains("list_files") { caps.push("List directory contents (list_files)"); }
     if enabled.contains("search_files") { caps.push("Search for text in files (search_files)"); }
@@ -1606,6 +1364,23 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
                     "wait_ms": {"type": "integer", "description": "How long to let the page run (timers, fetches, rendering) before capturing, in ms (default 3000, max 20000)."}
                 },
                 "required": ["url"]
+            }),
+        ));
+    }
+    if enabled.contains("create_pdf") {
+        defs.push((
+            "create_pdf",
+            "Make a PDF (a report, letter, one-pager, invoice, slide deck, handout...) by writing it as an HTML page and rendering it with a headless browser's print engine. Pass `html`: a complete, self-contained HTML document — inline CSS, images as https URLs or data: URIs. Control the page with CSS: `@page { size: A4; margin: 16mm }` (or `size: Letter`, `size: A4 landscape`, or `size: 1280px 720px` with `margin: 0` for 16:9 slides), and `break-before: page` to start a new page. Backgrounds and colors print as shown. Alternatively pass `path` (an HTML file in the workspace, so its relative images and stylesheets load) or `url` (an http(s) page or local dev server). Saved to the Content library unless output_path is given. To check the layout first, write the HTML to a workspace file and look at it with capture_page.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "html": {"type": "string", "description": "A complete HTML document to print."},
+                    "path": {"type": "string", "description": "Instead of html: a workspace-relative HTML file to print."},
+                    "url": {"type": "string", "description": "Instead of html: an http(s) URL (localhost allowed) to print."},
+                    "filename": {"type": "string", "description": "Name for the PDF in the Content library (default: the document's <title>)."},
+                    "output_path": {"type": "string", "description": "Save to this workspace path (ending in .pdf) instead of the Content library."},
+                    "wait_ms": {"type": "integer", "description": "How long to let the page load fonts/images/scripts before printing, in ms (default 1000, max 20000)."}
+                }
             }),
         ));
     }

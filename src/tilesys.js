@@ -19,7 +19,6 @@ export const TILE_TYPES = [
   { type: "library",    label: "Library",    dot: "purple" },
   { type: "memory",     label: "Memory",     dot: "purple" },
   { type: "content",    label: "Content",    dot: "off"   },
-  { type: "studio",     label: "Studio",     dot: "green" },
   // Still renderable (Settings sub-pages / restored layouts) but not in Apps nav.
   { type: "logs",       label: "Activity",   dot: "amber" },
   { type: "tools",      label: "Tools",      dot: "purple" },

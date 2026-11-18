@@ -4,8 +4,8 @@ Muninn is a macOS-first personal AI assistant built with Tauri 2 + Rust. It runs
 
 ## Features
 
-- **Tile dashboard** — chat, feeds, tasks, agents, memory, content library, media studio, logs, and settings panels arranged in a grid, with pop-out windows and persisted layouts
-- **Agent chat** — OpenAI-compatible and Anthropic-compatible providers (OpenAI, MiniMax, Meta, custom endpoints) with a shared in-Rust tool loop: workspace-scoped file/search/shell tools, web search & fetch, git/code/http tools, image generation, Mapbox directions/places, screen capture, and headless page capture
+- **Tile dashboard** — chat, feeds, tasks, skills, memory, content library, logs, and settings panels arranged in a grid, with pop-out windows and persisted layouts
+- **Agent chat** — OpenAI-compatible and Anthropic-compatible providers (OpenAI, MiniMax, Meta, custom endpoints) with a shared in-Rust tool loop: workspace-scoped file/search/shell tools, web search & fetch, git/code/http tools, image generation, Mapbox directions/places, screen capture, headless page capture, and PDF creation from HTML
 - **Custom agents** — user-defined agents with their own system prompts and tool allowlists, agent self-management (CRUD via tools), and agent-to-agent delegation with sub-session isolation
 - **Scheduled tasks** — natural-language schedules (`every 30s`, `daily at 09:00`, `every monday at 10:00`), task chaining with condition gates, per-run history, and per-task workspace/agent targeting
 - **AI feeds** — scheduled LLM jobs that generate feed items (with optional images) on their own cadence

@@ -10,12 +10,12 @@ import "./toolspanel.js";
 import "./skills.js";
 import "./memory.js";
 import "./content.js";
-import "./studio.js";
 import "./library.js";
 import { openSettingsModal, closeSettingsModal, isSettingsModalOpen } from "./settings.js";
 import { openConnections, closeConnections, isConnectionsOpen } from "./connections.js";
 
 import { invoke } from "@tauri-apps/api/core";
+import { getTileRenderer } from "./registry.js";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { workspace, newChatBtn, navSettingsBtn, ui } from "./state.js";
 import { addTile, isPopout, getPopoutParams, restoreLayout, setupTileKeyboardNav, replaceSingleTileIfAlone, makeDragSource, openTileForType } from "./tilesys.js";
@@ -137,7 +137,10 @@ async function bootMain() {
         continue; // settings is a modal now — don't restore old settings tiles
       } else {
         // Layouts saved before agents became skills still name the old tile type.
-        addTile(item.type === "agents" ? "skills" : item.type, { webUrl: item.webUrl || "" });
+        const type = item.type === "agents" ? "skills" : item.type;
+        // Skip tiles whose feature has since been removed (e.g. the old Studio tile).
+        if (!getTileRenderer(type)) continue;
+        addTile(type, { webUrl: item.webUrl || "" });
       }
     }
   } else {

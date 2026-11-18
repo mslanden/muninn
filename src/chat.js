@@ -504,7 +504,8 @@ export function renderChatTile(tileObj, body) {
     for (const file of files) {
       if (!file.type || !file.type.startsWith("image/")) continue;
       if (file.size > MAX_IMAGE_BYTES) {
-        addTurn(chatLog, "muninn", `That image is too large (${(file.size / 1048576).toFixed(1)}MB). Max is 10MB.`);
+        const chatLog = tileObj.el.querySelector(`[data-chat-stream="${tileObj.id}"]`);
+        if (chatLog) addTurn(chatLog, "muninn", `That image is too large (${(file.size / 1048576).toFixed(1)}MB). Max is 10MB.`);
         continue;
       }
       try { tileObj.pendingAttachments.push(await fileToAttachment(file)); } catch { /* skip unreadable */ }

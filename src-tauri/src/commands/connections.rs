@@ -49,12 +49,12 @@ const TOOL_GROUPS: &[ToolGroup] = &[
         name: "Files and shell",
         kind: "mac",
         icon: "folder",
-        description: "Read and edit files, run commands and background processes, git, tests and headless page previews — always inside the chat's workspace folder.",
+        description: "Read and edit files, run commands and background processes, git, tests, headless page previews and PDF creation — always inside the chat's workspace folder.",
         key_setting: None,
         tools: &[
             "read_file", "write_file", "edit_file", "append_file", "list_files", "search_files",
             "run_command", "git_status", "git_diff", "git_log", "git_commit", "code_outline",
-            "find_references", "run_tests", "process", "capture_page",
+            "find_references", "run_tests", "process", "capture_page", "create_pdf",
         ],
     },
     ToolGroup {
