@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -64,16 +64,8 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
             // reload; hidden=1 marks intermediate tool rounds replayed to the model only.
             "ALTER TABLE messages ADD COLUMN content_json TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE messages ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE entities ADD COLUMN aliases_json TEXT NOT NULL DEFAULT '[]'",
-            // Note: ALTER TABLE ADD COLUMN can't use CURRENT_TIMESTAMP (non-constant
-            // default) — the pre-versioning code tried and silently failed forever.
-            "ALTER TABLE entities ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN identity TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN personality TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN goals TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN preferences TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN current_state TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE memory_profile ADD COLUMN patterns TEXT NOT NULL DEFAULT ''",
+            // (Columns once added here to the old entities / memory_profile tables are gone:
+            // v15 drops those tables, and init_db no longer creates them.)
             "ALTER TABLE tasks ADD COLUMN completed_at TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN result TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0",
@@ -184,7 +176,7 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         // (system prompt + tool allowlist). Empty = current default behavior.
         let statements = [
             "ALTER TABLE tasks ADD COLUMN project_path TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE tasks ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''",
+            // (tasks.agent_id was added here too; v15 drops it — agents became skills.)
         ];
         for sql in statements {
             exec_migration(conn, sql)?;
@@ -305,9 +297,30 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 14)?;
     }
 
+    if version < 15 {
+        // Leftovers: the old memory (replaced by markdown notes, 2026-10) and agents
+        // (replaced by skills) tables, tasks.agent_id, and the removed phone server's settings.
+        for table in ["relationships", "episode_entities", "episodes", "entities", "embeddings", "memory_profile", "agents"] {
+            exec_migration(conn, &format!("DROP TABLE IF EXISTS {}", table))?;
+        }
+        if table_exists(conn, "tasks")? {
+            let has_agent_id = conn
+                .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'agent_id'")
+                .and_then(|mut st| st.exists([]))
+                .map_err(|e| e.to_string())?;
+            if has_agent_id {
+                exec_migration(conn, "ALTER TABLE tasks DROP COLUMN agent_id")?;
+            }
+        }
+        if table_exists(conn, "app_config")? {
+            exec_migration(conn, "DELETE FROM app_config WHERE key LIKE 'mobile/%'")?;
+        }
+        set_schema_version(conn, 15)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 14, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 15, "add a migration block for the new version");
 
     Ok(())
 }
@@ -372,7 +385,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           status TEXT NOT NULL DEFAULT 'scheduled',
           pending_input TEXT NOT NULL DEFAULT '',
           project_path TEXT NOT NULL DEFAULT '',
-          agent_id TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -397,19 +409,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE TABLE IF NOT EXISTS agents (
-          agent_id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          description TEXT NOT NULL DEFAULT '',
-          slash_command TEXT NOT NULL DEFAULT '',
-          system_prompt TEXT NOT NULL DEFAULT '',
-          max_iterations INTEGER NOT NULL DEFAULT 5,
-          enabled INTEGER NOT NULL DEFAULT 1,
-          allowed_tools_json TEXT NOT NULL DEFAULT '[]',
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
         CREATE TABLE IF NOT EXISTS projects (
           path TEXT PRIMARY KEY,
           name TEXT NOT NULL DEFAULT '',
@@ -424,72 +423,12 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE TABLE IF NOT EXISTS memory_profile (
-          id INTEGER PRIMARY KEY CHECK (id = 1),
-          user_name TEXT NOT NULL DEFAULT '',
-          user_about TEXT NOT NULL DEFAULT '',
-          profile_text TEXT NOT NULL DEFAULT '',
-          identity TEXT NOT NULL DEFAULT '',
-          personality TEXT NOT NULL DEFAULT '',
-          goals TEXT NOT NULL DEFAULT '',
-          preferences TEXT NOT NULL DEFAULT '',
-          current_state TEXT NOT NULL DEFAULT '',
-          patterns TEXT NOT NULL DEFAULT '',
-          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS entities (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          kind TEXT NOT NULL,
-          name TEXT NOT NULL,
-          summary TEXT NOT NULL DEFAULT '',
-          aliases_json TEXT NOT NULL DEFAULT '[]',
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS relationships (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          from_entity_id INTEGER NOT NULL,
-          to_entity_id INTEGER NOT NULL,
-          label TEXT NOT NULL,
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          FOREIGN KEY(from_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
-          FOREIGN KEY(to_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
-          UNIQUE(from_entity_id, to_entity_id, label)
-        );
-
-        CREATE TABLE IF NOT EXISTS episodes (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          description TEXT NOT NULL,
-          timestamp TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS episode_entities (
-          episode_id INTEGER NOT NULL,
-          entity_id INTEGER NOT NULL,
-          PRIMARY KEY(episode_id, entity_id),
-          FOREIGN KEY(episode_id) REFERENCES episodes(id) ON DELETE CASCADE,
-          FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE
-        );
         "#,
     )
     .map_err(|e| e.to_string())?;
 
-    // Embeddings table for semantic memory retrieval
     conn.execute_batch(
         r#"
-        CREATE TABLE IF NOT EXISTS embeddings (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          source_type TEXT NOT NULL,
-          source_id INTEGER NOT NULL,
-          content TEXT NOT NULL,
-          embedding BLOB NOT NULL,
-          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          UNIQUE(source_type, source_id)
-        );
-
         CREATE TABLE IF NOT EXISTS deferred_commands (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           session_id TEXT NOT NULL,
@@ -507,16 +446,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     run_migrations(conn)?;
-
-    conn.execute(
-        r#"
-        INSERT INTO memory_profile (id, user_name, user_about, profile_text, identity, personality, goals, preferences, current_state, patterns, updated_at)
-        VALUES (1, '', '', '', '', '', '', '', '', '', CURRENT_TIMESTAMP)
-        ON CONFLICT(id) DO NOTHING
-        "#,
-        [],
-    )
-    .map_err(|e| e.to_string())?;
 
     // Tools added to the "Files and shell" connection after it shipped inherit that
     // connection's current switch, so a user who turned the shell off doesn't get new
@@ -1455,9 +1384,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v7_database_gains_task_project_path_and_agent_id_on_migrate() {
+    fn legacy_v7_database_gains_task_project_path_on_migrate() {
         let conn = Connection::open_in_memory().unwrap();
-        // Simulate a DB at schema v7: tasks table without the two new columns.
+        // Simulate a DB at schema v7: tasks table without project_path.
         conn.execute_batch(
             "CREATE TABLE tasks (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1473,36 +1402,15 @@ mod tests {
              PRAGMA user_version = 7;",
         )
         .unwrap();
-        conn.execute("INSERT INTO tasks (name) VALUES ('pre-existing')", [])
-            .unwrap();
+        conn.execute("INSERT INTO tasks (name) VALUES ('pre-existing')", []).unwrap();
 
         run_migrations(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
-
-        // Existing rows default to empty (default behavior); new values persist.
-        let (pp, aid): (String, String) = conn
-            .query_row(
-                "SELECT project_path, agent_id FROM tasks WHERE name = 'pre-existing'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+        let pp: String = conn
+            .query_row("SELECT project_path FROM tasks WHERE name = 'pre-existing'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(pp, "");
-        assert_eq!(aid, "");
-        conn.execute(
-            "INSERT INTO tasks (name, project_path, agent_id) VALUES ('scoped', '/tmp/proj', 'default-research-agent')",
-            [],
-        )
-        .unwrap();
-        let (pp, aid): (String, String) = conn
-            .query_row(
-                "SELECT project_path, agent_id FROM tasks WHERE name = 'scoped'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(pp, "/tmp/proj");
-        assert_eq!(aid, "default-research-agent");
+        conn.execute("INSERT INTO tasks (name, project_path) VALUES ('scoped', '/tmp/proj')", []).unwrap();
     }
 
     #[test]
@@ -1532,6 +1440,55 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(tools, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn leftover_tables_agent_id_and_phone_settings_are_dropped() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT '', skill TEXT NOT NULL DEFAULT '');
+             CREATE TABLE agents (agent_id TEXT PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE memory_profile (id INTEGER PRIMARY KEY);
+             CREATE TABLE entities (id INTEGER PRIMARY KEY);
+             CREATE TABLE relationships (id INTEGER PRIMARY KEY, from_entity_id INTEGER REFERENCES entities(id));
+             CREATE TABLE episodes (id INTEGER PRIMARY KEY);
+             CREATE TABLE episode_entities (episode_id INTEGER, entity_id INTEGER);
+             CREATE TABLE embeddings (id INTEGER PRIMARY KEY);
+             CREATE TABLE app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             INSERT INTO tasks (name, agent_id, skill) VALUES ('Daily Email Triage', 'old-agent', 'triage');
+             INSERT INTO app_config (key, value) VALUES ('mobile/server_token', 'secret'), ('mobile/server_enabled', '0'), ('mobile/server_port', '8737'), ('user/name', 'kept');
+             PRAGMA user_version = 14;",
+        )
+        .unwrap();
+        run_migrations(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        for t in ["agents", "memory_profile", "entities", "relationships", "episodes", "episode_entities", "embeddings"] {
+            assert!(!table_exists(&conn, t).unwrap(), "{} should be gone", t);
+        }
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('tasks') ORDER BY cid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(cols, vec!["id", "name", "skill"]);
+        let (name, skill): (String, String) =
+            conn.query_row("SELECT name, skill FROM tasks", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((name.as_str(), skill.as_str()), ("Daily Email Triage", "triage"));
+        let keys: Vec<String> = conn
+            .prepare("SELECT key FROM app_config")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(keys, vec!["user/name"]);
+
+        // A fresh database never creates them.
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        assert!(!table_exists(&fresh, "agents").unwrap() && !table_exists(&fresh, "memory_profile").unwrap());
     }
 
     #[test]
