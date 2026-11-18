@@ -49,8 +49,7 @@
       "entitlements": "Entitlements.plist"
     },
     "externalBin": [
-      "binaries/muninn-transcriber",
-      "binaries/muninn-framescan"
+      "binaries/muninn-transcriber"
     ]
   }
 }

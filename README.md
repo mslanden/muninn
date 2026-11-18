@@ -5,12 +5,11 @@ Muninn is a macOS-first personal AI assistant built with Tauri 2 + Rust. It runs
 ## Features
 
 - **Tile dashboard** — chat, feeds, tasks, agents, memory, content library, media studio, logs, and settings panels arranged in a grid, with pop-out windows and persisted layouts
-- **Agent chat** — OpenAI-compatible and Anthropic-compatible providers (OpenAI, MiniMax, Meta, custom endpoints) with a shared in-Rust tool loop: workspace-scoped file/search/shell tools, web search & fetch, git/code/http tools, image generation, Mapbox directions/places, screen capture, and video editing
+- **Agent chat** — OpenAI-compatible and Anthropic-compatible providers (OpenAI, MiniMax, Meta, custom endpoints) with a shared in-Rust tool loop: workspace-scoped file/search/shell tools, web search & fetch, git/code/http tools, image generation, Mapbox directions/places, screen capture, and headless page capture
 - **Custom agents** — user-defined agents with their own system prompts and tool allowlists, agent self-management (CRUD via tools), and agent-to-agent delegation with sub-session isolation
 - **Scheduled tasks** — natural-language schedules (`every 30s`, `daily at 09:00`, `every monday at 10:00`), task chaining with condition gates, per-run history, and per-task workspace/agent targeting
 - **AI feeds** — scheduled LLM jobs that generate feed items (with optional images) on their own cadence
-- **Media Studio** — local ffmpeg video engine: non-destructive edit plans (cuts, captions, filters, overlays, aspect crop, speed), multi-source b-roll inserts, subject-aware smart reframe (Vision face detection), auto-generated 9:16 shorts, and multi-clip compilations
-- **On-device transcription** — Swift sidecar using Apple SpeechAnalyzer (macOS 26) or SFSpeechRecognizer, with cloud whisper (Groq/OpenAI) fallback
+- **On-device transcription** — voice input transcribed by a Swift sidecar using Apple SpeechAnalyzer (macOS 26) or SFSpeechRecognizer, with cloud whisper (Groq/OpenAI) fallback
 - **Memory** — persistent memories with embedding-based retrieval injected into chat
 - **Voice** — microphone recording + transcription for voice input
 - **Mobile companion** — opt-in in-process HTTP/WS server with QR pairing and an embedded phone UI
@@ -20,8 +19,7 @@ Muninn is a macOS-first personal AI assistant built with Tauri 2 + Rust. It runs
 
 - Rust toolchain (`rustup`, `cargo`)
 - Node.js + npm
-- Xcode Command Line Tools (`xcode-select --install`) — `swiftc` is needed to build the transcriber/framescan sidecars
-- `ffmpeg` (Homebrew) for Media Studio and video tools
+- Xcode Command Line Tools (`xcode-select --install`) — `swiftc` is needed to build the transcriber sidecar
 - API keys, via env vars or the Settings UI:
   - `OPENAI_API_KEY` for the OpenAI provider
   - `MINIMAX_API_KEY` (or `ANTHROPIC_API_KEY`) for the MiniMax Anthropic-compatible provider; optional `MINIMAX_ANTHROPIC_BASE_URL` (default `https://api.minimax.io/anthropic`)

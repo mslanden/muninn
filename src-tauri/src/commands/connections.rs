@@ -94,15 +94,6 @@ const TOOL_GROUPS: &[ToolGroup] = &[
         tools: &["search_places", "search_nearby", "get_directions"],
     },
     ToolGroup {
-        id: "video",
-        name: "Video editing",
-        kind: "service",
-        icon: "video",
-        description: "Analyze, edit, make shorts from and compile videos with local ffmpeg.",
-        key_setting: None,
-        tools: &["probe_video", "analyze_video", "edit_video", "generate_shorts", "compile_videos"],
-    },
-    ToolGroup {
         id: "muninn",
         name: "Built in",
         kind: "builtin",

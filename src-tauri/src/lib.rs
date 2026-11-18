@@ -18,10 +18,10 @@ mod procs;
 mod scheduler;
 mod screen;
 mod skills;
+mod speech;
 mod search;
 mod todos;
 mod tools;
-mod video;
 
 use models::RunningProcess;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -448,20 +448,6 @@ pub fn run() {
             commands::generate_carousel,
             commands::studio_save_png,
             commands::studio_generate_image,
-            commands::video_probe,
-            commands::video_thumbnails,
-            commands::video_filter_presets,
-            commands::video_analyze,
-            commands::video_plan_edit,
-            commands::video_render,
-            commands::video_generate_shorts,
-            commands::video_cancel_shorts,
-            commands::video_compile,
-            commands::video_cancel_compile,
-            commands::video_export_subtitles,
-            commands::video_cancel_render,
-            commands::video_save_plan,
-            commands::video_load_plan,
             commands::generate_feed_article,
             commands::refresh_ai_feed,
             commands::ai_web_search,

@@ -39,7 +39,7 @@ import { openSettingsModal } from "./settings.js";
 // Content and Memory live in Library now (see library.js).
 const APPS_TYPES = ["studio", "web", "feeds", "tasks"];
 const APPS_ICONS = {
-  studio: "video",
+  studio: "sparkles",
   content: "image",
   web: "globe",
   feeds: "rss",

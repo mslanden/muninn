@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -23,6 +23,17 @@ fn set_schema_version(conn: &Connection, version: i64) -> Result<(), String> {
 /// applied (installs that predate schema versioning are at unknown intermediate states).
 /// Any other failure is a real migration error and is propagated instead of being
 /// silently swallowed.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        params![name],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|r| r.is_some())
+    .map_err(|e| e.to_string())
+}
+
 fn exec_migration(conn: &Connection, sql: &str) -> Result<(), String> {
     match conn.execute(sql, []) {
         Ok(_) => Ok(()),
@@ -155,7 +166,8 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
     }
 
     if version < 7 {
-        // Per-source-video edit plan persistence for the Studio Video tab: keyed by the
+        // (Dropped again in v12, when the video editor was removed.) Per-source-video edit
+        // plan persistence for the Studio Video tab: keyed by the
         // video's absolute path so reopening the same file restores the last plan (AI or
         // manual) instead of starting over.
         conn.execute_batch(
@@ -259,9 +271,33 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 11)?;
     }
 
+    if version < 12 {
+        // The video editor was removed. Drop its saved edit plans and tool rows, and carry the
+        // on-device transcription switch (which voice input also used) over to its new key.
+        exec_migration(conn, "DROP TABLE IF EXISTS video_plans")?;
+        if table_exists(conn, "tools")? {
+            exec_migration(
+                conn,
+                "DELETE FROM tools WHERE tool_id IN ('probe_video', 'analyze_video', 'edit_video', 'generate_shorts', 'compile_videos')",
+            )?;
+        }
+        if table_exists(conn, "app_config")? {
+            exec_migration(
+                conn,
+                "INSERT OR IGNORE INTO app_config (key, value) \
+                 SELECT 'voice/local_transcription', value FROM app_config WHERE key = 'video/local_transcription'",
+            )?;
+            exec_migration(
+                conn,
+                "DELETE FROM app_config WHERE key IN ('video/local_transcription', 'video/hw_encode')",
+            )?;
+        }
+        set_schema_version(conn, 12)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 11, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 12, "add a migration block for the new version");
 
     Ok(())
 }
@@ -477,12 +513,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           resolved_at TEXT
         );
-
-        CREATE TABLE IF NOT EXISTS video_plans (
-          path TEXT PRIMARY KEY,
-          plan_json TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
         "#,
     )
     .map_err(|e| e.to_string())?;
@@ -555,36 +585,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
             "generate_image",
             "Generate Image",
             "Generate images from text descriptions.",
-            "image",
-        ),
-        (
-            "probe_video",
-            "Probe Video",
-            "Read a video's metadata (duration, resolution, fps, audio).",
-            "image",
-        ),
-        (
-            "analyze_video",
-            "Analyze Video",
-            "Detect silences and produce a timestamped transcript to plan video edits.",
-            "image",
-        ),
-        (
-            "edit_video",
-            "Edit Video",
-            "Cut, filter, caption, reframe, and re-render videos with ffmpeg.",
-            "image",
-        ),
-        (
-            "generate_shorts",
-            "Generate Shorts",
-            "Auto-clip a long recording into captioned 9:16 vertical shorts (great for scheduled runs).",
-            "image",
-        ),
-        (
-            "compile_videos",
-            "Compile Videos",
-            "Combine several clips into one video, keeping the good parts (best takes or a montage).",
             "image",
         ),
         (
@@ -1544,42 +1544,47 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v6_database_gains_video_plans_on_migrate() {
+    fn video_removal_migration_drops_its_state_and_keeps_the_transcription_switch() {
         let conn = Connection::open_in_memory().unwrap();
-        // Simulate a DB at schema v6 (no video_plans table yet). A real v6 DB has a
-        // tasks table (the v8 migration ALTERs it), so create a minimal one here.
+        // A v11 database from before the video editor was removed.
         conn.execute_batch(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, context_summary TEXT NOT NULL DEFAULT '', summary_upto_id INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
-             PRAGMA user_version = 6;",
+             CREATE TABLE app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             CREATE TABLE tools (tool_id TEXT PRIMARY KEY, name TEXT, enabled INTEGER NOT NULL DEFAULT 1);
+             CREATE TABLE video_plans (path TEXT PRIMARY KEY, plan_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+             INSERT INTO video_plans VALUES ('/tmp/a.mp4', '{}', 'x');
+             INSERT INTO tools (tool_id, name) VALUES ('edit_video', 'Edit Video'), ('compile_videos', 'Compile'), ('run_command', 'Run');
+             INSERT INTO app_config (key, value) VALUES ('video/local_transcription', '1'), ('video/hw_encode', '0'), ('llm/provider', 'minimax');
+             PRAGMA user_version = 11;",
         )
         .unwrap();
-        assert!(conn
-            .query_row(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='video_plans'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .unwrap()
-            .is_none());
         run_migrations(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
-        // Now it exists, is usable, and enforces path uniqueness (upsert target).
-        conn.execute(
-            "INSERT INTO video_plans (path, plan_json, updated_at) VALUES ('/tmp/a.mp4', '{}', '2026-01-01T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO video_plans (path, plan_json, updated_at) VALUES ('/tmp/a.mp4', '{}', '2026-01-02T00:00:00Z') \
-             ON CONFLICT(path) DO UPDATE SET plan_json = excluded.plan_json, updated_at = excluded.updated_at",
-            [],
-        )
-        .unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM video_plans", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
+        assert!(!table_exists(&conn, "video_plans").unwrap());
+        let tools: Vec<String> = conn
+            .prepare("SELECT tool_id FROM tools ORDER BY tool_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(tools, vec!["run_command".to_string()]);
+        let setting = |k: &str| -> Option<String> {
+            conn.query_row("SELECT value FROM app_config WHERE key = ?1", params![k], |r| r.get(0)).optional().unwrap()
+        };
+        assert_eq!(setting("voice/local_transcription").as_deref(), Some("1"));
+        assert_eq!(setting("video/local_transcription"), None);
+        assert_eq!(setting("video/hw_encode"), None);
+        assert_eq!(setting("llm/provider").as_deref(), Some("minimax"));
+
+        // A fresh database never has the video state at all.
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        assert!(!table_exists(&fresh, "video_plans").unwrap());
+        assert_eq!(
+            fresh.query_row("SELECT COUNT(*) FROM tools WHERE tool_id LIKE '%video%' OR tool_id = 'generate_shorts'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0
+        );
     }
 }

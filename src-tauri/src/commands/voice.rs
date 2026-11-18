@@ -292,10 +292,10 @@ pub async fn transcribe_wav(
 ) -> Result<TranscribeResponse, String> {
     let audio_bytes = B64.decode(&wav_base64).map_err(|e| format!("base64 decode error: {e}"))?;
 
-    // On-device first when enabled (same setting that gates Studio video transcription).
+    // On-device first when enabled (`voice/local_transcription`, see speech.rs).
     // Any failure falls through to the cloud whisper path below.
     let mut local_err: Option<String> = None;
-    let use_local = get_app_setting_value(&state, "video/local_transcription")?.as_deref() == Some("1");
+    let use_local = get_app_setting_value(&state, "voice/local_transcription")?.as_deref() == Some("1");
     if use_local {
         let tmp = std::env::temp_dir().join(format!(
             "muninn-voice-{}.wav",
@@ -308,7 +308,7 @@ pub async fn transcribe_wav(
             Ok(()) => {
                 let tmp_clone = tmp.clone();
                 let res = tauri::async_runtime::spawn_blocking(move || {
-                    crate::video::transcribe_local(&tmp_clone)
+                    crate::speech::transcribe_local(&tmp_clone)
                 })
                 .await
                 .map_err(|e| e.to_string())
@@ -319,7 +319,7 @@ pub async fn transcribe_wav(
             Err(e) => Err(format!("failed to write temp audio file: {e}")),
         };
         match local {
-            Ok(t) => return Ok(TranscribeResponse { text: t.text }),
+            Ok(text) => return Ok(TranscribeResponse { text }),
             Err(e) => local_err = Some(e),
         }
     }

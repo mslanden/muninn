@@ -144,7 +144,7 @@ export function renderSettingsTile(tileObj, body) {
               <label class="checkbox-inline mt-2">
                 <input type="checkbox" data-s-localtranscribe="${tileObj.id}" /> On-device transcription (Apple Speech)
               </label>
-              <span class="muted text-xs">Voice input and video analysis transcribe on your Mac — no key, audio never leaves the device. Falls back to cloud whisper.</span>
+              <span class="muted text-xs">Voice input is transcribed on your Mac — no key, audio never leaves the device. Falls back to cloud whisper.</span>
             </div>
             <div class="settings-group">
               <h3>Images</h3>
@@ -159,13 +159,6 @@ export function renderSettingsTile(tileObj, body) {
                 <button class="form-btn" data-s-fetch-img-models="${tileObj.id}">Fetch</button>
               </div>
               <span class="muted text-xs" data-s-img-status="${tileObj.id}"></span>
-            </div>
-            <div class="settings-group">
-              <h3>Video</h3>
-              <label class="checkbox-inline">
-                <input type="checkbox" data-s-hwencode="${tileObj.id}" /> Hardware video encoding (VideoToolbox)
-              </label>
-              <span class="muted text-xs">Faster renders on the Mac's hardware encoder; falls back to software automatically.</span>
             </div>
           </div></div>
 
@@ -327,7 +320,6 @@ export function renderSettingsTile(tileObj, body) {
   const keyFallbackInput = body.querySelector(`[data-s-keyfallback="${tileObj.id}"]`);
   const autoVerifyInput = body.querySelector(`[data-s-autoverify="${tileObj.id}"]`);
   const localTranscribeInput = body.querySelector(`[data-s-localtranscribe="${tileObj.id}"]`);
-  const hwEncodeInput = body.querySelector(`[data-s-hwencode="${tileObj.id}"]`);
   const approvalTimeoutInput = body.querySelector(`[data-s-approvaltimeout="${tileObj.id}"]`);
   const mobileToggleBtn = body.querySelector(`[data-s-mobile-toggle="${tileObj.id}"]`);
   const mobileStateEl = body.querySelector(`[data-s-mobile-state="${tileObj.id}"]`);
@@ -600,8 +592,7 @@ export function renderSettingsTile(tileObj, body) {
     notifyInput.checked = s["notifications/enabled"] !== "false";
     qaShortcutInput.value = s["quickask/shortcut"] || "cmd+shift+space";
     autoVerifyInput.checked = s["safety/auto_verify"] === "1";
-    localTranscribeInput.checked = s["video/local_transcription"] === "1";
-    hwEncodeInput.checked = s["video/hw_encode"] !== "0"; // default ON when unset
+    localTranscribeInput.checked = s["voice/local_transcription"] === "1";
     approvalTimeoutInput.value = s["safety/approval_timeout_secs"] || "";
     mobilePortInput.value = s["mobile/server_port"] || "";
     refreshMobileStatus();
@@ -659,8 +650,7 @@ export function renderSettingsTile(tileObj, body) {
     updates["notifications/enabled"] = notifyInput.checked ? "true" : "false";
     updates["quickask/shortcut"] = qaShortcutInput.value.trim();
     updates["safety/auto_verify"] = autoVerifyInput.checked ? "1" : "0";
-    updates["video/local_transcription"] = localTranscribeInput.checked ? "1" : "0";
-    updates["video/hw_encode"] = hwEncodeInput.checked ? "1" : "0";
+    updates["voice/local_transcription"] = localTranscribeInput.checked ? "1" : "0";
     // Approval timeout: blank falls back to the Rust default (120); otherwise clamp to [15, 3600].
     const approvalRaw = approvalTimeoutInput.value.trim();
     if (approvalRaw === "") {

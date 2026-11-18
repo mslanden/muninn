@@ -151,14 +151,8 @@ pub(crate) fn setting_schema() -> &'static [SettingDef] {
             gated: false,
         },
         SettingDef {
-            key: "video/local_transcription",
-            description: "1 = try on-device transcription first for video work, falling back to cloud whisper on failure.",
-            kind: Bool01,
-            gated: false,
-        },
-        SettingDef {
-            key: "video/hw_encode",
-            description: "1 = use hardware (VideoToolbox) encoding for video renders.",
+            key: "voice/local_transcription",
+            description: "1 = transcribe voice input on-device (Apple Speech) first, falling back to cloud whisper on failure.",
             kind: Bool01,
             gated: false,
         },
@@ -612,7 +606,7 @@ mod tests {
     fn bool_encodings_match_settings_ui() {
         // The Settings UI writes "1"/"0" for these...
         assert_eq!(validate_setting_value(def("safety/auto_verify"), "true").unwrap(), "1");
-        assert_eq!(validate_setting_value(def("video/hw_encode"), "off").unwrap(), "0");
+        assert_eq!(validate_setting_value(def("voice/local_transcription"), "off").unwrap(), "0");
         // ...but "true"/"false" for notifications.
         assert_eq!(validate_setting_value(def("notifications/enabled"), "1").unwrap(), "true");
         assert_eq!(validate_setting_value(def("notifications/enabled"), "no").unwrap(), "false");
