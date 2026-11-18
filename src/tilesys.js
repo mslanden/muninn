@@ -12,7 +12,6 @@ export { updateSidebar };
 // ==================== TILE MANAGEMENT ====================
 export const TILE_TYPES = [
   { type: "chat",       label: "Chat",       dot: "green" },
-  { type: "web",        label: "Web",        dot: "blue"  },
   { type: "tasks",      label: "Tasks",      dot: "blue"  },
   { type: "skills",     label: "Skills",     dot: "blue"  },
   { type: "library",    label: "Library",    dot: "purple" },
@@ -84,7 +83,6 @@ export function addTile(type, opts = {}) {
     el: tile,
     chatId: opts.chatId || null,
     projectPath: opts.projectPath || "",
-    webUrl: opts.webUrl || "",
     autoVoice: !!opts.autoVoice
   };
   tiles.push(tileObj);
@@ -303,7 +301,6 @@ export function popOutTile(tileId) {
   const params = new URLSearchParams();
   params.set("tile", tile.type);
   if (tile.chatId) params.set("chatId", tile.chatId);
-  if (tile.webUrl) params.set("url", tile.webUrl);
 
   const label = `popout-${tile.type}-${Date.now()}`;
   const popoutUrl = `${window.location.origin}${window.location.pathname}?${params.toString()}`;
@@ -334,8 +331,7 @@ export function getPopoutParams() {
   const params = new URLSearchParams(window.location.search);
   return {
     type: params.get("tile"),
-    chatId: params.get("chatId") || "",
-    url: params.get("url") || ""
+    chatId: params.get("chatId") || ""
   };
 }
 
@@ -345,7 +341,6 @@ export function saveLayout() {
     type: t.type,
     chatId: t.chatId,
     projectPath: t.projectPath || "",
-    webUrl: t.webUrl || "",
     autoVoice: !!t.autoVoice
   }));
   localStorage.setItem("muninn.layout", JSON.stringify(layout));

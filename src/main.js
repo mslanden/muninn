@@ -1,7 +1,6 @@
 // Entry point: wires sidebar buttons and boots the window.
 // Feature modules are imported for their side effect of registering tile renderers.
 import "./theme.js";
-import "./web.js";
 import "./chat.js";
 import "./logs.js";
 import "./tasks.js";
@@ -73,7 +72,7 @@ if (navLibrary) {
 
 // ==================== BOOT ====================
 async function bootPopout() {
-  const { type, chatId, url } = getPopoutParams();
+  const { type, chatId } = getPopoutParams();
 
   // Hide sidebar, make workspace full width
   const sidebar = document.querySelector(".sidebar");
@@ -94,8 +93,6 @@ async function bootPopout() {
     await addChatTile(chatId);
   } else if (type === "settings") {
     addTile("settings");
-  } else if (type === "web") {
-    addTile("web", { webUrl: url || "" });
   } else {
     addTile(type);
   }
@@ -139,7 +136,7 @@ async function bootMain() {
         const type = item.type === "agents" ? "skills" : item.type;
         // Skip tiles whose feature has since been removed (e.g. the old Studio tile).
         if (!getTileRenderer(type)) continue;
-        addTile(type, { webUrl: item.webUrl || "" });
+        addTile(type);
       }
     }
   } else {

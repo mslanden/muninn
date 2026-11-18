@@ -16,20 +16,6 @@ export function projectLabel(path) {
   return parts[parts.length - 1] || path;
 }
 
-export function normalizeWebUrl(input) {
-  const raw = String(input || "").trim();
-  if (!raw) return null;
-
-  const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
-  try {
-    const u = new URL(withScheme);
-    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-    return u.toString();
-  } catch {
-    return null;
-  }
-}
-
 // Block-level Markdown -> HTML. The input is escaped up front, so every tag in
 // the output is produced here and the result is safe for innerHTML sinks.
 // Covers what models actually emit: paragraphs, headings, lists, quotes, rules,
@@ -210,9 +196,4 @@ export function threadLabel(item, index = 0) {
   if (!cleaned) return messageCount > 0 ? `Chat ${index + 1}` : "New chat";
   if (cleaned.length <= 34) return cleaned;
   return `${cleaned.slice(0, 34).trimEnd()}...`;
-}
-// Treat input as a URL (browse) only when it has no spaces, contains a dot, and parses.
-export function looksLikeUrl(s) {
-  const v = String(s || "").trim();
-  return !/\s/.test(v) && /\./.test(v) && !!normalizeWebUrl(v);
 }

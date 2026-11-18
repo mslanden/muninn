@@ -3,7 +3,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml, field, projectLabel, renderMarkdown, threadLabel } from "./utils.js";
-import { focusTile, addTile, getChatTileBySessionId, saveLayout } from "./tilesys.js";
+import { addTile, saveLayout } from "./tilesys.js";
 import { icon, ravenLogo } from "./icons.js";
 
 // Refresh the sidebar chat-history list after session-mutating actions. Imported
@@ -13,31 +13,6 @@ import { icon, ravenLogo } from "./icons.js";
 import { refreshSessionList, openModelPopover } from "./sidebar.js";
 function bumpSessionList() {
   try { refreshSessionList(); } catch {}
-}
-
-// Open a fresh chat tile seeded with a web-search query and auto-send, so the user can
-// keep digging into a search result conversationally.
-export async function openQueryInChat(query) {
-  const q = String(query || "").trim();
-  if (!q) return;
-  const seed = `I searched the web for: "${q}". Give me a richer, well-sourced overview and the key links, then I'll ask follow-ups.`;
-  try {
-    const session = await invoke("create_session", { req: { projectPath: "" } });
-    const sid = field(session, "id", "id");
-    await addChatTile(sid, "");
-    const tile = getChatTileBySessionId(sid);
-    if (!tile) return;
-    focusTile(tile.id);
-    const input = tile.el.querySelector(`[data-chat-input="${tile.id}"]`);
-    const sendBtn = tile.el.querySelector(`[data-chat-send="${tile.id}"]`);
-    if (input && sendBtn) {
-      input.value = seed;
-      autoResize(input);
-      sendBtn.click();
-    }
-  } catch (e) {
-    console.error("Failed to open query in chat:", e);
-  }
 }
 
 // ========== CHAT TILE ==========

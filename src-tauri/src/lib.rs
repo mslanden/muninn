@@ -18,7 +18,6 @@ mod scheduler;
 mod screen;
 mod skills;
 mod speech;
-mod search;
 mod todos;
 mod tools;
 
@@ -434,7 +433,6 @@ pub fn run() {
             commands::open_content_file,
             commands::open_pdf,
             commands::read_image_base64,
-            commands::ai_web_search,
             commands::geocode_user_location,
             commands::get_session_todos,
             commands::answer_user_question,

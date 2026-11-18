@@ -8,7 +8,7 @@ export const newChatBtn = document.getElementById("new-chat-btn");
 export const navSettingsBtn = document.getElementById("nav-settings");
 export const sidebarCollapseBtn = document.getElementById("sidebar-collapse-btn");
 
-// Open tiles: { id, type, el, chatId?, projectPath?, webUrl?, cleanup? }
+// Open tiles: { id, type, el, chatId?, projectPath?, cleanup? }
 export const tiles = [];
 
 // Per-chat streaming state keyed by tile id

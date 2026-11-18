@@ -556,24 +556,3 @@ pub struct RunningProcess {
     pub child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiWebSearchRequest {
-    pub query: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiWebSource {
-    pub title: String,
-    pub url: String,
-    pub snippet: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiWebSearchResult {
-    pub answer: String,
-    pub sources: Vec<AiWebSource>,
-}
-
