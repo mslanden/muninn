@@ -1,6 +1,6 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getTileRenderer } from "./registry.js";
-import { workspace, tiles, chatStreams, tileMaps, ui } from "./state.js";
+import { workspace, tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml } from "./utils.js";
 import { addChatTile } from "./chat.js";
 import { updateSidebar } from "./sidebar.js";
@@ -112,14 +112,6 @@ export function removeTile(tileId) {
   // Clean up chat streaming state
   if (tile.type === "chat") {
     delete chatStreams[tileId];
-  }
-
-  // Clean up Mapbox GL map instances
-  if (tileMaps[tileId]) {
-    for (const m of tileMaps[tileId]) {
-      try { m.remove(); } catch {}
-    }
-    delete tileMaps[tileId];
   }
 
   if (ui.focusedTileId === tileId) {

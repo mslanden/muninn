@@ -6,7 +6,7 @@ use crate::AppState;
 
 /// Current schema version, stored in SQLite's `PRAGMA user_version`. Bump this and
 /// add a `if version < N` block in `run_migrations` for every new schema change.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 fn get_schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -297,9 +297,17 @@ fn run_migrations(conn: &Connection) -> Result<(), String> {
         set_schema_version(conn, 13)?;
     }
 
+    if version < 14 {
+        // Maps moved from Mapbox to Apple Maps (no key). Drop the now-unused Mapbox token.
+        if table_exists(conn, "app_config")? {
+            exec_migration(conn, "DELETE FROM app_config WHERE key = 'maps/mapbox_api_key'")?;
+        }
+        set_schema_version(conn, 14)?;
+    }
+
     // When adding a migration: append `if version < N { ...; set_schema_version(conn, N)?; }`
     // and bump SCHEMA_VERSION.
-    debug_assert!(SCHEMA_VERSION == 13, "add a migration block for the new version");
+    debug_assert!(SCHEMA_VERSION == 14, "add a migration block for the new version");
 
     Ok(())
 }
@@ -1524,6 +1532,26 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(tools, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn maps_migration_drops_only_the_mapbox_token() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             INSERT INTO app_config (key, value) VALUES ('maps/mapbox_api_key', 'pk.revoked'), ('user/location', 'San Diego, CA'), ('user/location_coords', '-117.1,32.7');
+             PRAGMA user_version = 13;",
+        )
+        .unwrap();
+        run_migrations(&conn).unwrap();
+        let keys: Vec<String> = conn
+            .prepare("SELECT key FROM app_config ORDER BY key")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(keys, vec!["user/location".to_string(), "user/location_coords".to_string()]);
     }
 
     #[test]

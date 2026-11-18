@@ -8,7 +8,7 @@ Everything below is live on `main`:
 
 - **Core app** — tile dashboard (chat, tasks, skills, memory, content, activity, settings), pop-out windows, persisted layouts, tray-resident lifecycle
 - **Chat & providers** — streaming, stop, slash commands, session history with pin/rename/delete/search/export, provider/model selector with fetch-models + test-connection (OpenAI, MiniMax/Anthropic-compatible, Meta, custom endpoints), MiniMax-M3 native vision (paste/drag/attach screenshots)
-- **Agent tooling** — workspace-scoped file/search/shell, write/edit/append, git/code/http/test, web search/fetch, image gen, Mapbox, screen capture/open app, settings self-config (schema allowlist + ask_user gating), agent self-management CRUD + `call_agent` delegation with sub-session isolation
+- **Agent tooling** — workspace-scoped file/search/shell, write/edit/append, git/code/http/test, web search/fetch, image gen, Apple Maps (MapKit sidecar, replaced Mapbox 2026-11-18), screen capture/open app, settings self-config (schema allowlist + ask_user gating), agent self-management CRUD + `call_agent` delegation with sub-session isolation
 - **Tasks** — natural-language schedules, chaining with condition gates, per-run history, run-now/pause/fail states, once-mode, per-task workspace + agent targeting, concurrent scheduler
 - **Safety** — workspace scoping, dangerous-command detection with approval prompts, LLM auto-verify with deferred-command queue, secret redaction, `/goal` auto-continue loop
 - **Media Studio** — shipped 2026-06/07, removed 2026-11-17: the video editor (ffmpeg engine, 5 agent tools, face-scan sidecar) and then the whole Studio tile (social copy, carousels, writing assist, HTML docs). Replaced by the `create_pdf` agent tool; everything else is done in chat.

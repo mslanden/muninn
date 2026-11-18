@@ -13,8 +13,6 @@ export const tiles = [];
 // Per-chat streaming state keyed by tile id
 export const chatStreams = {};
 
-// Mapbox GL map instances per tile, for cleanup on tile close
-export const tileMaps = {}; // tileId -> [mapboxgl.Map, ...]
 
 // Reassignable shared scalars. ES module bindings can't be reassigned by importers,
 // so anything multiple modules write to lives behind this object.
@@ -23,5 +21,4 @@ export const ui = {
   focusedTileId: null,
   loadedSettings: {},
   cachedSkills: [],
-  mapboxToken: null, // loaded from settings on init
 };

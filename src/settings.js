@@ -112,7 +112,6 @@ export function renderSettingsTile(tileObj, body) {
               <input class="mb-2" type="password" placeholder="Groq API key (voice transcription)" data-s-groq="${tileObj.id}" />
               <input class="mb-2" type="password" placeholder="Web search API key" data-s-search="${tileObj.id}" />
               <input class="mb-2" type="password" placeholder="Together AI key (images)" data-s-together="${tileObj.id}" />
-              <input class="mb-2" type="password" placeholder="Mapbox API key (maps)" data-s-mapbox="${tileObj.id}" />
               <input class="mb-2" type="password" placeholder="Fish Audio API key (TTS)" data-s-fishaudio="${tileObj.id}" />
             </div>
           </div></div>
@@ -302,7 +301,6 @@ export function renderSettingsTile(tileObj, body) {
   const groqInput = body.querySelector(`[data-s-groq="${tileObj.id}"]`);
   const searchInput = body.querySelector(`[data-s-search="${tileObj.id}"]`);
   const togetherInput = body.querySelector(`[data-s-together="${tileObj.id}"]`);
-  const mapboxInput = body.querySelector(`[data-s-mapbox="${tileObj.id}"]`);
   const imgProvSelect = body.querySelector(`[data-s-imgprov="${tileObj.id}"]`);
   const imgModelSelect = body.querySelector(`[data-s-imgmodel="${tileObj.id}"]`);
   const wsInput = body.querySelector(`[data-s-workspace="${tileObj.id}"]`);
@@ -569,11 +567,9 @@ export function renderSettingsTile(tileObj, body) {
     groqInput.value = "";
     searchInput.value = "";
     togetherInput.value = "";
-    mapboxInput.value = "";
     groqInput.placeholder = s["llm/groq_api_key"] ? "Groq key (saved)" : "Groq API key (voice transcription)";
     searchInput.placeholder = s["search/brave_api_key"] ? "Search key (saved)" : "Web search key";
     togetherInput.placeholder = s["imagegen/together_api_key"] ? "Together key (saved)" : "Together AI key";
-    mapboxInput.placeholder = s["maps/mapbox_api_key"] ? "Mapbox key (saved)" : "Mapbox API key (maps)";
     fishaudioInput.value = "";
     fishaudioInput.placeholder = s["tts/fishaudio_api_key"] ? "Fish Audio key (saved)" : "Fish Audio API key";
     voiceidInput.value = s["tts/voice_id"] || "";
@@ -642,10 +638,6 @@ export function renderSettingsTile(tileObj, body) {
     if (searchInput.value.trim()) updates["search/brave_api_key"] = searchInput.value.trim();
     if (togetherInput.value.trim()) updates["imagegen/together_api_key"] = togetherInput.value.trim();
     if (fishaudioInput.value.trim()) updates["tts/fishaudio_api_key"] = fishaudioInput.value.trim();
-    if (mapboxInput.value.trim()) {
-      updates["maps/mapbox_api_key"] = mapboxInput.value.trim();
-      ui.mapboxToken = mapboxInput.value.trim();
-    }
     updates["tts/voice_id"] = voiceidInput.value.trim();
     updates["notifications/enabled"] = notifyInput.checked ? "true" : "false";
     updates["quickask/shortcut"] = qaShortcutInput.value.trim();
@@ -681,25 +673,26 @@ export function renderSettingsTile(tileObj, body) {
     await invoke("set_app_settings", { req: { settings: updates } });
     // Restart MCP connections so config edits (changed args/env) take effect.
     if (mcpJson !== (ui.loadedSettings["mcp/servers"] || "")) refreshMcpStatus(true);
-    // Geocode location if changed and Mapbox key available
+    // Look the location up on Apple Maps only when it hasn't been yet: it changed, or an
+    // earlier lookup failed. Saving anything else in Settings doesn't touch it.
     const loc = locationInput.value.trim();
-    const token = ui.mapboxToken || updates["maps/mapbox_api_key"];
-    if (loc && token) {
+    let statusMs = 2000;
+    if (loc && ui.loadedSettings["user/location_coords_for"] !== loc) {
       try {
         await invoke("geocode_user_location", { location: loc });
+        ui.loadedSettings["user/location_coords_for"] = loc;
         statusEl.textContent = "Saved (location set ✓)";
       } catch (e) {
-        console.warn("Location geocoding failed:", e);
-        statusEl.textContent = "Saved (location failed: " + e + ")";
+        console.warn("Location lookup failed:", e);
+        statusEl.textContent = `Saved — but couldn't find "${loc}" on Apple Maps (${e}). Map searches won't be centered on you until it's found.`;
+        statusMs = 8000;
       }
-    } else if (loc && !token) {
-      statusEl.textContent = "Saved (add Mapbox key for location)";
     } else {
       statusEl.textContent = "Saved";
     }
     ui.loadedSettings = { ...ui.loadedSettings, ...updates };
     updateModelChips();
-    setTimeout(() => { statusEl.textContent = ""; }, 2000);
+    setTimeout(() => { statusEl.textContent = ""; }, statusMs);
     await loadS();
   });
 

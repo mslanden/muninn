@@ -89,8 +89,8 @@ const TOOL_GROUPS: &[ToolGroup] = &[
         name: "Maps",
         kind: "service",
         icon: "map-pin",
-        description: "Find places, search nearby and get directions with Mapbox.",
-        key_setting: Some("maps/mapbox_api_key"),
+        description: "Find places, search nearby and get directions with Apple Maps — no key needed.",
+        key_setting: None,
         tools: &["search_places", "search_nearby", "get_directions"],
     },
     ToolGroup {

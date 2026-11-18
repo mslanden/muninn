@@ -16,8 +16,6 @@ export default [
       sourceType: "module",
       globals: {
         ...globals.browser,
-        // Mapbox GL is loaded via a <script> tag, so it's a runtime global.
-        mapboxgl: "readonly",
       },
     },
     rules: {

@@ -1,6 +1,6 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { tiles, chatStreams, tileMaps, ui } from "./state.js";
+import { tiles, chatStreams, ui } from "./state.js";
 import { escapeHtml, renderMarkdown } from "./utils.js";
 import { getTilesByType, getChatTileBySessionId } from "./tilesys.js";
 import { playTts, maybeAutoSpeak, updateModelChips, addToolCard, renderTodoPanel, showUserQuestion, renderDeferredCard, showThinking, hideThinking, updateContextBar, onVoiceRecorded, onVoiceError, setGoalBannerStatus, hideGoalBanner, addTurn, addPdfCard } from "./chat.js";
@@ -209,122 +209,93 @@ export async function setupEventListeners() {
       });
   });
 
-  await listen("map-places", (event) => {
-    const { session_id, query, results } = event.payload;
+  // Map results (search_places / search_nearby / get_directions): a card with an Apple
+  // Maps image rendered by the muninn-maps helper, the details, and an Open in Maps button.
+  function addMapCard(session_id, buildBody, snapshotReq, mapsUrl) {
     const tile = getChatTileBySessionId(session_id);
     if (!tile) return;
     const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
     if (!chatLog) return;
-
-    const mapId = "map-" + Date.now();
+    const stream = chatStreams[tile.id];
+    if (stream && stream.bubble) {
+      stream.bubble.innerHTML = renderMarkdown(stream.text);
+      stream.bubble = null;
+      stream.text = "";
+    }
     const el = document.createElement("div");
     el.className = "turn";
     el.innerHTML = `
       <div class="turn-body">
-        <div class="map-title">Places: ${escapeHtml(query)}</div>
-        <div id="${mapId}" class="map-container"></div>
-        <div class="map-results">
-          ${results.map((r, i) => `<div class="map-result">${i + 1}. <strong>${escapeHtml(r.name)}</strong></div>`).join("")}
-        </div>
+        ${buildBody()}
+        <div class="map-image-wrap"><div class="map-image-loading">Loading map…</div></div>
+        <button class="form-btn map-open-btn" data-map-open>Open in Apple Maps</button>
       </div>
     `;
+    const wrap = el.querySelector(".map-image-wrap");
+    if (snapshotReq) {
+      invoke("map_snapshot", { req: { ...snapshotReq, dark: isDarkTheme(), width: 640, height: 320 } })
+        .then((src) => {
+          const img = document.createElement("img");
+          img.className = "map-image";
+          img.alt = "Map";
+          img.src = src;
+          wrap.replaceChildren(img);
+        })
+        .catch((e) => {
+          console.warn("map_snapshot", e);
+          wrap.remove();
+        });
+    } else {
+      wrap.remove();
+    }
+    const openBtn = el.querySelector("[data-map-open]");
+    if (mapsUrl) {
+      openBtn.addEventListener("click", () => invoke("open_in_maps", { url: mapsUrl }).catch((e) => console.error("open_in_maps", e)));
+    } else {
+      openBtn.remove();
+    }
     chatLog.appendChild(el);
     chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
+  }
 
-    if (!ui.mapboxToken) return;
-    setTimeout(() => {
-      const isDark = isDarkTheme();
-      const style = isDark ? "mapbox://styles/mapbox/dark-v11" : "mapbox://styles/mapbox/streets-v12";
-      const map = new mapboxgl.Map({
-        container: mapId,
-        style,
-        center: [results[0]?.lon || -117, results[0]?.lat || 34],
-        zoom: 13,
-        accessToken: ui.mapboxToken,
-        attributionControl: false,
-      });
-      const bounds = new mapboxgl.LngLatBounds();
-      results.forEach(r => {
-        const lon = parseFloat(r.lon), lat = parseFloat(r.lat);
-        if (lat === 0 && lon === 0) return;
-        new mapboxgl.Marker()
-          .setLngLat([lon, lat])
-          .setPopup(new mapboxgl.Popup({ offset: 25 }).setText(r.name))
-          .addTo(map);
-        bounds.extend([lon, lat]);
-      });
-      if (!bounds.isEmpty() && results.length > 1) {
-        map.fitBounds(bounds, { padding: 30 });
-      }
-      if (tile) { (tileMaps[tile.id] = tileMaps[tile.id] || []).push(map); }
-    }, 100);
+  const fmtDist = (m) => (m < 1000 ? `${Math.round(m)}m` : `${(m / 1000).toFixed(1)}km`);
+
+  await listen("map-places", (event) => {
+    const { session_id, query, results, maps_url } = event.payload;
+    const places = results || [];
+    addMapCard(
+      session_id,
+      () => `
+        <div class="map-title">${escapeHtml(query)}</div>
+        <div class="map-results">
+          ${places.map((r, i) => {
+            const extra = [r.category, r.distance_m != null ? fmtDist(r.distance_m) : "", r.phone].filter(Boolean).join(" · ");
+            return `<div class="map-result">${i + 1}. <strong>${escapeHtml(r.name)}</strong>${r.address && !String(r.name).includes(r.address) ? `<span class="muted"> — ${escapeHtml(r.address)}</span>` : ""}${extra ? `<div class="muted text-xs">${escapeHtml(extra)}</div>` : ""}</div>`;
+          }).join("")}
+        </div>`,
+      places.length ? { markers: places.map((r, i) => ({ lat: r.lat, lon: r.lon, label: String(i + 1) })) } : null,
+      maps_url,
+    );
   });
 
   await listen("map-route", (event) => {
-    const { session_id, from, to, distance_km, duration_min, geometry, steps } = event.payload;
-    const tile = getChatTileBySessionId(session_id);
-    if (!tile) return;
-    const chatLog = tile.el.querySelector(`[data-chat-stream="${tile.id}"]`);
-    if (!chatLog) return;
-
-    const mapId = "map-" + Date.now();
+    const { session_id, from, to, from_point, to_point, mode, distance_km, duration_min, polyline, steps, note, maps_url } = event.payload;
     const distText = distance_km < 1 ? `${Math.round(distance_km * 1000)}m` : `${distance_km.toFixed(1)}km`;
     const durText = duration_min < 60 ? `${Math.round(duration_min)} min` : `${Math.floor(duration_min / 60)}h ${Math.round(duration_min % 60)}m`;
-
-    const el = document.createElement("div");
-    el.className = "turn";
-    el.innerHTML = `
-      <div class="turn-body">
+    const markers = [
+      from_point && { ...from_point, label: "A", color: "green" },
+      to_point && { ...to_point, label: "B", color: "red" },
+    ].filter(Boolean);
+    addMapCard(
+      session_id,
+      () => `
         <div class="map-title">${escapeHtml(from)} \u2192 ${escapeHtml(to)}</div>
-        <div class="map-summary">${distText} \u00b7 ${durText}</div>
-        <div id="${mapId}" class="map-container"></div>
-        ${steps && steps.length > 0 ? `<details class="map-steps"><summary>Directions (${steps.length} steps)</summary>${steps.map(s => `<div class="map-step">${escapeHtml(s.instruction)} (${s.distance}m)</div>`).join("")}</details>` : ""}
-      </div>
-    `;
-    chatLog.appendChild(el);
-    chatLog.parentElement.scrollTop = chatLog.parentElement.scrollHeight;
-
-    if (!ui.mapboxToken || !geometry || geometry.length === 0) return;
-    setTimeout(() => {
-      const isDark = isDarkTheme();
-      const style = isDark ? "mapbox://styles/mapbox/dark-v11" : "mapbox://styles/mapbox/streets-v12";
-      // geometry is already [lon, lat] from Mapbox Directions API
-      const map = new mapboxgl.Map({
-        container: mapId,
-        style,
-        center: geometry[0],
-        zoom: 13,
-        accessToken: ui.mapboxToken,
-        attributionControl: false,
-      });
-      map.on("load", () => {
-        map.addSource("route", {
-          type: "geojson",
-          data: { type: "Feature", geometry: { type: "LineString", coordinates: geometry } },
-        });
-        map.addLayer({
-          id: "route",
-          type: "line",
-          source: "route",
-          layout: { "line-join": "round", "line-cap": "round" },
-          paint: { "line-color": "#4A90D9", "line-width": 4 },
-        });
-        // Fit bounds to route
-        const bounds = new mapboxgl.LngLatBounds();
-        geometry.forEach(c => bounds.extend(c));
-        map.fitBounds(bounds, { padding: 30 });
-      });
-      // Start and end markers
-      new mapboxgl.Marker({ color: "#22c55e" })
-        .setLngLat(geometry[0])
-        .setPopup(new mapboxgl.Popup({ offset: 25 }).setText(from))
-        .addTo(map);
-      new mapboxgl.Marker({ color: "#ef4444" })
-        .setLngLat(geometry[geometry.length - 1])
-        .setPopup(new mapboxgl.Popup({ offset: 25 }).setText(to))
-        .addTo(map);
-      if (tile) { (tileMaps[tile.id] = tileMaps[tile.id] || []).push(map); }
-    }, 100);
+        <div class="map-summary">${escapeHtml(mode || "driving")} \u00b7 ${distText} \u00b7 ${durText}</div>
+        ${note ? `<div class="muted text-xs">${escapeHtml(note)}</div>` : ""}
+        ${steps && steps.length > 0 ? `<details class="map-steps"><summary>Directions (${steps.length} steps)</summary>${steps.map(s => `<div class="map-step">${escapeHtml(s.instruction)} (${fmtDist(s.distance)})</div>`).join("")}</details>` : ""}`,
+      markers.length ? { markers, route: polyline || [] } : null,
+      maps_url,
+    );
   });
 
   await listen("memory-changed", () => {

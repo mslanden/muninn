@@ -1136,6 +1136,66 @@ pub(crate) async fn generate_image_impl(
     Ok("Image generated and saved to content folder.".to_string())
 }
 
+/// Where map searches are centered: the user's saved location (`user/location_coords`,
+/// set from Settings → Profile), if any.
+fn saved_location(state: &AppState) -> Option<crate::maps::LatLon> {
+    get_app_setting_value(state, "user/location_coords")
+        .ok()
+        .flatten()
+        .and_then(|v| crate::maps::parse_stored_coords(&v))
+}
+
+fn fmt_distance(m: f64) -> String {
+    if m < 1000.0 {
+        format!("{}m", m.round() as i64)
+    } else {
+        format!("{:.1}km", m / 1000.0)
+    }
+}
+
+fn fmt_duration(s: f64) -> String {
+    let min = (s / 60.0).round() as i64;
+    if min < 60 {
+        format!("{} min", min)
+    } else {
+        format!("{}h {}m", min / 60, min % 60)
+    }
+}
+
+/// Numbered list of places for the model, one line each.
+fn places_text(places: &[crate::maps::Place]) -> String {
+    let mut out = String::new();
+    for (i, p) in places.iter().enumerate() {
+        out.push_str(&format!("{}. {}", i + 1, p.display()));
+        if let Some(c) = &p.category {
+            out.push_str(&format!(" ({})", c));
+        }
+        if let Some(d) = p.distance_m {
+            out.push_str(&format!(" ~{}", fmt_distance(d)));
+        }
+        if let Some(phone) = &p.phone {
+            out.push_str(&format!(" · {}", phone));
+        }
+        out.push_str(&format!(" [{:.5}, {:.5}]\n", p.lat, p.lon));
+    }
+    out
+}
+
+/// Show places in the chat that ran the tool (chat.js renders an Apple Maps image).
+fn emit_places(app: &AppHandle, session_id: &str, title: &str, places: &[crate::maps::Place], center: Option<&crate::maps::LatLon>, query: &str) {
+    let _ = app.emit(
+        "map-places",
+        serde_json::json!({
+            "session_id": session_id,
+            "query": title,
+            "results": places,
+            "maps_url": crate::maps::apple_maps_search_url(query, center),
+        }),
+    );
+}
+
+/// Find specific places by name or description ("Arriba's Mexican Grill", "LAX", "Home
+/// Depot near Escondido") with Apple Maps, biased toward the user's saved location.
 pub(crate) async fn search_places_impl(
     app: &AppHandle,
     state: &AppState,
@@ -1143,114 +1203,18 @@ pub(crate) async fn search_places_impl(
     query: &str,
     limit: usize,
 ) -> Result<String, String> {
-    let token = first_non_empty_setting(state, &["maps/mapbox_api_key"])
-        .map_err(|e| format!("DB error reading Mapbox key: {}", e))?
-        .ok_or_else(|| "Mapbox API key not configured. Add it in Settings.".to_string())?;
-
-    let limit = limit.min(10).max(1);
-
-    // Get user's stored location for proximity bias
-    let proximity = get_app_setting_value(state, "user/location_coords")
-        .ok().flatten().unwrap_or_default();
-    let proximity_param = if proximity.is_empty() { String::new() } else { format!("&proximity={}", proximity) };
-
-    // Use Mapbox Search Box API for POI/business search
-    let url = format!(
-        "https://api.mapbox.com/search/searchbox/v1/forward?q={}&limit={}&types=poi,address&country=US{}&access_token={}",
-        urlencoding::encode(query),
-        limit,
-        proximity_param,
-        urlencoding::encode(&token),
-    );
-
-    let resp = state
-        .http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Mapbox search request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_body = resp.text().await.unwrap_or_default();
-        return Err(format!("Mapbox search error {}: {}", status, err_body));
+    let near = saved_location(state);
+    let places = crate::maps::search(query, near.as_ref(), 50_000.0, limit.clamp(1, 10)).await?;
+    if places.is_empty() {
+        return Ok(format!("No places found for '{}'.", query));
     }
-
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Mapbox search response: {}", e))?;
-
-    let features = body
-        .get("features")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Unexpected Mapbox response format".to_string())?;
-
-    let mut results = Vec::new();
-    let mut out = String::new();
-    for (i, feat) in features.iter().enumerate() {
-        let props = feat.get("properties");
-        let name = props
-            .and_then(|p| p.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or("Unknown");
-        let address = props
-            .and_then(|p| p.get("full_address").or_else(|| p.get("place_formatted")))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let place_type = props
-            .and_then(|p| p.get("poi_category"))
-            .and_then(Value::as_str)
-            .unwrap_or("place");
-
-        let coords = feat.get("geometry")
-            .and_then(|g| g.get("coordinates"))
-            .and_then(Value::as_array);
-
-        let (lon, lat) = match coords {
-            Some(c) if c.len() >= 2 => {
-                let lon = c[0].as_f64();
-                let lat = c[1].as_f64();
-                match (lon, lat) {
-                    (Some(lo), Some(la)) => (lo, la),
-                    _ => continue,
-                }
-            }
-            _ => continue,
-        };
-
-        let display = if address.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}, {}", name, address)
-        };
-
-        results.push(serde_json::json!({
-            "name": display,
-            "lat": lat,
-            "lon": lon,
-            "type": place_type,
-        }));
-
-        out.push_str(&format!("{}. {} ({}) [{}, {}]\n", i + 1, display, place_type, lat, lon));
-    }
-
-    if results.is_empty() {
-        out = "No places found.".to_string();
-    }
-
-    let _ = app.emit(
-        "map-places",
-        serde_json::json!({
-            "session_id": session_id,
-            "query": query,
-            "results": results,
-        }),
-    );
-
-    Ok(out)
+    let center = places.first().map(|p| crate::maps::LatLon { lat: p.lat, lon: p.lon });
+    emit_places(app, session_id, query, &places, center.as_ref(), query);
+    Ok(places_text(&places))
 }
 
+/// Find places of a kind ("coffee", "mexican restaurant", "gas station") around a location:
+/// `near` when given, else the user's saved location.
 pub(crate) async fn search_nearby_impl(
     app: &AppHandle,
     state: &AppState,
@@ -1259,154 +1223,41 @@ pub(crate) async fn search_nearby_impl(
     near: Option<&str>,
     limit: usize,
 ) -> Result<String, String> {
-    let token = first_non_empty_setting(state, &["maps/mapbox_api_key"])
-        .map_err(|e| format!("DB error reading Mapbox key: {}", e))?
-        .ok_or_else(|| "Mapbox API key not configured. Add it in Settings.".to_string())?;
-
-    // Try saved coords first, then geocode the 'near' param, then fall back to user/location text
-    let proximity = if let Some(coords) = get_app_setting_value(state, "user/location_coords").ok().flatten() {
-        coords
-    } else if let Some(loc) = near {
-        let (lon, lat, _) = mapbox_geocode(state, &token, loc).await?;
-        format!("{},{}", lon, lat)
-    } else if let Some(loc) = get_app_setting_value(state, "user/location").ok().flatten() {
-        if loc.is_empty() {
-            return Err("Location not set. Add your location in Settings > Profile, or pass a 'near' parameter.".to_string());
+    // Older tool calls used Mapbox category ids like "mexican_restaurant".
+    let what = category.replace('_', " ");
+    let center = match near.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(place) => {
+            let p = crate::maps::geocode(place, saved_location(state).as_ref()).await?;
+            crate::maps::LatLon { lat: p.lat, lon: p.lon }
         }
-        let (lon, lat, _) = mapbox_geocode(state, &token, &loc).await?;
-        format!("{},{}", lon, lat)
-    } else {
-        return Err("Location not set. Add your location in Settings > Profile, or pass a 'near' parameter.".to_string());
+        None => match saved_location(state) {
+            Some(c) => c,
+            None => {
+                let typed = get_app_setting_value(state, "user/location").ok().flatten().unwrap_or_default();
+                if typed.trim().is_empty() {
+                    return Err("Location not set. Add your location in Settings > Profile, or pass a 'near' place.".to_string());
+                }
+                let p = crate::maps::geocode(&typed, None).await?;
+                crate::maps::LatLon { lat: p.lat, lon: p.lon }
+            }
+        },
     };
-
-    let limit = limit.min(25).max(1);
-
-    let url = format!(
-        "https://api.mapbox.com/search/searchbox/v1/category/{}?limit={}&proximity={}&country=US&access_token={}",
-        urlencoding::encode(category),
-        limit,
-        urlencoding::encode(&proximity),
-        urlencoding::encode(&token),
-    );
-
-    let resp = state.http.get(&url).send().await
-        .map_err(|e| format!("Mapbox category search failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_body = resp.text().await.unwrap_or_default();
-        return Err(format!("Mapbox category search error {}: {}", status, err_body));
+    let mut places = crate::maps::search(&what, Some(&center), 8_000.0, limit.clamp(1, 25)).await?;
+    if places.is_empty() {
+        return Ok(format!("No {} found nearby.", what));
     }
-
-    let body: Value = resp.json().await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    let features = body.get("features").and_then(Value::as_array)
-        .ok_or_else(|| "Unexpected response format".to_string())?;
-
-    let mut results = Vec::new();
-    let mut out = String::new();
-    for (i, feat) in features.iter().enumerate() {
-        let props = feat.get("properties");
-        let name = props.and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or("Unknown");
-        let address = props
-            .and_then(|p| p.get("full_address").or_else(|| p.get("place_formatted")))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let dist = props.and_then(|p| p.get("distance"))
-            .and_then(Value::as_f64);
-
-        let coords = feat.get("geometry")
-            .and_then(|g| g.get("coordinates"))
-            .and_then(Value::as_array);
-
-        let (lon, lat) = match coords {
-            Some(c) if c.len() >= 2 => match (c[0].as_f64(), c[1].as_f64()) {
-                (Some(lo), Some(la)) => (lo, la),
-                _ => continue,
-            },
-            _ => continue,
-        };
-
-        let display = if address.is_empty() { name.to_string() } else { format!("{}, {}", name, address) };
-        let dist_text = dist.map(|d| {
-            if d < 1000.0 { format!(" ~{}m", d as i64) } else { format!(" ~{:.1}km", d / 1000.0) }
-        }).unwrap_or_default();
-
-        results.push(serde_json::json!({ "name": display, "lat": lat, "lon": lon, "type": category }));
-        out.push_str(&format!("{}. {}{}\n", i + 1, display, dist_text));
-    }
-
-    if results.is_empty() {
-        out = format!("No {} found nearby.", category);
-    }
-
-    let _ = app.emit("map-places", serde_json::json!({
-        "session_id": session_id,
-        "query": format!("Nearby: {}", category),
-        "results": results,
-    }));
-
-    Ok(out)
+    places.sort_by(|a, b| {
+        a.distance_m
+            .unwrap_or(f64::MAX)
+            .partial_cmp(&b.distance_m.unwrap_or(f64::MAX))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    emit_places(app, session_id, &format!("Nearby: {}", what), &places, Some(&center), &what);
+    Ok(places_text(&places))
 }
 
-/// Geocode a single address using Mapbox Geocoding v6.
-/// Returns (lon, lat, display_name) or an error.
-async fn mapbox_geocode(
-    state: &AppState,
-    token: &str,
-    address: &str,
-) -> Result<(f64, f64, String), String> {
-    let url = format!(
-        "https://api.mapbox.com/search/geocode/v6/forward?q={}&limit=1&access_token={}",
-        urlencoding::encode(address),
-        urlencoding::encode(token),
-    );
-    let resp = state
-        .http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Mapbox geocoding request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_body = resp.text().await.unwrap_or_default();
-        return Err(format!("Mapbox geocoding error {}: {}", status, err_body));
-    }
-
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Mapbox geocoding response: {}", e))?;
-
-    let feat = body
-        .get("features")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .ok_or_else(|| format!("Could not geocode '{}'", address))?;
-
-    let coords = feat
-        .get("geometry")
-        .and_then(|g| g.get("coordinates"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("No coordinates for '{}'", address))?;
-
-    let lon = coords.first().and_then(Value::as_f64)
-        .ok_or_else(|| format!("Invalid longitude for '{}'", address))?;
-    let lat = coords.get(1).and_then(Value::as_f64)
-        .ok_or_else(|| format!("Invalid latitude for '{}'", address))?;
-
-    let name = feat
-        .get("properties")
-        .and_then(|p| p.get("full_address").or_else(|| p.get("name")))
-        .and_then(Value::as_str)
-        .unwrap_or(address)
-        .to_string();
-
-    Ok((lon, lat, name))
-}
-
+/// Directions between two places with Apple Maps: driving, walking, cycling, or transit
+/// (transit is a travel-time estimate only; cycling and transit only where Apple covers them).
 pub(crate) async fn get_directions_impl(
     app: &AppHandle,
     state: &AppState,
@@ -1415,120 +1266,46 @@ pub(crate) async fn get_directions_impl(
     to: &str,
     mode: Option<&str>,
 ) -> Result<String, String> {
-    let token = first_non_empty_setting(state, &["maps/mapbox_api_key"])
-        .map_err(|e| format!("DB error reading Mapbox key: {}", e))?
-        .ok_or_else(|| "Mapbox API key not configured. Add it in Settings.".to_string())?;
-
-    // Geocode both endpoints
-    let (from_lon, from_lat, from_name) = mapbox_geocode(state, &token, from).await?;
-    let (to_lon, to_lat, to_name) = mapbox_geocode(state, &token, to).await?;
-
-    // Map mode to Mapbox profile
-    let profile = match mode.unwrap_or("driving") {
-        "walking" | "walk" | "foot" => "walking",
-        "cycling" | "cycle" | "bike" => "cycling",
-        _ => "driving",
-    };
-
-    // Get route from Mapbox Directions API
-    let route_url = format!(
-        "https://api.mapbox.com/directions/v5/mapbox/{}/{},{};{},{}?geometries=geojson&overview=full&steps=true&access_token={}",
-        profile, from_lon, from_lat, to_lon, to_lat, urlencoding::encode(&token),
-    );
-    let route_resp = state
-        .http
-        .get(&route_url)
-        .send()
-        .await
-        .map_err(|e| format!("Mapbox directions request failed: {}", e))?;
-
-    if !route_resp.status().is_success() {
-        let status = route_resp.status();
-        let err_body = route_resp.text().await.unwrap_or_default();
-        return Err(format!("Mapbox directions error {}: {}", status, err_body));
-    }
-
-    let route_body: Value = route_resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Mapbox directions response: {}", e))?;
-
-    let route = route_body
-        .get("routes")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .ok_or_else(|| "No route found".to_string())?;
-
-    let distance_m = route.get("distance").and_then(Value::as_f64).unwrap_or(0.0);
-    let duration_s = route.get("duration").and_then(Value::as_f64).unwrap_or(0.0);
-    let distance_km = distance_m / 1000.0;
-    let duration_min = duration_s / 60.0;
-
-    // Extract geometry coordinates (already [lon, lat] from Mapbox)
-    let geometry_coords = route
-        .get("geometry")
-        .and_then(|g| g.get("coordinates"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    // Extract step instructions (Mapbox provides full human-readable text)
-    let mut steps = Vec::new();
-    if let Some(legs) = route.get("legs").and_then(Value::as_array) {
-        for leg in legs {
-            if let Some(leg_steps) = leg.get("steps").and_then(Value::as_array) {
-                for step in leg_steps {
-                    let instruction = step
-                        .get("maneuver")
-                        .and_then(|m| m.get("instruction"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("Continue");
-                    let step_dist = step.get("distance").and_then(Value::as_f64).unwrap_or(0.0);
-
-                    steps.push(serde_json::json!({
-                        "instruction": instruction,
-                        "distance": step_dist as i64,
-                    }));
-                }
-            }
-        }
-    }
+    let route = crate::maps::directions(from, to, mode.unwrap_or("driving"), saved_location(state).as_ref()).await?;
 
     let _ = app.emit(
         "map-route",
         serde_json::json!({
             "session_id": session_id,
-            "from": from_name,
-            "to": to_name,
-            "distance_km": distance_km,
-            "duration_min": duration_min,
-            "geometry": geometry_coords,
-            "steps": steps,
+            "from": route.from.display(),
+            "to": route.to.display(),
+            "from_point": {"lat": route.from.lat, "lon": route.from.lon},
+            "to_point": {"lat": route.to.lat, "lon": route.to.lon},
+            "mode": route.mode,
+            "distance_km": route.distance_m / 1000.0,
+            "duration_min": route.duration_s / 60.0,
+            "polyline": route.polyline,
+            "steps": route.steps.iter().map(|s| serde_json::json!({
+                "instruction": s.instruction,
+                "distance": s.distance_m.round() as i64,
+            })).collect::<Vec<_>>(),
+            "note": route.note,
+            "maps_url": crate::maps::apple_maps_directions_url(&route),
         }),
     );
 
-    // Build text summary for LLM
-    let dist_text = if distance_km < 1.0 {
-        format!("{}m", (distance_km * 1000.0) as i64)
-    } else {
-        format!("{:.1}km", distance_km)
-    };
-    let dur_text = if duration_min < 60.0 {
-        format!("{} min", duration_min as i64)
-    } else {
-        format!("{}h {}m", (duration_min / 60.0) as i64, (duration_min % 60.0) as i64)
-    };
-
     let mut out = format!(
-        "Directions ({}) from {} to {}\nDistance: {} | Duration: {}\n\nSteps:\n",
-        profile, from_name, to_name, dist_text, dur_text
+        "Directions ({}) from {} to {}\nDistance: {} | Duration: {}\n",
+        route.mode,
+        route.from.display(),
+        route.to.display(),
+        fmt_distance(route.distance_m),
+        fmt_duration(route.duration_s)
     );
-    for (i, step) in steps.iter().enumerate() {
-        let instr = step.get("instruction").and_then(Value::as_str).unwrap_or("");
-        let dist = step.get("distance").and_then(Value::as_i64).unwrap_or(0);
-        out.push_str(&format!("{}. {} ({}m)\n", i + 1, instr, dist));
+    if let Some(note) = &route.note {
+        out.push_str(&format!("Note: {}\n", note));
     }
-
+    if !route.steps.is_empty() {
+        out.push_str("\nSteps:\n");
+        for (i, step) in route.steps.iter().enumerate() {
+            out.push_str(&format!("{}. {} ({})\n", i + 1, step.instruction, fmt_distance(step.distance_m)));
+        }
+    }
     Ok(out)
 }
 

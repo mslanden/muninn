@@ -16,8 +16,10 @@ mod notify_user;
 mod procs;
 mod scheduler;
 mod screen;
+mod sidecar;
 mod skills;
 mod speech;
+mod maps;
 mod todos;
 mod tools;
 
@@ -434,6 +436,8 @@ pub fn run() {
             commands::open_pdf,
             commands::read_image_base64,
             commands::geocode_user_location,
+            commands::map_snapshot,
+            commands::open_in_maps,
             commands::get_session_todos,
             commands::answer_user_question,
             commands::cancel_user_question,

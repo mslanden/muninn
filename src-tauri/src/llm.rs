@@ -873,10 +873,10 @@ Proactively use your tools — don't describe what you *could* do, just do it."
     }
     if enabled.contains("search_places") {
         caps.push("Show a specific named place on the map (search_places) — Use this to locate and display a KNOWN place by name, like 'Arriba's Mexican Grill' or 'LAX airport'. This is a pin-drop tool, not a discovery tool. For discovering new places use search_nearby, for reviews/recommendations use web_search.");
-        caps.push("Browse nearby places by CATEGORY (search_nearby) — PREFERRED tool for 'find X near me' or 'what restaurants are around here' queries. Use category IDs like 'restaurant', 'mexican_restaurant', 'coffee', 'gas_station', 'grocery', 'pharmacy', 'hotel', 'bar', 'gym', 'parking', 'fast_food', 'pizza'. Always try search_nearby FIRST for general food/service discovery. Falls back to user's saved location automatically. For reviews, ratings, or 'best of' recommendations, combine with web_search for richer results.");
+        caps.push("Browse nearby places by CATEGORY (search_nearby) — PREFERRED tool for 'find X near me' or 'what restaurants are around here' queries. Describe the kind of place in plain words: 'restaurant', 'mexican restaurant', 'coffee', 'gas station', 'grocery store', 'pharmacy', 'hotel', 'bar', 'gym', 'parking', 'pizza'. Always try search_nearby FIRST for general food/service discovery. Falls back to user's saved location automatically. For reviews, ratings, or 'best of' recommendations, combine with web_search for richer results.");
     }
     if enabled.contains("get_directions") {
-        caps.push("Get directions between locations — maps display automatically, ALWAYS use the tool instead of text-only directions. Supports driving, walking, and cycling modes. (get_directions)");
+        caps.push("Get directions between locations — maps display automatically, ALWAYS use the tool instead of text-only directions. Driving, walking and cycling give a full route; transit gives travel time only. Cycling and transit work only where Apple Maps covers them — fall back to driving or walking if they fail. (get_directions)");
     }
     if enabled.contains("list_inbox") {
         caps.push("Read the user's Apple Mail inbox (list_inbox) — recent messages, optionally unread-only.");
@@ -1458,7 +1458,7 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
             json!({
                 "type": "object",
                 "properties": {
-                    "category": {"type": "string", "description": "Mapbox category ID. Common: restaurant, mexican_restaurant, chinese_restaurant, italian_restaurant, pizza, coffee, cafe, bar, fast_food, gas_station, grocery, supermarket, pharmacy, hospital, hotel, gym, parking, bank, atm, laundry, post_office, library, park, beach, movie_theater, shopping_mall, clothing_store, hardware, auto_repair, car_wash, dentist, veterinarian, hair_salon"},
+                    "category": {"type": "string", "description": "What kind of place, in plain words: restaurant, mexican restaurant, chinese restaurant, pizza, coffee, bar, fast food, gas station, grocery store, pharmacy, hospital, hotel, gym, parking, bank, ATM, laundromat, post office, library, park, beach, movie theater, shopping mall, hardware store, auto repair, car wash, dentist, veterinarian, hair salon..."},
                     "near": {"type": "string", "description": "Optional location to search near (e.g., 'Hemet, CA'). Uses saved user location if omitted."},
                     "limit": {"type": "integer", "description": "Max results (default 10, max 25)"}
                 },
@@ -1469,13 +1469,13 @@ fn tool_defs(enabled: &HashSet<String>, interactive: bool) -> Vec<(&'static str,
     if enabled.contains("get_directions") {
         defs.push((
             "get_directions",
-            "Get directions between two locations. Results display on an interactive map with the route.",
+            "Get directions between two locations with Apple Maps. The route is shown to the user on a map. Transit returns travel time only (no steps); cycling and transit are only available where Apple Maps covers them.",
             json!({
                 "type": "object",
                 "properties": {
                     "from": {"type": "string", "description": "Starting address or place"},
                     "to": {"type": "string", "description": "Destination address or place"},
-                    "mode": {"type": "string", "description": "Transport mode: driving, walking, cycling (default driving)"}
+                    "mode": {"type": "string", "description": "Transport mode: driving (default), walking, cycling, or transit"}
                 },
                 "required": ["from", "to"]
             }),

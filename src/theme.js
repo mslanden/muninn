@@ -24,7 +24,7 @@ export function resolveThemeId(pref) {
   return id;
 }
 
-/** Whether the active theme is dark-based (for Mapbox, etc.). */
+/** Whether the active theme is dark-based (e.g. to pick light or dark map images). */
 export function isDarkTheme() {
   const pref = localStorage.getItem("muninn-theme") || "dark";
   const resolved = resolveThemeId(pref);

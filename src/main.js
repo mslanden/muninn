@@ -91,7 +91,6 @@ async function bootPopout() {
 
   await setupEventListeners();
   try { ui.loadedSettings = await invoke("get_app_settings"); } catch { ui.loadedSettings = {}; }
-  ui.mapboxToken = ui.loadedSettings["maps/mapbox_api_key"] || null;
 
   try { ui.cachedSkills = await invoke("list_skills"); } catch {}
 
@@ -125,7 +124,6 @@ async function bootMain() {
   setupTileKeyboardNav();
 
   try { ui.loadedSettings = await invoke("get_app_settings"); } catch { ui.loadedSettings = {}; }
-  ui.mapboxToken = ui.loadedSettings["maps/mapbox_api_key"] || null;
   updateModelChips();
 
   try { ui.cachedSkills = await invoke("list_skills"); } catch {}
